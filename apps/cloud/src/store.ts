@@ -35,6 +35,7 @@ import {
   foldOverlayOps,
   type Op,
   type OverlayDocument,
+  type SnapshotBatch,
 } from "@weft/sync-engine";
 
 /** Author naming author-table index 1 when seeding an empty reconstructed doc
@@ -1353,8 +1354,9 @@ export class CloudStore {
     bytes: Uint8Array,
     publication: SnapshotPublication | null,
     checkStorage: () => T | null,
+    batch?: SnapshotBatch,
   ): SnapshotPublicationResult<T> {
-    const requestHash = publication ? sha256hex(bytes) : null;
+    const requestHash = publication ? (batch ? "batch:" : "") + sha256hex(bytes) : null;
     return this.publishPage(user, doc, page, () => {
       if (publication) {
         const receipt = this.db.query<
@@ -1376,7 +1378,8 @@ export class CloudStore {
       const blocked = checkStorage();
       if (blocked !== null) return { kind: "blocked", response: blocked };
 
-      const { seq, merged } = this.putSnapshotMerged(user, doc, page, bytes);
+      if (batch) this.appendOps(user, doc, page, batch.deltas, batch.author);
+      const { seq, merged } = this.putSnapshotMerged(user, doc, page, batch?.snapshot ?? bytes);
       if (publication) {
         this.db.run(
           `INSERT INTO page_snapshot_receipts

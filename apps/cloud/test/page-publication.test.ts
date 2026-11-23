@@ -518,3 +518,70 @@ test('guarded snapshot publications require both headers and validate the base c
         rmSync(dir, { recursive: true, force: true })
     }
 })
+
+test('a guarded mixed snapshot accepts or rejects its history deltas with the snapshot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'weft-mixed-snapshot-receipt-'))
+    const db = join(dir, 'relay.sqlite')
+    process.env.CLOUD_DEV_USER = '1'
+    const server = startCloud({ port: 0, db })
+    const inspect = new Database(db)
+    const endpoint = `http://localhost:${server.port}/api/documents/${DOC}/pages/${PAGE}/snapshot-batch`
+    const id = crypto.randomUUID()
+    const snapshot = encodeSnapshot(tabletFile(), overlay)
+    const { encodeSnapshotBatch, SNAPSHOT_BATCH_CONTENT_TYPE } = await import('@weft/sync-engine')
+    const bytes = encodeSnapshotBatch({ snapshot, deltas: [operation], author: 'web history' })
+    const publish = (
+        baseSeq: number, contentType = SNAPSHOT_BATCH_CONTENT_TYPE, body = bytes, endpointOverride = endpoint,
+    ) => fetch(endpointOverride, {
+        method: 'POST',
+        headers: {
+            authorization: `Bearer ${TOKEN}`,
+            'content-type': contentType,
+            'x-snapshot-publication-id': id,
+            'x-snapshot-base-seq': String(baseSeq),
+        },
+        body,
+    })
+    try {
+        const before = server.store.putSnapshot(...PAGE_KEY, encodeSnapshot(blank, overlay))
+        const truncated = bytes.slice(0, 5)
+        expect((await publish(before, SNAPSHOT_BATCH_CONTENT_TYPE, truncated)).status).toBe(400)
+        const tooManyOps = encodeSnapshotBatch({
+            snapshot, deltas: Array(1001).fill(operation), author: 'web history',
+        })
+        expect((await publish(before, SNAPSHOT_BATCH_CONTENT_TYPE, tooManyOps)).status).toBe(413)
+        expect(server.store.latestSnapshotSeq(...PAGE_KEY)).toBe(before)
+        expect((await publish(0)).status).toBe(409)
+        expect(server.store.opsSince(...PAGE_KEY, 0)).toEqual([])
+        expect(server.store.changesSince(USER, 0)).toEqual([])
+
+        inspect.run(`CREATE TRIGGER reject_mixed_delivery BEFORE INSERT ON changes BEGIN
+            SELECT RAISE(ABORT, 'injected mixed delivery failure'); END`)
+        expect((await publish(before)).status).toBe(500)
+        expect(server.store.latestSnapshotSeq(...PAGE_KEY)).toBe(before)
+        expect(server.store.opsSince(...PAGE_KEY, 0)).toEqual([])
+        inspect.run('DROP TRIGGER reject_mixed_delivery')
+
+        const response = await publish(before)
+        expect(response.status).toBe(200)
+        const accepted = await response.json() as { seq: number; merged: boolean }
+        const ops = server.store.opsSince(...PAGE_KEY, 0)
+        expect(ops).toHaveLength(1)
+        expect(ops[0]).toMatchObject({ op: operation, author: 'web history' })
+        expect(server.store.latestSnapshot(...PAGE_KEY)?.opSeq).toBe(ops[0]!.seq)
+        expect(server.store.changesSince(USER, 0)).toHaveLength(1)
+
+        const duplicate = await publish(before)
+        expect(duplicate.status).toBe(200)
+        expect(await duplicate.json()).toEqual(accepted)
+        const differentMode = await publish(before, 'application/octet-stream', bytes, endpoint.replace(/-batch$/, ''))
+        expect(differentMode.status).toBe(409)
+        expect(await differentMode.json()).toMatchObject({ reason: 'publication-id-reused' })
+        expect(server.store.opsSince(...PAGE_KEY, 0)).toEqual(ops)
+        expect(server.store.changesSince(USER, 0)).toHaveLength(1)
+    } finally {
+        inspect.close()
+        server.stop()
+        rmSync(dir, { recursive: true, force: true })
+    }
+})

@@ -18,7 +18,7 @@ import {
   jwtSigningSecret,
   signSelfHostToken,
 } from "./auth";
-import { encodeSnapshot } from "@weft/sync-engine";
+import { decodeSnapshotBatch, encodeSnapshot, SNAPSHOT_BATCH_CONTENT_TYPE } from "@weft/sync-engine";
 import { builtinTemplate, builtinTemplateList } from "./builtin-templates";
 import { installProcessHooks, reportError } from "./telemetry";
 import { RmDocument, RootTextAuthorConflict } from "@weft/rm-format";
@@ -1748,10 +1748,12 @@ export function startCloud(
 
       // Snapshot channel (#45): whole-page compacted .rm at a version.
       const snapMatch =
-        /^\/api\/documents\/([^/]+)\/pages\/([^/]+)\/snapshot$/.exec(path);
+        /^\/api\/documents\/([^/]+)\/pages\/([^/]+)\/(snapshot|snapshot-batch)$/.exec(path);
       if (snapMatch) {
         const { doc, page } = pageParams(snapMatch);
-        if (req.method === "PUT" || req.method === "POST") {
+        const endpoint = snapMatch[3];
+        const isBatch = endpoint === "snapshot-batch";
+        if (req.method === "POST" || (!isBatch && req.method === "PUT")) {
           const publicationId = req.headers.get("x-snapshot-publication-id");
           const base = req.headers.get("x-snapshot-base-seq");
           let publication: SnapshotPublication | null = null;
@@ -1770,11 +1772,27 @@ export function startCloud(
             }
             publication = { id: publicationId.toLowerCase(), baseSeq };
           }
-          const body = await readBytes(req, MAX_RM, touchDevice);
+          if (isBatch && req.headers.get("content-type") !== SNAPSHOT_BATCH_CONTENT_TYPE) {
+            return json({ error: "unsupported snapshot batch format" }, 415);
+          }
+          const body = await readBytes(req, isBatch ? 2 * MAX_RM : MAX_RM, touchDevice);
           if ("error" in body) return body.error;
+          let batch;
+          if (isBatch) {
+            try {
+              batch = decodeSnapshotBatch(body.bytes);
+            } catch {
+              return json({ error: "invalid snapshot batch" }, 400);
+            }
+            if (
+              batch.snapshot.length > MAX_RM ||
+              batch.deltas.length > MAX_OPS_PER_POST ||
+              body.bytes.length - batch.snapshot.length > MAX_RM
+            ) return json({ error: "snapshot batch too large" }, 413);
+          }
           const result = store.publishSnapshot(
             user, doc, page, body.bytes, publication,
-            () => storageGuard(user, body.bytes.length, doc),
+            () => storageGuard(user, body.bytes.length, doc), batch,
           );
           if (result.kind === "blocked") return result.response;
           if (result.kind === "reused") {
@@ -1799,7 +1817,7 @@ export function startCloud(
           // must pull it back or its replica misses that content.
           return json({ seq, merged });
         }
-        if (req.method === "GET") {
+        if (!isBatch && req.method === "GET") {
           // lazy blob->snapshot migration (5d): an op-mode client bootstrapping
           // a legacy blob page must receive its content, not a 404-empty page.
           store.seedSnapshotFromBlob(user, doc, page);
