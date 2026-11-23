@@ -197,7 +197,10 @@ test.each(cases)('%s rolls back its entire publication on a delivery failure', a
                 body = JSON.stringify({ toSnapshot: store.latestSnapshotSeq(...PAGE_KEY) })
             }
         }
-        if (opAppend) body = JSON.stringify({ ops: [Buffer.from(operation).toString('base64')], author: null })
+        if (opAppend) {
+            const batch = { ops: [Buffer.from(operation).toString('base64')], author: null }
+            body = JSON.stringify(endpoint === 'ops-batch' ? { baseSeq: 0, batch } : batch)
+        }
 
         const readState = () => ({
             blob: store.getPage(...PAGE_KEY),

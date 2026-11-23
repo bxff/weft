@@ -1670,21 +1670,28 @@ export function startCloud(
           }
           const body = await readBytes(req, MAX_RM, touchDevice);
           if ("error" in body) return body.error;
+          type OpBody = { ops?: unknown; author?: unknown };
+          let parsed: (OpBody & { baseSeq?: unknown; batch?: OpBody }) | null = null;
+          let invalidJson = false;
+          try {
+            parsed = JSON.parse(new TextDecoder().decode(body.bytes));
+          } catch {
+            invalidJson = true;
+          }
+          const baseSeq = guarded ? parsed?.baseSeq : undefined;
+          const validBase = typeof baseSeq === "number" && Number.isSafeInteger(baseSeq) && baseSeq >= 0;
           const append = () => {
-            let parsed: { ops?: unknown; author?: unknown };
-            try {
-              parsed = JSON.parse(new TextDecoder().decode(body.bytes));
-            } catch {
-              return json({ error: "invalid json" }, 400);
-            }
-            if (guarded && (!parsed || (parsed.author !== null && typeof parsed.author !== "string"))) {
+            if (invalidJson) return json({ error: "invalid json" }, 400);
+            if (guarded && !validBase) return json({ error: "invalid op batch base" }, 400);
+            const payload = guarded ? parsed?.batch : parsed;
+            if (guarded && (!payload || (payload.author !== null && typeof payload.author !== "string"))) {
               return json({ error: "invalid op batch author" }, 400);
             }
-            if (!Array.isArray(parsed.ops))
+            if (!Array.isArray(payload!.ops))
               return json({ error: "ops must be an array" }, 400);
-            if (guarded && parsed.ops.length === 0)
+            if (guarded && payload!.ops.length === 0)
               return json({ error: "empty op batch" }, 400);
-            if (parsed.ops.length > MAX_OPS_PER_POST)
+            if (payload!.ops.length > MAX_OPS_PER_POST)
               return json(
                 {
                   error: `too many ops in one batch (max ${MAX_OPS_PER_POST})`,
@@ -1692,7 +1699,7 @@ export function startCloud(
                 400,
               );
             const ops: Uint8Array[] = [];
-            for (const b of parsed.ops) {
+            for (const b of payload!.ops) {
               if (typeof b !== "string")
                 return json({ error: "op must be base64" }, 400);
               const bytes = Buffer.from(b, "base64");
@@ -1700,7 +1707,7 @@ export function startCloud(
                 return json({ error: "invalid base64 op" }, 400);
               ops.push(new Uint8Array(bytes));
             }
-            const author = typeof parsed.author === "string" ? parsed.author : null;
+            const author = typeof payload!.author === "string" ? payload!.author : null;
             store.seedSnapshotFromBlob(user, doc, page);
             {
               const g = storageGuard(
@@ -1727,8 +1734,11 @@ export function startCloud(
                 // Roll back a lazy base seed if its append fails the quota check.
                 if (outcome instanceof Response) throw outcome;
                 return outcome;
-              });
-              if (!result) return json({ error: "op batch ID already used", reason: "batch-id-reused" }, 409);
+              }, validBase ? baseSeq : undefined);
+              if (result.kind === "stale") return json({
+                error: "snapshot base advanced", reason: "snapshot-base", currentSeq: result.currentSeq,
+              }, 409);
+              if (result.kind === "reused") return json({ error: "op batch ID already used", reason: "batch-id-reused" }, 409);
               if (result.duplicate) return json(result.range);
               range = result.range;
             } catch (error) {

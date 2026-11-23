@@ -1379,8 +1379,12 @@ export class CloudStore {
     batchId: string,
     bytes: Uint8Array,
     append: () => { firstSeq: number; lastSeq: number },
-  ): { range: { firstSeq: number; lastSeq: number }; duplicate: boolean } | null {
-    const hash = sha256hex(bytes);
+    baseSeq?: number,
+  ):
+    | { kind: "accepted"; range: { firstSeq: number; lastSeq: number }; duplicate: boolean }
+    | { kind: "reused" }
+    | { kind: "stale"; currentSeq: number } {
+    const hash = (baseSeq === undefined ? "" : `base:${baseSeq}:`) + sha256hex(bytes);
     return this.publishPage(user, doc, page, () => {
       const key = [user, doc, page, batchId] as const;
       const prior = this.db.query<
@@ -1392,8 +1396,12 @@ export class CloudStore {
       ).get(...key);
       if (prior) {
         return prior.request_hash === hash
-          ? { range: { firstSeq: prior.first_seq, lastSeq: prior.last_seq }, duplicate: true }
-          : null;
+          ? { kind: "accepted", range: { firstSeq: prior.first_seq, lastSeq: prior.last_seq }, duplicate: true }
+          : { kind: "reused" };
+      }
+      if (baseSeq !== undefined) {
+        const currentSeq = this.latestSnapshotSeq(user, doc, page);
+        if (currentSeq !== baseSeq) return { kind: "stale", currentSeq };
       }
       const range = append();
       this.db.run(
@@ -1401,7 +1409,7 @@ export class CloudStore {
          (user_id, doc, page, batch_id, request_hash, first_seq, last_seq) VALUES (?,?,?,?,?,?,?)`,
         [...key, hash, range.firstSeq, range.lastSeq],
       );
-      return { range, duplicate: false };
+      return { kind: "accepted", range, duplicate: false };
     });
   }
 
