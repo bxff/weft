@@ -144,6 +144,7 @@ test('a missing retained snapshot does not route a tablet download to a stale le
 const cases = [
     ['legacy RM', 'rm', 'PUT', 'page.changed'],
     ['first ops batch', 'ops', 'POST', 'ops.appended'],
+    ['guarded first ops batch', 'ops-batch', 'POST', 'ops.appended'],
     ['web snapshot', 'snapshot', 'PUT', 'page.changed'],
     ['versioned snapshot', 'snapshot', 'POST', 'page.changed'],
     ['restore op', 'revert', 'POST', 'page.changed'],
@@ -179,7 +180,8 @@ test.each(cases)('%s rolls back its entire publication on a delivery failure', a
         })
         let body: Uint8Array | string = tabletFile()
         let baseRevision = ''
-        if (name === 'legacy RM' || name === 'first ops batch') {
+        const opAppend = endpoint === 'ops' || endpoint === 'ops-batch'
+        if (name === 'legacy RM' || opAppend) {
             const saved = store.putPage(...PAGE_KEY, '', blank, 'setup')
             if ('conflict' in saved) throw new Error('unexpected setup conflict')
             baseRevision = saved.revision
@@ -195,7 +197,7 @@ test.each(cases)('%s rolls back its entire publication on a delivery failure', a
                 body = JSON.stringify({ toSnapshot: store.latestSnapshotSeq(...PAGE_KEY) })
             }
         }
-        if (name === 'first ops batch') body = JSON.stringify({ ops: [Buffer.from(operation).toString('base64')] })
+        if (opAppend) body = JSON.stringify({ ops: [Buffer.from(operation).toString('base64')], author: null })
 
         const readState = () => ({
             blob: store.getPage(...PAGE_KEY),
@@ -209,6 +211,7 @@ test.each(cases)('%s rolls back its entire publication on a delivery failure', a
             overlay: store.overlayAtHead(...PAGE_KEY),
             files: files(),
             receipts: inspect.query('SELECT * FROM page_snapshot_receipts').all(),
+            opReceipts: inspect.query('SELECT * FROM page_op_batch_receipts').all(),
         })
         const before = readState()
         inspect.run(`CREATE TRIGGER reject_delivery BEFORE INSERT ON changes BEGIN
@@ -217,6 +220,7 @@ test.each(cases)('%s rolls back its entire publication on a delivery failure', a
             authorization: `Bearer ${TOKEN}`,
             'x-base-revision': baseRevision,
         }
+        if (endpoint === 'ops-batch') headers['x-op-batch-id'] = crypto.randomUUID()
         if (name === 'versioned snapshot') {
             headers['x-snapshot-publication-id'] = crypto.randomUUID()
             headers['x-snapshot-base-seq'] = String(store.latestSnapshotSeq(...PAGE_KEY))
@@ -230,7 +234,7 @@ test.each(cases)('%s rolls back its entire publication on a delivery failure', a
         inspect.run('DROP TRIGGER reject_delivery')
         const response = await publish()
         expect(response.status).toBe(200)
-        if (name === 'versioned snapshot') {
+        if (name === 'versioned snapshot' || endpoint === 'ops-batch') {
             const duplicate = await publish()
             expect(duplicate.status).toBe(200)
             expect(await duplicate.json()).toEqual(await response.json())
@@ -247,17 +251,18 @@ test.each(cases)('%s rolls back its entire publication on a delivery failure', a
         const after = readState()
         expect(after.changes).toHaveLength(before.changes.length + 1)
         expect(after.receipts).toHaveLength(name === 'versioned snapshot' ? 1 : 0)
+        expect(after.opReceipts).toHaveLength(endpoint === 'ops-batch' ? 1 : 0)
         expect(after.changes.at(-1)?.revision).toBe(
             name === 'legacy RM' ? after.blob?.revision : after.native.revision,
         )
         if (name === 'legacy RM') expect(after.blob?.bytes).toEqual(body)
-        if (name === 'first ops batch') expect(after.overlay).toMatchObject({ tombstones: { 'shape:gone': { ts: 1 } } })
+        if (opAppend) expect(after.overlay).toMatchObject({ tombstones: { 'shape:gone': { ts: 1 } } })
         if (endpoint === 'snapshot' || name === 'device ops and fallback snapshot') {
             expect(RmDocument.parse(after.native.bytes).tree().rootText).toBeTruthy()
             expect(after.snapshot?.opSeq).toBe(after.ops.at(-1)?.seq)
         }
         if (name.startsWith('restore')) expect(after.snapshot?.revert).toBe(true)
-        if (name === 'first ops batch' || name === 'device ops and fallback snapshot') {
+        if (opAppend || name === 'device ops and fallback snapshot') {
             expect(after.ops.length).toBeGreaterThan(before.ops.length)
             expect(after.snapshot?.seq).toBeGreaterThan(before.snapshot?.seq ?? 0)
         }

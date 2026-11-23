@@ -286,6 +286,12 @@ export class CloudStore {
                 op BLOB NOT NULL, author TEXT, ts INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS page_ops_page ON page_ops(user_id, doc, page, seq);
+            CREATE TABLE IF NOT EXISTS page_op_batch_receipts (
+                user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
+                batch_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+                first_seq INTEGER NOT NULL, last_seq INTEGER NOT NULL,
+                PRIMARY KEY (user_id, doc, page, batch_id)
+            ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS page_snapshots (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
@@ -319,6 +325,26 @@ export class CloudStore {
                 WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page
             ) BEGIN
                 DELETE FROM page_snapshot_receipts
+                WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page;
+            END;
+            -- History pruning retains a page stream. Clear append receipts
+            -- only when both its ops and its snapshots have been removed.
+            CREATE TRIGGER IF NOT EXISTS page_op_batches_after_ops_delete
+            AFTER DELETE ON page_ops WHEN NOT EXISTS (
+                SELECT 1 FROM page_ops WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page
+            ) AND NOT EXISTS (
+                SELECT 1 FROM page_snapshots WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page
+            ) BEGIN
+                DELETE FROM page_op_batch_receipts
+                WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page;
+            END;
+            CREATE TRIGGER IF NOT EXISTS page_op_batches_after_snapshot_delete
+            AFTER DELETE ON page_snapshots WHEN NOT EXISTS (
+                SELECT 1 FROM page_snapshots WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page
+            ) AND NOT EXISTS (
+                SELECT 1 FROM page_ops WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page
+            ) BEGIN
+                DELETE FROM page_op_batch_receipts
                 WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page;
             END;
             -- Truncation floor: the highest op seq retention deleted for a page
@@ -1342,6 +1368,41 @@ export class CloudStore {
       `${doc}/${page}`,
       op || snapshot ? opMarker(op ?? 0, snapshot ?? 0) : blob ?? "",
     ]));
+  }
+
+  /** An append receipt survives history truncation and suppresses a retry's
+   * effects before even checking storage quota. */
+  publishOpsOnce(
+    user: string,
+    doc: string,
+    page: string,
+    batchId: string,
+    bytes: Uint8Array,
+    append: () => { firstSeq: number; lastSeq: number },
+  ): { range: { firstSeq: number; lastSeq: number }; duplicate: boolean } | null {
+    const hash = sha256hex(bytes);
+    return this.publishPage(user, doc, page, () => {
+      const key = [user, doc, page, batchId] as const;
+      const prior = this.db.query<
+        { request_hash: string; first_seq: number; last_seq: number },
+        typeof key
+      >(
+        `SELECT request_hash, first_seq, last_seq FROM page_op_batch_receipts
+         WHERE user_id=? AND doc=? AND page=? AND batch_id=?`,
+      ).get(...key);
+      if (prior) {
+        return prior.request_hash === hash
+          ? { range: { firstSeq: prior.first_seq, lastSeq: prior.last_seq }, duplicate: true }
+          : null;
+      }
+      const range = append();
+      this.db.run(
+        `INSERT INTO page_op_batch_receipts
+         (user_id, doc, page, batch_id, request_hash, first_seq, last_seq) VALUES (?,?,?,?,?,?,?)`,
+        [...key, hash, range.firstSeq, range.lastSeq],
+      );
+      return { range, duplicate: false };
+    });
   }
 
   /** Accept a client snapshot and its delivery marker in one publication.
