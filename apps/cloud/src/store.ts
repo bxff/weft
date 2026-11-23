@@ -132,6 +132,17 @@ function sha256hex(bytes: Uint8Array): string {
   return hasher.digest("hex");
 }
 
+export interface SnapshotPublication {
+  id: string;
+  baseSeq: number;
+}
+
+type SnapshotPublicationResult<T> =
+  | { kind: "accepted"; seq: number; merged: boolean; duplicate: boolean }
+  | { kind: "stale"; currentSeq: number }
+  | { kind: "reused" }
+  | { kind: "blocked"; response: T };
+
 /**
  * The two storage classes. `created` is the user's own irreplaceable output
  * (pages, ops, snapshots, overlays, assets, thumbnails, templates). `sources`
@@ -291,6 +302,24 @@ export class CloudStore {
                 revert INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS page_snapshots_page ON page_snapshots(user_id, doc, page, seq);
+            -- A receipt must outlive snapshot pruning: a browser may restart
+            -- and retry an already accepted upload long after it was pruned.
+            CREATE TABLE IF NOT EXISTS page_snapshot_receipts (
+                user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
+                publication_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+                base_seq INTEGER NOT NULL, seq INTEGER NOT NULL, merged INTEGER NOT NULL,
+                PRIMARY KEY (user_id, doc, page, publication_id)
+            ) WITHOUT ROWID;
+            -- Pruning retains a head. Removing the entire snapshot stream
+            -- ends the page's lifetime and must also remove its receipts.
+            CREATE TRIGGER IF NOT EXISTS page_snapshot_receipts_after_delete
+            AFTER DELETE ON page_snapshots WHEN NOT EXISTS (
+                SELECT 1 FROM page_snapshots
+                WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page
+            ) BEGIN
+                DELETE FROM page_snapshot_receipts
+                WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page;
+            END;
             -- Truncation floor: the highest op seq retention deleted for a page
             -- (absent/0 = nothing truncated). Persisted explicitly, never derived
             -- from MIN(page_ops.seq), which cannot distinguish "truncated below X"
@@ -1312,6 +1341,53 @@ export class CloudStore {
       `${doc}/${page}`,
       op || snapshot ? opMarker(op ?? 0, snapshot ?? 0) : blob ?? "",
     ]));
+  }
+
+  /** Accept a client snapshot and its delivery marker in one publication.
+   * Receipt matching precedes the base check: a retry of an accepted request
+   * is an acknowledgement, even after another writer advanced the page. */
+  publishSnapshot<T>(
+    user: string,
+    doc: string,
+    page: string,
+    bytes: Uint8Array,
+    publication: SnapshotPublication | null,
+    checkStorage: () => T | null,
+  ): SnapshotPublicationResult<T> {
+    const requestHash = publication ? sha256hex(bytes) : null;
+    return this.publishPage(user, doc, page, () => {
+      if (publication) {
+        const receipt = this.db.query<
+          { request_hash: string; base_seq: number; seq: number; merged: number },
+          [string, string, string, string]
+        >(`SELECT request_hash, base_seq, seq, merged FROM page_snapshot_receipts
+           WHERE user_id=? AND doc=? AND page=? AND publication_id=?`)
+          .get(user, doc, page, publication.id);
+        if (receipt) {
+          if (receipt.request_hash !== requestHash || receipt.base_seq !== publication.baseSeq) {
+            return { kind: "reused" };
+          }
+          return { kind: "accepted", seq: receipt.seq, merged: receipt.merged === 1, duplicate: true };
+        }
+        const currentSeq = this.latestSnapshotSeq(user, doc, page);
+        if (publication.baseSeq !== currentSeq) return { kind: "stale", currentSeq };
+      }
+
+      const blocked = checkStorage();
+      if (blocked !== null) return { kind: "blocked", response: blocked };
+
+      const { seq, merged } = this.putSnapshotMerged(user, doc, page, bytes);
+      if (publication) {
+        this.db.run(
+          `INSERT INTO page_snapshot_receipts
+             (user_id, doc, page, publication_id, request_hash, base_seq, seq, merged)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [user, doc, page, publication.id, requestHash, publication.baseSeq, seq, merged ? 1 : 0],
+        );
+      }
+      this.recordOpChange(user, doc, page, "web");
+      return { kind: "accepted", seq, merged, duplicate: false };
+    });
   }
 
   /**

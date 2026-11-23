@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite'
 import { expect, spyOn, test } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRootText, crdtId, insertText, Pen, PenColor, RmDocument } from '@weft/rm-format'
@@ -145,6 +145,7 @@ const cases = [
     ['legacy RM', 'rm', 'PUT', 'page.changed'],
     ['first ops batch', 'ops', 'POST', 'ops.appended'],
     ['web snapshot', 'snapshot', 'PUT', 'page.changed'],
+    ['versioned snapshot', 'snapshot', 'POST', 'page.changed'],
     ['restore op', 'revert', 'POST', 'page.changed'],
     ['restore snapshot', 'revert', 'POST', 'page.changed'],
     ['device ops and fallback snapshot', 'rm', 'PUT', 'page.changed'],
@@ -188,7 +189,7 @@ test.each(cases)('%s rolls back its entire publication on a delivery failure', a
             for (let i = 0; i < SNAPSHOT_KEEP; i++) store.putSnapshot(...PAGE_KEY, encodeSnapshot(blank, overlay))
             store.appendOps(...PAGE_KEY, [operation], 'setup')
             baseRevision = store.deviceRevision(...PAGE_KEY)
-            if (name === 'web snapshot') body = encodeSnapshot(tabletFile(), overlay)
+            if (endpoint === 'snapshot') body = encodeSnapshot(tabletFile(), overlay)
             if (name === 'restore op') body = JSON.stringify({ toSeq: 0 })
             if (name === 'restore snapshot') {
                 body = JSON.stringify({ toSnapshot: store.latestSnapshotSeq(...PAGE_KEY) })
@@ -207,14 +208,21 @@ test.each(cases)('%s rolls back its entire publication on a delivery failure', a
             native: store.reconstructDevicePage(...PAGE_KEY),
             overlay: store.overlayAtHead(...PAGE_KEY),
             files: files(),
+            receipts: inspect.query('SELECT * FROM page_snapshot_receipts').all(),
         })
         const before = readState()
         inspect.run(`CREATE TRIGGER reject_delivery BEFORE INSERT ON changes BEGIN
             SELECT RAISE(ABORT, 'injected delivery failure'); END`)
+        const headers: Record<string, string> = {
+            authorization: `Bearer ${TOKEN}`,
+            'x-base-revision': baseRevision,
+        }
+        if (name === 'versioned snapshot') {
+            headers['x-snapshot-publication-id'] = crypto.randomUUID()
+            headers['x-snapshot-base-seq'] = String(store.latestSnapshotSeq(...PAGE_KEY))
+        }
         const publish = () => fetch(`${base}/api/documents/${DOC}/pages/${PAGE}/${endpoint}`, {
-            method,
-            headers: { authorization: `Bearer ${TOKEN}`, 'x-base-revision': baseRevision },
-            body,
+            method, headers, body,
         })
         expect((await publish()).status).toBe(500)
         expect(readState()).toEqual(before)
@@ -222,6 +230,11 @@ test.each(cases)('%s rolls back its entire publication on a delivery failure', a
         inspect.run('DROP TRIGGER reject_delivery')
         const response = await publish()
         expect(response.status).toBe(200)
+        if (name === 'versioned snapshot') {
+            const duplicate = await publish()
+            expect(duplicate.status).toBe(200)
+            expect(await duplicate.json()).toEqual(await response.json())
+        }
         // WebSocket delivery is ordered. This event drains any notifications
         // from both attempts before we count them.
         expect((await fetch(`${base}/api/documents`, {
@@ -233,12 +246,13 @@ test.each(cases)('%s rolls back its entire publication on a delivery failure', a
         expect(events.filter((event) => event.type === eventType && event.page === PAGE)).toHaveLength(1)
         const after = readState()
         expect(after.changes).toHaveLength(before.changes.length + 1)
+        expect(after.receipts).toHaveLength(name === 'versioned snapshot' ? 1 : 0)
         expect(after.changes.at(-1)?.revision).toBe(
             name === 'legacy RM' ? after.blob?.revision : after.native.revision,
         )
         if (name === 'legacy RM') expect(after.blob?.bytes).toEqual(body)
         if (name === 'first ops batch') expect(after.overlay).toMatchObject({ tombstones: { 'shape:gone': { ts: 1 } } })
-        if (name === 'web snapshot' || name === 'device ops and fallback snapshot') {
+        if (endpoint === 'snapshot' || name === 'device ops and fallback snapshot') {
             expect(RmDocument.parse(after.native.bytes).tree().rootText).toBeTruthy()
             expect(after.snapshot?.opSeq).toBe(after.ops.at(-1)?.seq)
         }
@@ -387,6 +401,120 @@ test('an enclosing publication rollback keeps the history files retired by a nes
         expect(store.opsSince(...PAGE_KEY, 0)).toHaveLength(3)
         expect(readdirSync(path + '-files/snapshots').sort()).toEqual(files)
     } finally {
+        rmSync(dir, { recursive: true, force: true })
+    }
+})
+
+test('accepted snapshot retries survive pruning and cannot rewrite subsequent publications', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'weft-snapshot-receipt-'))
+    const db = join(dir, 'relay.sqlite')
+    process.env.CLOUD_DEV_USER = '1'
+    let server = startCloud({ port: 0, db })
+    const id = crypto.randomUUID()
+    const local = RmDocument.parse(blank)
+    local.createLayer('Local', { authorUuid: AUTHOR })
+    const localBytes = encodeSnapshot(local.serialize(), overlay)
+    const publish = (bytes: Uint8Array, publicationId: string, baseSeq: number) =>
+        fetch(`http://localhost:${server.port}/api/documents/${DOC}/pages/${PAGE}/snapshot`, {
+            method: 'POST',
+            headers: {
+                authorization: `Bearer ${TOKEN}`,
+                'x-snapshot-publication-id': publicationId,
+                'x-snapshot-base-seq': String(baseSeq),
+            },
+            body: bytes,
+        })
+    try {
+        const initial = await publish(localBytes, id, 0)
+        expect(initial.status).toBe(200)
+        const acknowledgement = await initial.json() as { seq: number; merged: boolean }
+
+        const peer = RmDocument.parse(server.store.reconstructDevicePage(...PAGE_KEY).bytes)
+        peer.createLayer('Peer', { authorUuid: 'bbbbbbbb-0000-4000-a000-000000000002' })
+        const peerBytes = encodeSnapshot(peer.serialize(), overlay)
+        const next = await publish(peerBytes, crypto.randomUUID(), acknowledgement.seq)
+        expect(next.status).toBe(200)
+        for (let i = 0; i < SNAPSHOT_KEEP; i++) server.store.putSnapshot(...PAGE_KEY, peerBytes)
+        const inspect = new Database(db)
+        try {
+            expect(inspect.query('SELECT seq FROM page_snapshots WHERE seq=?').get(acknowledgement.seq)).toBeNull()
+        } finally {
+            inspect.close()
+        }
+
+        const archive = server.store.backup(join(dir, 'archive'))
+        const restoredDb = join(dir, 'restored.sqlite')
+        cpSync(join(archive, 'weft.db'), restoredDb)
+        cpSync(join(archive, 'files'), restoredDb + '-files', { recursive: true })
+        server.stop()
+        server = startCloud({ port: 0, db: restoredDb })
+        const latest = server.store.latestSnapshotSeq(...PAGE_KEY)
+        const changes = server.store.changesSince(USER, 0)
+        const usage = server.store.usageBytes(USER, 'created')
+
+        const stale = await publish(localBytes, crypto.randomUUID(), 0)
+        expect(stale.status).toBe(409)
+        expect(await stale.json()).toMatchObject({ reason: 'snapshot-base', currentSeq: latest })
+        for (const [bytes, baseSeq] of [[peerBytes, 0], [localBytes, latest]] as const) {
+            const reused = await publish(bytes, id, baseSeq)
+            expect(reused.status).toBe(409)
+            expect(await reused.json()).toMatchObject({ reason: 'publication-id-reused' })
+        }
+
+        server.store.setUserQuota(USER, 'created', 1)
+        const retried = await publish(localBytes, id, 0)
+        expect(retried.status).toBe(200)
+        expect(await retried.json()).toEqual(acknowledgement)
+        expect(server.store.latestSnapshotSeq(...PAGE_KEY)).toBe(latest)
+        expect(server.store.changesSince(USER, 0)).toEqual(changes)
+        expect(server.store.usageBytes(USER, 'created')).toBe(usage)
+        expect(RmDocument.parse(server.store.reconstructDevicePage(...PAGE_KEY).bytes).layers()
+            .map(({ label }) => label)).toEqual(['Layer 1', 'Local', 'Peer'])
+
+        const restored = new Database(restoredDb)
+        try {
+            // A full purge can remove a page, unlike normal checkpoint pruning.
+            restored.run('DELETE FROM page_snapshots WHERE user_id=? AND doc=? AND page=?', PAGE_KEY)
+            expect(restored.query('SELECT * FROM page_snapshot_receipts').all()).toEqual([])
+        } finally {
+            restored.close()
+        }
+        server.store.setUserQuota(USER, 'created', null)
+        const recreated = await publish(peerBytes, crypto.randomUUID(), 0)
+        expect(recreated.status).toBe(200)
+        const expired = await publish(localBytes, id, 0)
+        expect(expired.status).toBe(409)
+        expect(await expired.json()).toMatchObject({ reason: 'snapshot-base' })
+    } finally {
+        server.stop()
+        rmSync(dir, { recursive: true, force: true })
+    }
+})
+
+test('guarded snapshot publications require both headers and validate the base cursor', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'weft-snapshot-headers-'))
+    process.env.CLOUD_DEV_USER = '1'
+    const server = startCloud({ port: 0, db: join(dir, 'relay.sqlite') })
+    const id = crypto.randomUUID()
+    const opaque = Uint8Array.of(1, 2, 3)
+    const put = (headers: Record<string, string>) =>
+        fetch(`http://localhost:${server.port}/api/documents/${DOC}/pages/${PAGE}/snapshot`, {
+            method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, ...headers }, body: opaque,
+        })
+    try {
+        expect((await put({})).status).toBe(400)
+        expect((await put({ 'x-snapshot-base-seq': '0' })).status).toBe(400)
+        expect((await put({ 'x-snapshot-publication-id': id })).status).toBe(400)
+        expect((await put({ 'x-snapshot-publication-id': 'invalid', 'x-snapshot-base-seq': '0' })).status).toBe(400)
+        for (const base of ['', '-1', '1.5', '2e1', '9007199254740992']) {
+            expect((await put({ 'x-snapshot-publication-id': id, 'x-snapshot-base-seq': base })).status).toBe(400)
+        }
+        expect(server.store.latestSnapshot(...PAGE_KEY)).toBeNull()
+        expect(server.store.changesSince(USER, 0)).toEqual([])
+        expect((await put({ 'x-snapshot-publication-id': id, 'x-snapshot-base-seq': '0' })).status).toBe(200)
+        expect(server.store.latestSnapshot(...PAGE_KEY)?.bytes).toEqual(opaque)
+    } finally {
+        server.stop()
         rmSync(dir, { recursive: true, force: true })
     }
 })

@@ -8,6 +8,7 @@
 import {
   BelowFloorError,
   CloudStore,
+  type SnapshotPublication,
   type StorageClass,
   type StoredFailureReport,
 } from "./store";
@@ -332,7 +333,7 @@ export function startCloud(
   const CORS = {
     "access-control-allow-origin": "*",
     "access-control-allow-headers":
-      "authorization, content-type, x-base-revision, x-client-id, x-device-token, x-api-key, range, if-none-match, x-if-snapshot-seq-gt",
+      "authorization, content-type, x-base-revision, x-client-id, x-device-token, x-api-key, range, if-none-match, x-if-snapshot-seq-gt, x-snapshot-publication-id, x-snapshot-base-seq",
     "access-control-allow-methods": "GET, PUT, POST, PATCH, DELETE, OPTIONS",
     // headers pdf.js + client caches read cross-origin (Range, revalidation etags)
     "access-control-expose-headers":
@@ -1750,18 +1751,42 @@ export function startCloud(
         /^\/api\/documents\/([^/]+)\/pages\/([^/]+)\/snapshot$/.exec(path);
       if (snapMatch) {
         const { doc, page } = pageParams(snapMatch);
-        if (req.method === "PUT") {
+        if (req.method === "PUT" || req.method === "POST") {
+          const publicationId = req.headers.get("x-snapshot-publication-id");
+          const base = req.headers.get("x-snapshot-base-seq");
+          let publication: SnapshotPublication | null = null;
+          // Older relays reject POST without writing, rather than silently
+          // accepting a guarded request as an ordinary snapshot replacement.
+          if (req.method === "POST") {
+            const baseSeq = Number(base);
+            if (
+              publicationId === null ||
+              !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(publicationId) ||
+              base === null ||
+              !/^\d+$/.test(base) ||
+              !Number.isSafeInteger(baseSeq)
+            ) {
+              return json({ error: "invalid snapshot publication headers" }, 400);
+            }
+            publication = { id: publicationId.toLowerCase(), baseSeq };
+          }
           const body = await readBytes(req, MAX_RM, touchDevice);
           if ("error" in body) return body.error;
-          { const g = storageGuard(user, body.bytes.length, doc); if (g) return g; }
-          // merge-published: concurrent tablet edits (text/anchors) that this
-          // client has not seen union in instead of being clobbered
-          const { seq, merged } = store.publishPage(user, doc, page, () => {
-            const result = store.putSnapshotMerged(user, doc, page, body.bytes);
-            store.recordOpChange(user, doc, page, "web");
-            return result;
-          });
-          emit(user, {
+          const result = store.publishSnapshot(
+            user, doc, page, body.bytes, publication,
+            () => storageGuard(user, body.bytes.length, doc),
+          );
+          if (result.kind === "blocked") return result.response;
+          if (result.kind === "reused") {
+            return json({ error: "snapshot publication ID already used", reason: "publication-id-reused" }, 409);
+          }
+          if (result.kind === "stale") {
+            return json({
+              error: "snapshot base advanced", reason: "snapshot-base", currentSeq: result.currentSeq,
+            }, 409);
+          }
+          const { seq, merged, duplicate } = result;
+          if (!duplicate) emit(user, {
             type: "page.changed",
             doc,
             page,
