@@ -10,8 +10,16 @@
   ],
   "description": "weft installer for the reMarkable: weft setup | doctor | uninstall | link. Run it with bunx.",
   "homepage": "https://weft.page",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "publishConfig": {
     "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bxff/weft.git",
+    "directory": "apps/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/bxff/weft/issues"
   }
 }
