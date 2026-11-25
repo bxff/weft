@@ -132,6 +132,25 @@ authentication or a secret supplied outside Git.
 Once the relay and editor are reachable, connect a tablet from the web setup
 page or follow the [tablet installer guide](device/installer/README.md).
 
+### Deploy from GitHub Actions
+
+The **Deploy Weft VPS** workflow is manual. It only runs from `main`, and
+requires the test workflow to have passed on the exact commit. Pull requests
+never get deployment credentials. The Pages helper remains a separate
+manual command.
+
+- **VPS:** configure the `vps-production` environment with a dedicated
+  `VPS_SSH_KEY`, an independently verified `VPS_KNOWN_HOSTS` entry, and
+  `VPS_HOST` and `VPS_USER`. Set `VPS_PORT` if it is not 22. The installer
+  expects a pre-provisioned `weft-cloud` user service and directories
+  `~/weft/src` and `~/weft/releases`. It does not configure or replace the
+  VPS's runtime environment file `~/weft/env`.
+
+Restrict each GitHub environment to `main` and consider requiring a reviewer.
+Keep `CLERK_SECRET_KEY`, password-mode secrets, database paths, and tunnel
+credentials on the relay host. A split-host frontend only needs Clerk's
+publishable key, not the backend secret.
+
 ## 4. Deploy the cloud server (production)
 
 Build from the **repo root** (workspace packages live in `packages/*`):
