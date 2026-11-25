@@ -1,26 +1,16 @@
 ---
-title: Introduction
-description: A sync API for reMarkable tablets. Full docs land with the public release.
+title: Getting started
+description: Set up Weft, run your own relay, or get the source.
 ---
 
-weft is a sync service for reMarkable tablets. A hosted cloud server speaks
-the same protocol as the on-device daemon, exposing your notebooks, pages,
-ink, and page assets to the browser editor and, later, to your own apps.
+Weft syncs reMarkable notebooks with a browser editor. You can view handwriting
+and marked-up PDFs, edit pages, and sync changes back to the tablet.
 
-weft is in **private beta**. Sign-ups are invite-only while the sync core
-settles.
+- [Set up your tablet](/install) to connect it to Weft.
+- [Run your own relay](https://github.com/bxff/weft/blob/main/SELFHOST.md) if you prefer to host it yourself.
+- [View the source or report an issue](https://github.com/bxff/weft) on GitHub.
 
-## What lands here
+The source is public. The hosted service is still invite-only.
 
-The full documentation is being rewritten for the public release:
-
-- Authentication: API keys and device pairing
-- HTTP API reference
-- WebSocket events
-- Build your own client
-- Self-hosting
-
-The API already exists and is the same one this web app uses, scoped to your
-account with keys you create and revoke in [settings](/settings/keys). If you
-are in the beta and want to build against it before the reference ships, ask
-and we will walk you through the current surface.
+If you’re building your own client, create or revoke an API key in
+[Settings](/settings/keys). It’s scoped to your account.

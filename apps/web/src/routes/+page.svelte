@@ -30,18 +30,21 @@
     const op = (s: string) => `<span class="tok-operator">${s}</span>`
     const cmt = (s: string) => `<span class="tok-comment">${s}</span>`
     const API_EXAMPLE_HTML = [
-        `${kw('const')} headers ${op('=')} { ${str('"x-api-key"')}: key }`,
+        `${kw('const')} base ${op('=')} ${str('"https://api.weft.page"')}`,
+        `${kw('const')} headers ${op('=')} { ${str('"x-api-key"')}: apiKey }`,
         ``,
-        `${kw('const')} r ${op('=')} ${kw('await')} ${fn('fetch')}(${str('"https://api.weft.page/api/documents"')}, { headers })`,
-        `${kw('const')} { ${prop('documents')} } ${op('=')} ${kw('await')} r.${fn('json')}()`,
+        `${kw('const')} list ${op('=')} ${kw('await')} ${fn('fetch')}(base + ${str('"/api/documents"')}, { headers })`,
+        `${kw('if')} (!list.ok) ${kw('throw new')} Error(${str('"Could not list notebooks"')})`,
+        `${kw('const')} { ${prop('documents')} } ${op('=')} ${kw('await')} list.${fn('json')}()`,
+        `${kw('const')} doc ${op('=')} documents.${fn('find')}(d ${op('=&gt;')} d.type === ${str('"notebook"')} &amp;&amp; d.pages?.length)`,
+        `${kw('if')} (!doc) ${kw('throw new')} Error(${str('"No synced notebook pages yet"')})`,
         ``,
-        `${kw('const')} doc ${op('=')} documents.${fn('find')}((d) ${op('=&gt;')} d.type ${op('===')} ${str('"notebook"')})`,
         `${kw('const')} page ${op('=')} ${kw('await')} ${fn('fetch')}(`,
-        `  ${str('`https://api.weft.page/api/documents/${doc.id}/pages/${doc.pages[0].id}/rm`')},`,
+        `  base + ${str('`/api/documents/${doc.id}/pages/${doc.pages[0].id}/rm`')},`,
         `  { headers },`,
         `)`,
-        `${cmt("// page.arrayBuffer() is the page's real .rm file:")}`,
-        `${cmt("// every stroke, in the tablet's own format")}`,
+        `${kw('if')} (!page.ok) ${kw('throw new')} Error(${str('"Could not download the page"')})`,
+        `${kw('const')} bytes ${op('=')} ${kw('await')} page.${fn('arrayBuffer')}() ${cmt('// native .rm bytes')}`,
     ]
         .map((l) => `<span class="line">${l || ' '}</span>`)
         .join('')
@@ -85,8 +88,8 @@
 
             <p class="my-4">
                 <a href="/install" class="wf-link">Set up the tablet</a> once and sync runs
-                both ways on its own: pen strokes land in the browser a second or two after
-                you lift the pen, and browser edits land back on paper. When both sides touch the same
+                both ways while your tablet and browser can reach the relay: pen strokes
+                show up in the browser, and browser edits sync back to the tablet. When both sides touch the same
                 page at once (you reorganize a page in the browser while someone is still
                 writing on it), weft merges the strokes instead of keeping one side and
                 losing the other. Every page also keeps its edit history, so you can put a
@@ -94,33 +97,32 @@
             </p>
 
             <p class="my-4">
-                weft adds one small program to the tablet and changes nothing else. One
-                thing to know before you install: a tablet can only have one sync agent,
+                weft installs a sync agent on the tablet. One thing to know before you install: a tablet can only have one sync agent,
                 so weft takes the place of reMarkable&rsquo;s own cloud sync. While
                 it&rsquo;s installed, your notes sync to weft and not to reMarkable&rsquo;s
                 cloud or their apps. The daemon runs as its own service beside xochitl
                 (the reMarkable UI), reads and writes the same note files, and never
-                patches the system software. Firmware updates install normally; weft puts
-                itself back afterward and keeps itself up to date, so you set it up once.
-                Uninstalling removes that one program and stock sync comes back, so there
-                is nothing to brick.
+                patches the system software. Check the <a href="/install" class="wf-link">setup guide</a> for your model before
+                installing. Back up your notes before changing sync services, and check
+                that stock sync resumes after uninstalling.
             </p>
 
             <p class="my-4">
                 The hosted beta is free, and none of it needs a reMarkable Connect
                 subscription: browser editing, backup, version history, PDFs, and images in
                 your notes all work on a plain account (the official apps reserve image
-                support for Connect subscribers). The beta is invite-only for now; the
-                source and a self-hosting guide come with the public release.
+                support for Connect subscribers). The hosted beta is invite-only. The
+                <a href="https://github.com/bxff/weft" class="wf-link">source is public</a>,
+                and you can <a href={docsUrl()} class="wf-link">run it yourself</a>.
             </p>
 
             <p class="my-4">
-                Other apps can build on your notes too. The API is the same one this web app
-                uses, scoped to your account with keys you control (create one in
+                Other apps can build on your notes too. The relay API accepts keys scoped to
+                your account (create one in
                 <a href="/settings/keys" class="wf-link">settings</a>, revoke it any time).
-                The full reference is still being written and lands with the public release;
-                during the beta the endpoints work but may change. This lists your documents
-                and downloads a page&rsquo;s actual ink file:
+                The API is still evolving. This lists synced notebooks and downloads one
+                page&rsquo;s native <code>.rm</code> bytes. It isn&rsquo;t a full notebook export:
+                browser-only shape metadata and linked assets are separate.
             </p>
 
             <div class="my-4">
