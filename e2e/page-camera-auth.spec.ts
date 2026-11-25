@@ -27,7 +27,7 @@ for (const mode of ['known', 'known with a different valid token', 'pending', 'r
             }
             const exp = validPreviousToken ? Date.now() / 1000 + 90 : 1
             const previous = ['header', btoa(JSON.stringify({ sub: 'previous-user', exp })), 'signature'].join('.')
-            sessionStorage.setItem('weft-clerk-token', JSON.stringify({ value: previous, at: 1 }))
+            sessionStorage.setItem('weft-clerk-token', JSON.stringify({ value: previous, publishableKey: 'pk_test_mock', relay: location.origin }))
             ;(window as Window & { __WEFT_CLERK_MOCK__: unknown }).__WEFT_CLERK_MOCK__ = {
                 user: knownAtOpen ? { id: 'current-user' } : null,
                 session: { getToken: () => new Promise(() => {}) },
@@ -77,7 +77,7 @@ test('a valid cached Clerk session restores its camera before the SDK loads', as
         ]))
         const claims = { sub: 'current-user', exp: Date.now() / 1000 + 90 }
         const token = ['header', btoa(JSON.stringify(claims)), 'signature'].join('.')
-        sessionStorage.setItem('weft-clerk-token', JSON.stringify({ value: token, at: Date.now() }))
+        sessionStorage.setItem('weft-clerk-token', JSON.stringify({ value: token, publishableKey: 'pk_test_Y2xlcmsuZXhhbXBsZS5jb20k', relay: location.origin }))
     }, { doc, pageId, storageKey, oldCamera })
 
     await page.goto(`/app/${doc}/${pageId}`)
@@ -104,7 +104,7 @@ test('an expired Clerk token does not lock an offline notebook on unrelated stor
             { page: JSON.stringify([location.origin, 'clerk:current-user', doc, pageId]), camera: oldCamera },
         ]))
         const payload = btoa(JSON.stringify({ sub: 'current-user', exp: (Date.now() + 60_000) / 1000 }))
-        sessionStorage.setItem('weft-clerk-token', JSON.stringify({ value: `header.${payload}.signature`, at: Date.now() }))
+        sessionStorage.setItem('weft-clerk-token', JSON.stringify({ value: `header.${payload}.signature`, publishableKey: 'pk_test_Y2xlcmsuZXhhbXBsZS5jb20k', relay: location.origin }))
     }, { storageKey, doc, pageId, oldCamera })
 
     await page.goto(`/app/${doc}/${pageId}`)

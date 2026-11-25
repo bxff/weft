@@ -151,6 +151,7 @@ test('failed local persistence keeps the outgoing page and retries without losin
 })
 
 test('a failed toolbar layer write stays on the page and retries without losing visibility', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 })
     await page.goto(DOC1)
     await expect(page.getByTestId('sync-status')).toHaveText('synced')
     await page.getByRole('button', { name: 'layers', exact: true }).click()
@@ -194,6 +195,7 @@ test('a failed toolbar layer write stays on the page and retries without losing 
 })
 
 test('a completed layer write cannot repaint through a disposed controller', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 })
     await page.goto(DOC1)
     await expect(page.getByTestId('sync-status')).toHaveText('synced')
     await delayNextPendingWrite(page)

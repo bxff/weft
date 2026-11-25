@@ -153,8 +153,7 @@ test('IMAGE page renders the embedded photo as a tldraw image shape (E26)', asyn
         .toBeGreaterThanOrEqual(2)
     const image = page.locator('.tl-image').first()
     await expect(image).toBeVisible({ timeout: 30_000 })
-    const box = await image.boundingBox()
-    expect(box!.width).toBeGreaterThan(20)
+    await expect.poll(async () => (await image.boundingBox())?.width ?? 0).toBeGreaterThan(20)
     await page.screenshot({ path: 'e2e/artifacts/image-doc.png' })
 })
 

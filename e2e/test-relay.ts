@@ -9,7 +9,7 @@ export async function startTestRelay() {
         join(homedir(), '.bun/bin/bun'),
         ['apps/cloud/src/server.ts', '--port', '0', '--db', ':memory:'],
         {
-            cwd: join(__dirname, '..'),
+            cwd: join(import.meta.dirname, '..'),
             env: { ...process.env, CLOUD_DEV_USER: '1', HOST: '127.0.0.1' },
             stdio: ['ignore', 'pipe', 'inherit'],
         },

@@ -10,11 +10,20 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   web-and-cloud:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bunx tsc -b --force
@@ -27,8 +36,11 @@ jobs:
 
   daemon:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -47,8 +59,11 @@ jobs:
   e2e:
     # Playwright 1.60 provides a Chromium build for Ubuntu 24.04.
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # the e2e webServer (scripts/e2e-serve.ts) seeds the store through the
       # REAL rmsyncd, so this job builds the daemon too (cache shared with
       # the daemon job)
@@ -60,8 +75,11 @@ jobs:
       - run: cargo build --release
         working-directory: device
       - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.3"
       - run: bun install --frozen-lockfile
-      - run: bunx playwright install --with-deps chromium
+      - run: node node_modules/@playwright/test/cli.js install --with-deps chromium
       - run: bun run build
         working-directory: apps/web
         env:
@@ -69,11 +87,4 @@ jobs:
           PUBLIC_CLERK_PUBLISHABLE_KEY: ""
           PUBLIC_DOCS_URL: ""
           PUBLIC_TLDRAW_LICENSE_KEY: ""
-      - run: bunx playwright test
-      - uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: e2e-artifacts
-          path: |
-            test-results/
-            e2e/artifacts/
+      - run: node node_modules/@playwright/test/cli.js test

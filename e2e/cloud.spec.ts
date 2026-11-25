@@ -37,7 +37,7 @@ test.beforeAll(async () => {
         body: JSON.stringify(docs),
     })
     expect(r.ok).toBe(true)
-    const bytes = readFileSync(join(__dirname, '../fixtures/ferrari-xochitl-rewritten-merge.rm'))
+    const bytes = readFileSync(join(import.meta.dirname, '../fixtures/ferrari-xochitl-rewritten-merge.rm'))
     r = await fetch(`${relay.origin}/api/documents/${DOC}/pages/${PAGE}/rm`, {
         method: 'PUT',
         headers: { ...AUTH, 'x-base-revision': '', 'x-client-id': 'seed' },
