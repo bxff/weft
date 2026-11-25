@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 248 64" role="img" aria-label="weft">
+  <!-- Horizontal lockup: woven-"w" mark + geometric lowercase "weft" wordmark.
+       Self-contained (no external fonts; letters are monoline strokes).
+       Monochrome via currentColor.
+       The MARK is the hero (6px stroke, the woven "w"). The WORDMARK is set a
+       step lighter (5px stroke) and plainer so the woven mark stays special and
+       the two w's read as logo + label, not "ww".
+       Wordmark x-height grid: x-height top y=24, baseline y=48; f/t to y=16. -->
+
+  <!-- ===== MARK: the woven "w" ===== -->
+  <g stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M8 16 L20 48 L32 24 L44 48 L56 16"/>
+    <line x1="12" y1="32" x2="28" y2="32"/>
+    <line x1="36" y1="32" x2="52" y2="32"/>
+  </g>
+
+  <!-- divider whitespace; wordmark begins at x=96 -->
+  <!-- ===== WORDMARK "weft" ===== -->
+  <g transform="translate(96 0)" stroke="currentColor" stroke-width="5"
+     stroke-linecap="round" stroke-linejoin="round" fill="none">
+
+    <!-- w : two even V's, plain (no weave) -->
+    <path d="M0 24 L7 48 L16 30 L25 48 L32 24"/>
+
+    <!-- e : round bowl + crossbar, opening lower-right; tuned weight -->
+    <path d="M40 38 L54 38 A7 7 0 1 0 50 44.5"/>
+
+    <!-- f : ascender stem (curves in at top) + crossbar -->
+    <path d="M74 48 L74 22 A6 6 0 0 1 80 16"/>
+    <line x1="68" y1="30" x2="81" y2="30"/>
+
+    <!-- t : stem (curves out at baseline) + crossbar -->
+    <path d="M99 16 L99 42 A6 6 0 0 0 105 48"/>
+    <line x1="93" y1="30" x2="106" y2="30"/>
+  </g>
+</svg>

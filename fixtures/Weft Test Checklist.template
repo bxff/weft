@@ -1,0 +1,61 @@
+{
+  "name": "Weft Test Checklist",
+  "constants": [],
+  "items": [
+    {
+      "type": "text",
+      "text": "Sample checklist",
+      "fontSize": 22,
+      "position": {
+        "x": "templateWidth / 2 - textWidth / 2",
+        "y": 40
+      }
+    },
+    {
+      "type": "path",
+      "data": [
+        "M",
+        20,
+        65,
+        "L",
+        "templateWidth - 20",
+        65
+      ]
+    },
+    {
+      "type": "group",
+      "boundingBox": {
+        "x": 20,
+        "y": 120,
+        "width": "templateWidth - 40",
+        "height": 100
+      },
+      "repeat": {
+        "rows": "down"
+      },
+      "children": [
+        {
+          "type": "path",
+          "data": [
+            "M",
+            0,
+            0,
+            "h",
+            15,
+            "v",
+            15,
+            "h",
+            -15,
+            "Z",
+            "M",
+            30,
+            15,
+            "L",
+            "parentWidth",
+            15
+          ]
+        }
+      ]
+    }
+  ]
+}

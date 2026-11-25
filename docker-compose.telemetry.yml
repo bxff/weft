@@ -1,0 +1,41 @@
+# Optional GlitchTip, using its all-in-one container and PostgreSQL task queue.
+# Load together with docker-compose.yml. See SELFHOST.md before upgrading old data.
+services:
+  glitchtip-postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: glitchtip
+      POSTGRES_PASSWORD: ${GLITCHTIP_POSTGRES_PASSWORD:?set GLITCHTIP_POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: glitchtip
+    volumes:
+      - glitchtip-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U glitchtip -d glitchtip"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  glitchtip-web:
+    image: glitchtip/glitchtip:7
+    restart: unless-stopped
+    depends_on:
+      glitchtip-postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8080"
+    environment:
+      DATABASE_URL: postgres://glitchtip:${GLITCHTIP_POSTGRES_PASSWORD}@glitchtip-postgres:5432/glitchtip
+      VALKEY_URL: ""
+      SECRET_KEY: ${GLITCHTIP_SECRET_KEY:?set GLITCHTIP_SECRET_KEY in .env}
+      PORT: "8080"
+      GLITCHTIP_DOMAIN: ${GLITCHTIP_DOMAIN:-http://localhost:8000}
+      EMAIL_URL: ${GLITCHTIP_EMAIL_URL:-consolemail://}
+      DEFAULT_FROM_EMAIL: ${GLITCHTIP_FROM_EMAIL:-weft@localhost}
+      ENABLE_ORGANIZATION_CREATION: "${GLITCHTIP_OPEN_REGISTRATION:-True}"
+    volumes:
+      - glitchtip-uploads:/code/uploads
+
+volumes:
+  glitchtip-pg:
+  glitchtip-uploads:

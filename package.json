@@ -1,0 +1,23 @@
+{
+  "name": "weft",
+  "private": true,
+  "version": "0.0.1",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "bun run --cwd apps/web dev",
+    "check": "tsc -b",
+    "test": "bun test packages apps/cli apps/cloud apps/web",
+    "lint": "prettier --check . && oxlint .",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "oxlint": "^1.0.0",
+    "playwright": "^1.60.0",
+    "prettier": "^3.8.1",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "noEmit": true,
+    "lib": ["ESNext"],
+    "types": ["bun"]
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../../packages/rm-format" },
+    { "path": "../../packages/sync-engine" }
+  ]
+}

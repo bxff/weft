@@ -1,0 +1,12 @@
+# Relay only needs the listed workspace manifests and source.
+*
+!package.json
+!bun.lock
+!apps/cloud/package.json
+!apps/cloud/src/**
+!packages/rm-format/package.json
+!packages/rm-format/src/**
+!packages/rm-ink/package.json
+!packages/rm-ink/src/**
+!packages/sync-engine/package.json
+!packages/sync-engine/src/**

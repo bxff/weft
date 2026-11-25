@@ -1,0 +1,7 @@
+{
+  "name": "@weft/rm-format",
+  "version": "0.0.1",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "description": "Pure TypeScript codec for reMarkable .rm v6 files: tagged blocks, CRDT sequences, scene tree, .tree hash file. Zero dependencies, no I/O."
+}

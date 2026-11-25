@@ -1,0 +1,13 @@
+{
+  "name": "@weft/sync-engine",
+  "version": "0.0.1",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@weft/rm-format": "workspace:*",
+    "@weft/rm-ink": "workspace:*"
+  },
+  "description": "Offline editor sessions, edit reconciliation, and transport to the Weft relay."
+}

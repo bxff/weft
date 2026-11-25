@@ -1,0 +1,78 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "bun install --frozen-lockfile && bun run --cwd apps/web build",
+  "outputDirectory": "apps/web/build",
+  "framework": null,
+  "installCommand": "bun install --frozen-lockfile",
+  "routes": [
+    {
+      "handle": "filesystem"
+    },
+    {
+      "src": "^/.*$",
+      "missing": [
+        {
+          "type": "header",
+          "key": "accept",
+          "value": "(?i)^(?:[^,]*,)*\\s*text/html\\s*(?=[;,]|$)(?![^,]*;\\s*q\\s*=\\s*0(?:\\.0*)?\\s*(?:[;,]|$))[^,]*(?:,.*)?$"
+        }
+      ],
+      "headers": {
+        "Vary": "Accept, Sec-Fetch-Dest",
+        "Cache-Control": "no-store"
+      },
+      "status": 404
+    },
+    {
+      "src": "^/.*$",
+      "has": [
+        {
+          "type": "header",
+          "key": "sec-fetch-dest",
+          "value": "^(?!(?:document|iframe|frame)$).*"
+        }
+      ],
+      "headers": {
+        "Vary": "Accept, Sec-Fetch-Dest",
+        "Cache-Control": "no-store"
+      },
+      "status": 404
+    },
+    {
+      "src": "^/app/[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+/?$",
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "headers": {
+        "Vary": "Accept, Sec-Fetch-Dest",
+        "Cache-Control": "no-store"
+      },
+      "dest": "/app/shell/shell.html"
+    },
+    {
+      "src": "^/(?:install|join|library|login|settings(?:/keys)?)/?$",
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "headers": {
+        "Vary": "Accept, Sec-Fetch-Dest",
+        "Cache-Control": "no-store"
+      },
+      "dest": "/index.html"
+    },
+    {
+      "src": "^(/docs(?:/[a-zA-Z0-9_-]+)*)/?$",
+      "methods": [
+        "GET",
+        "HEAD"
+      ],
+      "headers": {
+        "Vary": "Accept, Sec-Fetch-Dest",
+        "Cache-Control": "no-store"
+      },
+      "dest": "$1.html"
+    }
+  ]
+}

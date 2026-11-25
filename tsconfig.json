@@ -1,0 +1,9 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/rm-format" },
+    { "path": "packages/rm-ink" },
+    { "path": "packages/sync-engine" },
+    { "path": "apps/cloud" }
+  ]
+}

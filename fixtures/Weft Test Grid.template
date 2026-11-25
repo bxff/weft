@@ -1,0 +1,60 @@
+{
+  "name": "Weft Test Grid",
+  "constants": [
+    {
+      "gridStep": "templateWidth < 900 || templateHeight < 900 ? 54 : 92"
+    }
+  ],
+  "items": [
+    {
+      "type": "group",
+      "boundingBox": {
+        "x": 0,
+        "y": 0,
+        "width": "gridStep",
+        "height": "gridStep"
+      },
+      "repeat": {
+        "rows": "infinite"
+      },
+      "children": [
+        {
+          "type": "path",
+          "data": [
+            "M",
+            0,
+            0,
+            "L",
+            "templateWidth",
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "type": "group",
+      "boundingBox": {
+        "x": 0,
+        "y": 0,
+        "width": "gridStep",
+        "height": "gridStep"
+      },
+      "repeat": {
+        "columns": "right"
+      },
+      "children": [
+        {
+          "type": "path",
+          "data": [
+            "M",
+            0,
+            0,
+            "L",
+            0,
+            "templateHeight"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+# TLS front for the weft cloud store on a server with ports
+# 80/443 and a DNS record. Caddy terminates HTTPS with automatic
+# Let's Encrypt certificates and proxies everything — WebSockets included,
+# no extra directives needed — to the cloud container.
+#
+# Set WEFT_DOMAIN in .env (e.g. cloud.weft.example.com). Rate limiting stays
+# in the app (per-user token buckets, per-IP login bucket, body caps,
+# storage quotas); the proxy's job here is TLS + a stable public origin.
+{$WEFT_DOMAIN} {
+	reverse_proxy cloud:8080
+}

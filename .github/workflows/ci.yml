@@ -1,0 +1,79 @@
+# CI gates — the same suites the repo runs locally. Notes:
+#  - apps/web/.env is gitignored: the e2e build gets its PUBLIC_* env inline
+#    (e2e drives server/keys via localStorage overrides, so empties are fine).
+#  - daemon-cloud.test.ts (real rmsyncd <-> cloud) self-skips when the binary
+#    is missing; the daemon job builds release and runs it explicitly so the
+#    cross-stack gate still runs in CI.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  web-and-cloud:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bunx tsc -b --force
+      - run: bun run check
+        working-directory: apps/web
+        env:
+          PUBLIC_CLOUD_URL: ""
+          PUBLIC_CLERK_PUBLISHABLE_KEY: ""
+      - run: bun test packages apps/cli apps/cloud apps/web
+
+  daemon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: device
+          shared-key: device-release
+      - run: cargo test
+        working-directory: device
+      - run: cargo build --release
+        working-directory: device
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun test apps/cloud/test/daemon-cloud.test.ts
+        env:
+          WEFT_RMSYNCD: ${{ github.workspace }}/device/target/release/rmsyncd
+
+  e2e:
+    # Playwright 1.60 provides a Chromium build for Ubuntu 24.04.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # the e2e webServer (scripts/e2e-serve.ts) seeds the store through the
+      # REAL rmsyncd, so this job builds the daemon too (cache shared with
+      # the daemon job)
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: device
+          shared-key: device-release
+      - run: cargo build --release
+        working-directory: device
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bunx playwright install --with-deps chromium
+      - run: bun run build
+        working-directory: apps/web
+        env:
+          PUBLIC_CLOUD_URL: ""
+          PUBLIC_CLERK_PUBLISHABLE_KEY: ""
+          PUBLIC_DOCS_URL: ""
+          PUBLIC_TLDRAW_LICENSE_KEY: ""
+      - run: bunx playwright test
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-artifacts
+          path: |
+            test-results/
+            e2e/artifacts/

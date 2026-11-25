@@ -1,0 +1,21 @@
+{
+  "name": "@weft/rm-ink",
+  "version": "0.0.1",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./pure": "./src/pure.ts"
+  },
+  "dependencies": {
+    "@weft/rm-format": "workspace:*",
+    "opentype.js": "^2.0.0"
+  },
+  "peerDependencies": {
+    "tldraw": "5.6.1"
+  },
+  "devDependencies": {
+    "tldraw": "5.6.1",
+    "@types/opentype.js": "^1.3.8"
+  },
+  "description": "Ink conversion: tldraw shapes to reMarkable strokes and back, pen-faithful rendering. './pure' subpath has zero tldraw dependency."
+}

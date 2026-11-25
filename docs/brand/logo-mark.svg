@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="weft">
+  <!-- Concept 2 (WINNER): Geometric "w" monogram with one woven weft thread.
+       Engineered on an 8px grid (key points on multiples of 8) so strokes stay
+       crisp at small sizes. The "w" is the dominant form; a single horizontal
+       weft thread crosses it, IN FRONT of the outer limbs and BEHIND the centre
+       peak (gap) - the monogram is literally woven. One idea: w = weft = weave. -->
+  <g stroke="currentColor" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- the w: peaks at y=16, valleys at y=48, centre peak at y=24 -->
+    <path d="M8 16 L20 48 L32 24 L44 48 L56 16"/>
+    <!-- weft thread at y=32, broken where it tucks behind the centre peak -->
+    <line x1="12" y1="32" x2="28" y2="32"/>
+    <line x1="36" y1="32" x2="52" y2="32"/>
+  </g>
+</svg>
