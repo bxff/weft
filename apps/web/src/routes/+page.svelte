@@ -123,6 +123,7 @@
                 The API is still evolving. This lists synced notebooks and downloads one
                 page&rsquo;s native <code>.rm</code> bytes. It isn&rsquo;t a full notebook export:
                 browser-only shape metadata and linked assets are separate.
+                <a href="/docs/api" class="wf-link">See the API quickstart</a> for a curl example.
             </p>
 
             <div class="my-4">

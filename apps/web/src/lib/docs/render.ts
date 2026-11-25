@@ -4,8 +4,7 @@ import { Marked } from 'marked'
 import matter from 'gray-matter'
 import { createHighlighter, type Highlighter } from 'shiki'
 
-// Trimmed to the intro for the private beta; more docs return with public release.
-const ORDER = ['index']
+const ORDER = ['index', 'api']
 const raw = import.meta.glob('./content/*.md', { query: '?raw', import: 'default', eager: true }) as Record<
     string,
     string

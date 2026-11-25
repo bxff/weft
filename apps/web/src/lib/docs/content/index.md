@@ -12,5 +12,4 @@ and marked-up PDFs, edit pages, and sync changes back to the tablet.
 
 The source is public. The hosted service is still invite-only.
 
-If you’re building your own client, create or revoke an API key in
-[Settings](/settings/keys). It’s scoped to your account.
+Building your own client? [Use the API](/docs/api) to list your notebooks and download a page.
