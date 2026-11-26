@@ -368,3 +368,36 @@ test('a text edit reapplies native layer visibility without replacing the ink', 
     }, shapeId)
     expect(opacity).toBe(1)
 })
+
+test('a tablet END-anchor uses the heading baseline, then reflows to a blank final line without rewriting ink', async ({ page, request }) => {
+    const { RmDocument, crdtId, setParagraphStyle } = await import('../packages/rm-format/src/index')
+    const { RM_SCALE } = await import('../packages/rm-ink/src/pen')
+    const id = crypto.randomUUID()
+    const endpoint = `/api/documents/${DOC}/pages/${id}/rm`
+    const { first } = await anchoredReflowPushes()
+    const seeded = RmDocument.parse(first as never)
+    setParagraphStyle(seeded, crdtId(0, 0), 2, { authorUuid: DEVICE_AUTHOR })
+    const native = (doc: InstanceType<typeof RmDocument>) => doc.blocks.flatMap(b =>
+        b.type === 'sceneLineItem' && b.line && b.deletedLength === 0 ? [b.line.points] : [])
+    const initial = native(seeded)
+    const rawY = Math.min(...initial[0]!.map(p => p.y))
+    const rootY = seeded.tree().rootText!.posY
+    expect((await request.put(endpoint, { data: Buffer.from(seeded.serialize()) })).ok()).toBe(true)
+    const y = () => page.evaluate(() => {
+        const ed = (window as unknown as { __weftEditor: Editor }).__weftEditor
+        return ed?.getCurrentPageShapes().find(shape => shape.type === 'draw')?.y
+    })
+    const open = async () => {
+        await page.goto(`/app/${DOC}/${id}`)
+        await expect(page.getByTestId('sync-status')).toHaveText('synced', { timeout: 30_000 })
+    }
+    await open()
+    await expect.poll(y).toBeCloseTo((rawY + rootY + 63.203125) * RM_SCALE, 1)
+    await appendToDeviceText(page, '\n')
+    await expect.poll(y).toBeCloseTo((rawY + rootY + 100) * RM_SCALE, 1)
+    await expect(page.getByTestId('sync-status')).toHaveText('synced')
+    const after = RmDocument.parse(new Uint8Array(await (await request.get(endpoint)).body()) as never)
+    expect(native(after)).toEqual(initial)
+    await open()
+    await expect.poll(y).toBeCloseTo((rawY + rootY + 100) * RM_SCALE, 1)
+})

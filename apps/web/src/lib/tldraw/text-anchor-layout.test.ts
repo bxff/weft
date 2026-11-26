@@ -111,7 +111,7 @@ test('body/body START follows the second paragraph top without adding its baseli
     expect(computeAnchorOffsets(doc, measure).get('0:11')?.dy).toBe(303.546875)
 })
 
-test('type-2 END retains line-top placement when anchor metadata is exposed', () => {
+test('type-2 END still uses the line top for a trailing empty paragraph', () => {
     const doc = sentinelDocument(ANCHOR_TEXT_END)
     expect(doc.anchoredGroups()[0]!.anchorType).toBe(2)
     expect(computeAnchorOffsets(doc, measure).get('0:11')?.dy).toBe(334)
@@ -120,4 +120,22 @@ test('type-2 END retains line-top placement when anchor metadata is exposed', ()
 test('single-paragraph START retains its existing fallback', () => {
     const doc = sentinelDocument(ANCHOR_TEXT_START, 1, 'body')
     expect(computeAnchorOffsets(doc, measure).get('0:11')?.dy).toBe(337.140625)
+})
+
+test('type-2 END below one visible heading follows the heading baseline', () => {
+    const doc = sentinelDocument(ANCHOR_TEXT_END, 2, 'A sample heading')
+    const original = doc.serialize()
+    expect(computeAnchorOffsets(doc, measure).get('0:11')).toEqual({
+        dx: -464,
+        dy: 297.203125,
+    })
+    expect(doc.serialize()).toEqual(original)
+})
+
+test('legacy END without anchor type retains line-top placement on visible text', () => {
+    const doc = sentinelDocument(ANCHOR_TEXT_END, 2, 'A sample heading')
+    const group = doc.blocks.find((block) => block.type === 'treeNode' && block.anchorId)
+    if (group?.type !== 'treeNode') throw new Error('missing anchored group')
+    group.anchorType = null
+    expect(computeAnchorOffsets(doc, measure).get('0:11')?.dy).toBe(234)
 })

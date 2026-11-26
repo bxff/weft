@@ -29,17 +29,14 @@ async function liveStrokes(page: Page): Promise<Stroke[]> {
         .map((b) => ({ points: (b as { line: { points: { x: number; y: number }[] } }).line.points }))
 }
 
-/** Wait for the projected stroke set to STOP changing (debounce + sync flush). */
-async function settle(page: Page): Promise<Stroke[]> {
-    let prev = -1
-    let cur: Stroke[] = []
-    for (let i = 0; i < 25; i++) {
-        cur = await liveStrokes(page)
-        if (cur.length === prev) return cur
-        prev = cur.length
-        await page.waitForTimeout(400)
-    }
-    return cur
+/** Poll for the edit to reach the relay, not for an unchanged pre-edit snapshot. */
+async function waitForStrokeCount(page: Page, minimum: number): Promise<Stroke[]> {
+    let strokes: Stroke[] = []
+    await expect.poll(async () => {
+        strokes = await liveStrokes(page)
+        return strokes.length
+    }, { timeout: 15_000 }).toBeGreaterThanOrEqual(minimum)
+    return strokes
 }
 
 const len = (s: Stroke): number => {
@@ -64,14 +61,14 @@ test.beforeEach(async ({ page }) => {
 test('a dotted line splits into VISIBLE dots (not microscopic), solid stays one stroke', async ({
     page,
 }) => {
-    const base = (await settle(page)).length
+    const base = (await liveStrokes(page)).length
     await createShape(page, {
         type: 'line',
         x: 80,
         y: 80,
         props: { dash: 'solid', points: { a1: { id: 'a1', index: 'a1', x: 0, y: 0 }, a2: { id: 'a2', index: 'a2', x: 400, y: 0 } } },
     })
-    const afterSolid = await settle(page)
+    const afterSolid = await waitForStrokeCount(page, base + 1)
     expect(afterSolid.length - base).toBeGreaterThanOrEqual(1)
 
     await createShape(page, {
@@ -80,7 +77,7 @@ test('a dotted line splits into VISIBLE dots (not microscopic), solid stays one 
         y: 160,
         props: { dash: 'dotted', points: { a1: { id: 'a1', index: 'a1', x: 0, y: 0 }, a2: { id: 'a2', index: 'a2', x: 400, y: 0 } } },
     })
-    const afterDotted = await settle(page)
+    const afterDotted = await waitForStrokeCount(page, afterSolid.length + 4)
     const dots = afterDotted.slice(afterSolid.length)
     expect(dots.length).toBeGreaterThan(3)
     // each dot must be a visible blob (~half the stroke width), not a speck
@@ -90,7 +87,7 @@ test('a dotted line splits into VISIBLE dots (not microscopic), solid stays one 
 })
 
 test('a dotted FREEHAND (draw) stroke honors dash (not one solid line)', async ({ page }) => {
-    const base = (await settle(page)).length
+    const base = (await liveStrokes(page)).length
     await page.evaluate(() => {
         ;(window as unknown as { __weftEditor?: { setCurrentTool(id: string): void } }).__weftEditor?.setCurrentTool('draw')
     })
@@ -101,7 +98,7 @@ test('a dotted FREEHAND (draw) stroke honors dash (not one solid line)', async (
     for (let i = 1; i <= 16; i++) await page.mouse.move(box.x + 100 + i * 22, y)
     await page.mouse.up()
     await page.keyboard.press('Escape')
-    const afterSolid = await settle(page)
+    const afterSolid = await waitForStrokeCount(page, base + 1)
     expect(afterSolid.length - base).toBeGreaterThanOrEqual(1)
 
     await page.evaluate(() => {
@@ -114,7 +111,7 @@ test('a dotted FREEHAND (draw) stroke honors dash (not one solid line)', async (
         const ids = [...ed.__weftEditor!.getCurrentPageShapeIds()]
         ed.__weftEditor!.updateShape({ id: ids[ids.length - 1], type: 'draw', props: { dash: 'dotted' } })
     })
-    const afterDotted = await settle(page)
+    const afterDotted = await waitForStrokeCount(page, afterSolid.length + 3)
     // dotted freehand must break into several dots
     expect(afterDotted.length - afterSolid.length).toBeGreaterThan(2)
 })
@@ -122,14 +119,14 @@ test('a dotted FREEHAND (draw) stroke honors dash (not one solid line)', async (
 test('a filled rectangle is hatched (adds an interior fill stroke over the outline)', async ({
     page,
 }) => {
-    const base = (await settle(page)).length
+    const base = (await liveStrokes(page)).length
     await createShape(page, {
         type: 'geo',
         x: 700,
         y: 80,
         props: { geo: 'rectangle', w: 260, h: 200, dash: 'solid', fill: 'none' },
     })
-    const afterHollow = await settle(page)
+    const afterHollow = await waitForStrokeCount(page, base + 1)
     expect(afterHollow.length - base).toBeGreaterThanOrEqual(1) // outline
 
     await createShape(page, {
@@ -138,7 +135,7 @@ test('a filled rectangle is hatched (adds an interior fill stroke over the outli
         y: 340,
         props: { geo: 'rectangle', w: 260, h: 200, dash: 'solid', fill: 'solid' },
     })
-    const afterFilled = await settle(page)
+    const afterFilled = await waitForStrokeCount(page, afterHollow.length + 2)
     const added = afterFilled.slice(afterHollow.length)
     // outline + at least one interior hatch stroke (hollow added only the outline)
     expect(added.length).toBeGreaterThanOrEqual(2)
@@ -147,14 +144,14 @@ test('a filled rectangle is hatched (adds an interior fill stroke over the outli
 })
 
 test('a rectangle LABEL projects as ink glyphs', async ({ page }) => {
-    const base = (await settle(page)).length
+    const base = (await liveStrokes(page)).length
     await createShape(page, {
         type: 'geo',
         x: 80,
         y: 420,
         props: { geo: 'rectangle', w: 300, h: 160, dash: 'solid', fill: 'none' },
     })
-    const afterPlain = await settle(page)
+    const afterPlain = await waitForStrokeCount(page, base + 1)
     const plainDelta = afterPlain.length - base
 
     await createShape(page, {
@@ -163,7 +160,7 @@ test('a rectangle LABEL projects as ink glyphs', async ({ page }) => {
         y: 620,
         props: { geo: 'rectangle', w: 300, h: 160, dash: 'solid', fill: 'none' },
     })
-    await settle(page)
+    await waitForStrokeCount(page, afterPlain.length + 1)
     // set the label the deterministic way (the keyboard edit flow is flaky
     // headless); this is the same richText a user's typing produces
     await page.evaluate(() => {
@@ -182,7 +179,7 @@ test('a rectangle LABEL projects as ink glyphs', async ({ page }) => {
             },
         })
     })
-    const afterLabeled = await settle(page)
+    const afterLabeled = await waitForStrokeCount(page, afterPlain.length + plainDelta + 6)
     // HELLO's glyph contours add many strokes beyond a bare outline
     expect(afterLabeled.length - afterPlain.length).toBeGreaterThan(plainDelta + 5)
 })
@@ -191,7 +188,7 @@ test('moving a FRAME re-projects its children (frame contents follow on the tabl
     // a frame is a true clipping container: children are frame-relative, so
     // moving the frame updates ONLY the frame record. Without re-enqueuing the
     // frame's descendants, their strokes never move on the tablet.
-    const base = (await settle(page)).length
+    const base = (await liveStrokes(page)).length
     const frameId = await page.evaluate(() => {
         const e = (window as unknown as { __weftEditor?: any }).__weftEditor
         e.createShape({ type: 'frame', x: 1200, y: 1000, props: { w: 300, h: 300 } })
@@ -200,7 +197,7 @@ test('moving a FRAME re-projects its children (frame contents follow on the tabl
         e.createShape({ type: 'geo', parentId: fid, x: 1240, y: 1040, props: { geo: 'rectangle', w: 80, h: 80, dash: 'solid' } })
         return fid
     })
-    const created = await settle(page)
+    const created = await waitForStrokeCount(page, base + 1)
     const minX = (ss: Stroke[]): number => Math.min(...ss.slice(base).flatMap((s) => s.points.map((p) => p.x)))
     const before = minX(created)
     await page.evaluate((fid) => {
@@ -218,7 +215,7 @@ test('moving a FRAME re-projects its children (frame contents follow on the tabl
 })
 
 test('a sticky NOTE projects (outline + its text), not dropped', async ({ page }) => {
-    const base = (await settle(page)).length
+    const base = (await liveStrokes(page)).length
     await createShape(page, {
         type: 'note',
         x: 1100,
@@ -230,7 +227,7 @@ test('a sticky NOTE projects (outline + its text), not dropped', async ({ page }
             },
         },
     })
-    const after = await settle(page)
+    const after = await waitForStrokeCount(page, base + 5)
     // was ZERO before the fix (note not syncable); now outline + glyph strokes
     expect(after.length - base).toBeGreaterThan(4)
 })
