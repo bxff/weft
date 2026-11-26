@@ -75,10 +75,10 @@ import {
 } from './device-text-richtext'
 import { textFromNode, eraseRichTextGlyphs, canonicalRichText } from './richtext-plain'
 import {
+    NATIVE_FONT_PRELOADS,
     canvasMeasure,
     layoutText,
     metricsFor,
-    penPositions,
     DEVICE_TEXT_LEFT_MARGIN_INK,
 } from './text-metrics'
 import { computeAnchorOffsets } from './text-anchor-layout'
@@ -821,18 +821,11 @@ export class StudioController {
     private async settleDeviceFonts(): Promise<void> {
         if (typeof document === 'undefined' || !document.fonts) return
         // the px size is irrelevant to WHICH face loads; use a nominal one
-        const specs = [
-            `10px 'RM Noto Sans'`,
-            `500 10px 'RM Noto Sans'`,
-            `700 10px 'RM Noto Sans'`,
-            `16px 'RM Noto Serif'`,
-        ]
+        const specs = NATIVE_FONT_PRELOADS
         if (specs.every((s) => document.fonts.check(s))) return // already correct
-        try {
-            await Promise.all(specs.map((s) => document.fonts.load(s)))
-        } catch {
-            return // measureText will use whatever face is available
-        }
+        const loaded = await Promise.allSettled(specs.map((s) => document.fonts.load(s)))
+        if (loaded.every((r) => r.status === 'rejected')) return
+        // A missing optional face must not suppress reflow for the ones that did load.
         if (this.disposed || !this.session) return
         if (!this.session.document.tree().rootText) return // nothing to re-lay out
         this.layoutGen++
@@ -1919,7 +1912,7 @@ export class StudioController {
         const lines: { x: number; y: number; w: number; h: number }[] = []
         paragraphs.forEach((p, pi) => {
             const para = layout.paras[pi]!
-            const m = metricsFor(p.style, p.sizeCode)
+            const m = metricsFor(p.style, p.sizeCode, p.indentLevel)
             const full = p.spans.map((s) => s.text).join('')
             para.lineStarts.forEach((start, li) => {
                 const end =
@@ -1932,7 +1925,8 @@ export class StudioController {
                     markerX !== undefined
                         ? Math.min(markerX, m.indentInk)
                         : m.indentInk || DEVICE_TEXT_LEFT_MARGIN_INK
-                const wInk = m.indentInk - leftInk + penPositions(lineText, m, undefined, measure).end
+                const textStartInk = m.indentInk || DEVICE_TEXT_LEFT_MARGIN_INK
+                const wInk = textStartInk - leftInk + para.lineWidthsInk[li]!
                 lines.push({
                     x: Math.round(leftInk * RM_SCALE * 100) / 100,
                     y: Math.round((para.topInk + li * para.lineStrideInk) * RM_SCALE * 100) / 100,
@@ -1956,7 +1950,7 @@ export class StudioController {
                 richText,
                 lines,
             },
-            meta: { weft: true },
+            meta: { weft: true, layoutGen: this.layoutGen },
         }
         this.remote(() => {
             if (existing) this.editor.updateShape(record as never)
