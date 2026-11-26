@@ -1,0 +1,173 @@
+name: Preview Weft Pages
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Number of an open, preview-labeled PR in this repo
+        type: number
+        required: true
+
+permissions: {}
+
+jobs:
+  select:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      vars.WEFT_PRIVATE_PREVIEWS_ENABLED == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      pr: ${{ steps.pr.outputs.pr }}
+      sha: ${{ steps.pr.outputs.sha }}
+    steps:
+      - name: Select an approved, tested PR head
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
+          MANUAL_PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$MANUAL_PR" =~ ^[1-9][0-9]*$ ]]
+            candidates=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$MANUAL_PR" | jq '[.]')
+          else
+            [[ "$CI_SHA" =~ ^[0-9a-f]{40}$ ]]
+            candidates=$(gh api "repos/$GITHUB_REPOSITORY/commits/$CI_SHA/pulls")
+          fi
+          candidate=$(jq -c --arg repo "$GITHUB_REPOSITORY" --arg sha "$CI_SHA" '
+            [
+              .[] | select(.state == "open" and .base.ref == "main" and
+                .head.repo.full_name == $repo and .base.repo.full_name == $repo and
+                ($sha == "" or .head.sha == $sha) and any(.labels[]; .name == "preview"))
+            ] | if length == 1 then .[0] else empty end
+          ' <<< "$candidates")
+          if [[ -z "$candidate" ]]; then
+            echo 'No eligible, preview-labeled PR.'
+            [[ "$GITHUB_EVENT_NAME" != workflow_dispatch ]]
+            exit
+          fi
+          pr=$(jq -r .number <<< "$candidate")
+          sha=$(jq -r .head.sha <<< "$candidate")
+          [[ "$pr" =~ ^[1-9][0-9]*$ && "$sha" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event pull_request \
+              --commit "$sha" --status success --limit 1 --json headSha --jq '.[0].headSha // ""')
+            [[ "$passed" == "$sha" ]] || { echo 'CI must pass on the current PR head.'; exit 1; }
+          fi
+          printf 'pr=%s\nsha=%s\n' "$pr" "$sha" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: select
+    if: needs.select.outputs.pr != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.select.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - name: Build without production services
+        working-directory: apps/web
+        env:
+          PUBLIC_CLOUD_URL: https://preview-relay.invalid
+          PUBLIC_CLERK_PUBLISHABLE_KEY: ""
+          PUBLIC_TLDRAW_LICENSE_KEY: ""
+          PUBLIC_DOCS_URL: ""
+        run: bun run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weft-preview-static
+          path: apps/web/build/
+          if-no-files-found: error
+          retention-days: 1
+          include-hidden-files: true
+
+  upload:
+    needs: [select, build]
+    if: vars.WEFT_PRIVATE_PREVIEWS_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      pull-requests: read
+    concurrency:
+      group: weft-pages-preview-${{ needs.select.outputs.pr }}
+      cancel-in-progress: false
+    environment:
+      name: pages-preview
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.3"
+      - name: Install Wrangler before downloading the build
+        run: npm install --prefix "$RUNNER_TEMP/weft-wrangler" --no-audit --no-fund wrangler@4.168.0
+      - uses: actions/download-artifact@v4
+        with:
+          name: weft-preview-static
+          path: ${{ runner.temp }}/weft-preview-static
+      - name: Reject symlinks and Pages runtime code
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/weft-preview-static"
+          test -f "$root/index.html"
+          reject=$(find "$root" \( -type l -o -iname '_worker.js' -o -iname 'functions' \
+            -o -iname 'wrangler.toml' -o -iname 'wrangler.json' -o -iname 'wrangler.jsonc' \) -print -quit)
+          [[ -z "$reject" ]] || { echo 'Preview must contain static assets only.'; exit 1; }
+      - name: Confirm the approval and SHA are still current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.select.outputs.pr }}
+          SHA: ${{ needs.select.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" | jq -e \
+            --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" \
+            '.state == "open" and .base.ref == "main" and .head.sha == $sha and
+             .head.repo.full_name == $repo and any(.labels[]; .name == "preview")' >/dev/null
+      - name: Upload only to a non-production branch alias
+        id: deploy
+        working-directory: ${{ runner.temp }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_PAGES_PROJECT: ${{ vars.CLOUDFLARE_PAGES_PROJECT }}
+          PAGES_HOSTNAME: ${{ vars.CLOUDFLARE_PAGES_HOSTNAME }}
+          PR: ${{ needs.select.outputs.pr }}
+          SHA: ${{ needs.select.outputs.sha }}
+        run: |
+          set -euo pipefail
+          : "${CLOUDFLARE_API_TOKEN:?Set a Pages deployment token in pages-preview}"
+          [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[a-f0-9]{32}$ ]]
+          [[ "$CLOUDFLARE_PAGES_PROJECT" =~ ^[a-z0-9-]+$ ]]
+          [[ "$PAGES_HOSTNAME" =~ ^[a-z0-9-]+\.pages\.dev$ ]]
+          [[ "$PR" =~ ^[1-9][0-9]*$ && "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          alias="pr-$PR"
+          project=$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/$CLOUDFLARE_PAGES_PROJECT" \
+            | jq -er --arg hostname "$PAGES_HOSTNAME" \
+                'select(.success and .result.subdomain == $hostname) | .result.production_branch')
+          [[ -n "$project" && "$project" != "$alias" ]]
+          "$RUNNER_TEMP/weft-wrangler/node_modules/.bin/wrangler" pages deploy \
+            "$RUNNER_TEMP/weft-preview-static" --project-name="$CLOUDFLARE_PAGES_PROJECT" \
+            --branch="$alias" --commit-hash="$SHA"
+          url="https://$alias.$PAGES_HOSTNAME"
+          printf 'url=%s\n' "$url" >> "$GITHUB_OUTPUT"
+          printf '[Open the protected preview](%s)\n' "$url" >> "$GITHUB_STEP_SUMMARY"
