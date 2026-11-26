@@ -185,8 +185,14 @@ export type MeasureFn = (text: string, font: string) => number
 
 /** canvas measureText fallback for glyphs outside the device tables. */
 export function canvasMeasure(): MeasureFn {
-    const ctx = document.createElement('canvas').getContext('2d')!
+    let ctx: CanvasRenderingContext2D | null | undefined
     return (text, font) => {
+        // Create a canvas only if a glyph was absent from our tables. Tests
+        // and non-browser consumers use the same estimate as no measurer.
+        if (ctx === undefined) {
+            ctx = typeof document === 'undefined' ? null : document.createElement('canvas').getContext('2d')
+        }
+        if (!ctx) return 0.55 * Number(font.match(/([\d.]+)px/)?.[1] ?? BODY_PX)
         ctx.font = font
         return ctx.measureText(text).width
     }
@@ -223,11 +229,11 @@ export function glyphAdvanceInk(
     span?: SpanStyle,
     measure?: MeasureFn,
 ): number {
+    const both = span?.bold && span?.italic
+    const italic = span?.italic && !both
+    const bold = span?.bold && !both
     const font = spanFontKey(m, span)
     if (nativeFontProfile) {
-        const both = span?.bold && span?.italic
-        const italic = span?.italic && !both
-        const bold = span?.bold && !both
         const key = !bold && !italic ? PROFILE_ADVANCE_TABLE[m.emInk]
             : m.emInk === 32 ? italic ? 'ital32' : 'bold32' : undefined
         const hinted = key === undefined ? undefined : nativeFontProfile.advances[key]?.[ch]
@@ -237,8 +243,22 @@ export function glyphAdvanceInk(
         const advance = OPEN_FONT_ADVANCES[font]?.[ch]
         if (advance !== undefined) return advance * m.emInk
     }
-    if (measure) return measure(ch, m.font) * INK_PER_PX
+    if (measure) {
+        const style = italic ? 'italic ' : ''
+        const weight = bold ? 700 : m.css.fontWeight ?? 400
+        return measure(ch, `${style}${weight} ${m.css.fontSizePx}px ${m.css.fontFamily}`) * INK_PER_PX
+    }
     return 0.55 * m.emInk
+}
+
+function pairKernInk(
+    table: Record<string, number> | undefined,
+    previous: string,
+    next: string,
+    emInk: number,
+): number {
+    const pair = previous && table?.[previous + next]
+    return pair ? Math.round(pair * emInk * 64 / 1000) / 64 : 0
 }
 
 /** Pen positions for a run: x offset of each glyph (from pen start) plus the
@@ -254,18 +274,12 @@ export function penPositions(
     let previous = ''
     const kerning = nativeFontProfile?.kerning[spanFontKey(m, span)]
     for (const ch of text) {
-        const pair = previous && kerning?.[previous + ch]
-        if (pair) pen += Math.round(pair * m.emInk * 64 / 1000) / 64
+        pen += pairKernInk(kerning, previous, ch, m.emInk)
         xs.push(pen)
         pen += glyphAdvanceInk(ch, m, span, measure)
         previous = ch
     }
     return { xs, end: pen }
-}
-
-/** run width in ink (spaces at the END excluded, Qt wrap semantics). */
-function runWidthInk(text: string, m: StyleMetrics, measure?: MeasureFn): number {
-    return penPositions(text.replace(/ +$/, ''), m, undefined, measure).end
 }
 
 export interface ParagraphLayout {
@@ -276,37 +290,84 @@ export interface ParagraphLayout {
     /** baseline offset within each line box (baseline - top). */
     baselineOffsetInk: number
     lineStrideInk: number
-    /** visible-char offset each wrapped line starts at. */
+    /** UTF-16 offsets at grapheme boundaries, shared with native char IDs. */
     lineStarts: number[]
+    /** Painted advance of each line, excluding trailing ASCII spaces. */
+    lineWidthsInk: number[]
     style: number
 }
 
-/** Greedy word wrap with the device pen model. */
+let graphemes: Intl.Segmenter | undefined
+
+function* wrapUnits(text: string): Iterable<{ index: number; segment: string }> {
+    // Printable ASCII cannot contain a multi-code-unit grapheme.
+    if (/^[ -~]*$/.test(text)) {
+        for (let i = 0; i < text.length; i++) yield { index: i, segment: text[i]! }
+        return
+    }
+    // An older engine may lack Segmenter. Overflow instead of splitting an
+    // unknown grapheme cluster or corrupting its UTF-16 anchor offsets.
+    if (typeof Intl.Segmenter !== 'function') {
+        yield { index: 0, segment: text }
+        return
+    }
+    graphemes ??= new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+    yield* graphemes.segment(text)
+}
+
+/** Measure the same styled segments the SVG paints. Prefix positions keep
+ * the greedy wrapping pass linear, even for a long line with no breaks. */
 function wrapParagraph(
-    text: string,
+    spans: readonly TextParagraph['spans'][number][],
     m: StyleMetrics,
     availInk: number,
     measure?: MeasureFn,
-): number[] {
-    if (text.length === 0) return [0]
-    const starts = [0]
-    let lineStart = 0
-    let candidate = 0
-    for (let i = 0; i < text.length; i++) {
-        if (text[i] === ' ') candidate = i + 1
-        if (text[i] === ' ') continue // trailing spaces never trigger a break
-        const w = runWidthInk(text.slice(lineStart, i + 1), m, measure)
-        if (w > availInk && i > lineStart) {
-            const breakAt = candidate > lineStart ? candidate : i
-            starts.push(breakAt)
-            lineStart = breakAt
-            candidate = lineStart
+): { lineStarts: number[]; lineWidthsInk: number[] } {
+    const text = spans.map((s) => s.text).join('')
+    const cumulative = new Float64Array(text.length + 1)
+    const leadingKern = nativeFontProfile ? new Float64Array(text.length) : undefined
+    let at = 0
+    for (const span of spans) {
+        const kerning = nativeFontProfile?.kerning[spanFontKey(m, span)]
+        let previous = ''
+        for (const char of span.text) {
+            const kern = pairKernInk(kerning, previous, char, m.emInk)
+            const next = at + char.length
+            if (leadingKern) leadingKern[at] = kern
+            cumulative[next] = cumulative[at]! + kern + glyphAdvanceInk(char, m, span, measure)
+            at = next
+            previous = char
         }
-        // a hyphen is a break opportunity (break after it), like xochitl and
-        // the browser
-        if (text[i] === '-' && i + 1 < text.length) candidate = i + 1
     }
-    return starts
+    // The first glyph on a new line doesn't kern against the previous line.
+    const width = (start: number, end: number) =>
+        start < end ? cumulative[end]! - cumulative[start]! - (leadingKern?.[start] ?? 0) : 0
+    const lineStarts = [0]
+    const lineWidthsInk: number[] = []
+    let start = 0
+    let candidate = 0
+    let candidateEnd = 0
+    let lastNonSpace = 0
+    for (const { index, segment } of wrapUnits(text)) {
+        const end = index + segment.length
+        if (segment === ' ') {
+            candidate = end
+            candidateEnd = lastNonSpace
+            continue // trailing spaces neither force wrapping nor count in width
+        }
+        while (index > start && width(start, end) > availInk) {
+            const keepWord = candidate > start
+            const breakAt = keepWord ? candidate : index
+            lineWidthsInk.push(width(start, keepWord ? candidateEnd : index))
+            lineStarts.push(breakAt)
+            start = breakAt
+            candidate = start
+        }
+        lastNonSpace = end
+        if (segment === '-') candidate = candidateEnd = end
+    }
+    lineWidthsInk.push(width(start, lastNonSpace))
+    return { lineStarts, lineWidthsInk }
 }
 
 export type LayoutParagraph = Omit<TextParagraph, 'startId'>
@@ -327,14 +388,13 @@ export function layoutText(
     let lastStride = BODY_LINE_STRIDE_INK
     for (const p of paragraphs) {
         const m = metricsFor(p.style, p.sizeCode, p.indentLevel)
-        const text = p.spans.map((s) => s.text).join('')
         const avail = Math.max(
             1,
             widthInk -
                 (m.indentInk > 0 ? m.indentInk : DEVICE_TEXT_LEFT_MARGIN_INK) -
                 DEVICE_TEXT_RIGHT_MARGIN_INK,
         )
-        const lineStarts = wrapParagraph(text, m, avail, measure)
+        const lines = wrapParagraph(p.spans, m, avail, measure)
         const firstBaseline: number =
             prevBaseline === null
                 ? m.baselineInk
@@ -345,10 +405,10 @@ export function layoutText(
             firstBaselineInk: firstBaseline,
             baselineOffsetInk: m.baselineInk,
             lineStrideInk: m.lineStrideInk,
-            lineStarts,
+            ...lines,
             style: p.style,
         })
-        const lastBaseline: number = firstBaseline + (lineStarts.length - 1) * m.lineStrideInk
+        const lastBaseline: number = firstBaseline + (lines.lineStarts.length - 1) * m.lineStrideInk
         lastTop = lastBaseline - m.baselineInk
         lastStride = m.lineStrideInk
         prevBaseline = lastBaseline

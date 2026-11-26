@@ -327,7 +327,7 @@ test('a rotated and locked group receives the reflow in page coordinates', async
     expect(after[1]!.y).toBeCloseTo(state[1]!.y)
 })
 
-test('changed font metrics reflow the existing anchored stroke', async ({ page, request }) => {
+test('changed fallback glyph widths reflow visible text, hitboxes and anchored ink together', async ({ page, request }) => {
     const { first } = await anchoredReflowPushes()
     const { RmDocument, insertText } = await import('../packages/rm-format/src/index')
     const doc = RmDocument.parse(first as never)
@@ -342,10 +342,28 @@ test('changed font metrics reflow the existing anchored stroke', async ({ page, 
         const shape = ed.getCurrentPageShapes().find(shape => shape.type === 'draw')!
         return { id: shape.id, x: shape.x, y: shape.y }
     })
+    const { RM_SCALE } = await import('../packages/rm-ink/src/pen')
+    const layout = () => page.evaluate(() => {
+        const ed = (window as unknown as { __weftEditor: Editor }).__weftEditor
+        const column = ed.getCurrentPageShapes().find((shape) => shape.type === 'device-text')
+        const svg = document.querySelectorAll('.tl-shape[data-shape-type="device-text"] svg text')
+        return {
+            lastBaseline: Math.max(...Array.from(svg, (node) => Number(node.getAttribute('y')))),
+            lastHitbox: column?.type === 'device-text' ? column.props.lines.at(-1)?.y ?? 0 : 0,
+        }
+    })
+    await expect.poll(async () => Number.isFinite((await layout()).lastBaseline)).toBe(true)
     const before = await stroke()
+    const beforeLayout = await layout()
     await page.evaluate(() => window.releaseDeviceFonts())
     await expect.poll(async () => (await stroke()).y).toBeGreaterThan(before.y)
-    expect(await stroke()).toMatchObject({ id: before.id, x: before.x })
+    await expect.poll(async () => (await layout()).lastBaseline).toBeGreaterThan(beforeLayout.lastBaseline)
+    const after = await stroke()
+    const afterLayout = await layout()
+    expect(after).toMatchObject({ id: before.id, x: before.x })
+    const delta = after.y - before.y
+    expect((afterLayout.lastBaseline - beforeLayout.lastBaseline) * RM_SCALE).toBeCloseTo(delta, 2)
+    expect(afterLayout.lastHitbox - beforeLayout.lastHitbox).toBeCloseTo(delta, 1)
 })
 
 test('a text edit reapplies native layer visibility without replacing the ink', async ({ page, request }) => {

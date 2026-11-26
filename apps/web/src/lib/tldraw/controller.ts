@@ -79,7 +79,6 @@ import {
     canvasMeasure,
     layoutText,
     metricsFor,
-    penPositions,
     DEVICE_TEXT_LEFT_MARGIN_INK,
 } from './text-metrics'
 import { computeAnchorOffsets } from './text-anchor-layout'
@@ -1913,7 +1912,7 @@ export class StudioController {
         const lines: { x: number; y: number; w: number; h: number }[] = []
         paragraphs.forEach((p, pi) => {
             const para = layout.paras[pi]!
-            const m = metricsFor(p.style, p.sizeCode)
+            const m = metricsFor(p.style, p.sizeCode, p.indentLevel)
             const full = p.spans.map((s) => s.text).join('')
             para.lineStarts.forEach((start, li) => {
                 const end =
@@ -1926,7 +1925,8 @@ export class StudioController {
                     markerX !== undefined
                         ? Math.min(markerX, m.indentInk)
                         : m.indentInk || DEVICE_TEXT_LEFT_MARGIN_INK
-                const wInk = m.indentInk - leftInk + penPositions(lineText, m, undefined, measure).end
+                const textStartInk = m.indentInk || DEVICE_TEXT_LEFT_MARGIN_INK
+                const wInk = textStartInk - leftInk + para.lineWidthsInk[li]!
                 lines.push({
                     x: Math.round(leftInk * RM_SCALE * 100) / 100,
                     y: Math.round((para.topInk + li * para.lineStrideInk) * RM_SCALE * 100) / 100,
@@ -1950,7 +1950,7 @@ export class StudioController {
                 richText,
                 lines,
             },
-            meta: { weft: true },
+            meta: { weft: true, layoutGen: this.layoutGen },
         }
         this.remote(() => {
             if (existing) this.editor.updateShape(record as never)

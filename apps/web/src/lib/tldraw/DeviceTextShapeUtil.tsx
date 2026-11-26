@@ -178,6 +178,7 @@ export class DeviceTextShapeUtil extends ShapeUtil<DeviceTextShape> {
                         <DeviceTextSvgContent
                             richText={shape.props.richText}
                             widthInk={shape.props.w / RM_SCALE}
+                            layoutGen={typeof shape.meta.layoutGen === 'number' ? shape.meta.layoutGen : 0}
                         />
                     </g>
                 </SVGContainer>

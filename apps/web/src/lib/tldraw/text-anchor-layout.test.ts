@@ -5,7 +5,9 @@
  * step(32->64) = 163.15625.
  */
 import { expect, test } from 'bun:test'
-import { layoutText, PARA_STRIDE_INK, type MeasureFn } from './text-metrics'
+import { layoutText, metricsFor, penPositions, PARA_STRIDE_INK, type MeasureFn } from './text-metrics'
+import { paragraphsToRichText } from './device-text-richtext'
+import { buildSvgLines } from './device-text-svg'
 import { computeAnchorOffsets, lineTopOf } from './text-anchor-layout'
 import {
     ANCHOR_TEXT_START,
@@ -138,4 +140,81 @@ test('legacy END without anchor type retains line-top placement on visible text'
     if (group?.type !== 'treeNode') throw new Error('missing anchored group')
     group.anchorType = null
     expect(computeAnchorOffsets(doc, measure).get('0:11')?.dy).toBe(234)
+})
+
+test('styled text wraps using the painted advances', () => {
+    const text = 'heading heading'
+    const normal = para(text)
+    const strong = { ...normal, spans: [{ text, bold: true, italic: false }] }
+    const m = metricsFor(1)
+    const advance = penPositions(text, m).end
+    const boldAdvance = penPositions(text, m, strong.spans[0]!).end
+    expect(boldAdvance).toBeGreaterThan(advance)
+    const width = 8 + (advance + boldAdvance) / 2
+    expect(layoutText([normal], width).paras[0]!.lineStarts).toEqual([0])
+    expect(layoutText([strong], width).paras[0]!.lineStarts).toEqual([0, 8])
+})
+
+test('wrapping never splits a surrogate pair or combining cluster, even when oversized', () => {
+    const text = '🙂e\u0301🙂'
+    const p = para(text)
+    // Make the fallback advance greater than the frame's usable width.
+    const starts = layoutText([p], 10, measure).paras[0]!.lineStarts
+    expect(starts).toEqual([0, 2, 4])
+})
+
+
+test('mixed styled runs share their wraps and painted widths with the SVG', () => {
+    const normal = para('heading heading')
+    const p = { ...normal, spans: [
+        { text: 'heading ', bold: false, italic: false },
+        { text: 'heading', bold: true, italic: false },
+    ] }
+    const m = metricsFor(1)
+    const normalWidth = penPositions(normal.spans[0]!.text, m).end
+    const before = penPositions(p.spans[0]!.text, m).end
+    const after = penPositions(p.spans[1]!.text, m, p.spans[1]).end
+    const width = 8 + (normalWidth + before + after) / 2
+    const parsed = layoutText([p], width).paras[0]!
+    expect(parsed.lineStarts).toEqual([0, 8])
+    const lines = buildSvgLines(paragraphsToRichText([p]), width)
+    expect(lines.map((line) => line.runs.map((run) => run.text).join(''))).toEqual([
+        'heading ',
+        'heading',
+    ])
+    lines.forEach((line, i) =>
+        expect(line.endX - line.startX).toBeCloseTo(parsed.lineWidthsInk[i]!, 10),
+    )
+})
+
+test('ordinary whitespace and hyphen breaks keep UTF-16 positions', () => {
+    const m = metricsFor(1)
+    const width = 8 + Math.max(penPositions('hello-', m).end, penPositions('world', m).end) + 0.1
+    expect(layoutText([para('hello-world    ')], width).paras[0]!.lineStarts).toEqual([0, 6])
+    const withSpaces = layoutText([para('hello    ')], width).paras[0]!
+    expect(withSpaces.lineStarts).toEqual([0])
+    expect(withSpaces.lineWidthsInk).toEqual([penPositions('hello', m).end])
+    expect(layoutText([para('     ')], width).paras[0]!.lineWidthsInk).toEqual([0])
+})
+
+test('older browsers without Segmenter keep a Unicode paragraph intact', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(Intl, 'Segmenter')!
+    try {
+        Object.defineProperty(Intl, 'Segmenter', { configurable: true, value: undefined })
+        expect(layoutText([para('🙂e\u0301🙂')], 10, measure).paras[0]!.lineStarts).toEqual([0])
+        expect(layoutText([para('abc')], 10, measure).paras[0]!.lineStarts).toEqual([0, 1, 2])
+    } finally {
+        Object.defineProperty(Intl, 'Segmenter', descriptor)
+    }
+})
+
+test('unsupported glyph geometry stays deterministic without a browser canvas', () => {
+    const p = para('🙂🙂')
+    const width = 36
+    const layout = layoutText([p], width).paras[0]!
+    const svg = buildSvgLines(paragraphsToRichText([p]), width)
+    expect(svg.map((line) => line.runs.map((run) => run.text).join(''))).toEqual(['🙂', '🙂'])
+    svg.forEach((line, i) =>
+        expect(line.endX - line.startX).toBeCloseTo(layout.lineWidthsInk[i]!, 10),
+    )
 })
