@@ -36,6 +36,7 @@ for (const [family, width, height, dpr, expectedRatio] of [
             expect(assetWidth).toBeGreaterThanOrEqual(rect!.width * dpr * 0.95)
             expect(rect!.width / rect!.height).toBeCloseTo(expectedRatio, 2)
             await expect(page.getByRole('link', { name: 'Read the docs' })).toBeVisible()
+            await expect(page.locator('footer')).not.toContainText('©')
             await expect(page.getByRole('link', { name: 'bxff/weft', exact: true })).toHaveAttribute('href', 'https://github.com/bxff/weft')
         })
     })
