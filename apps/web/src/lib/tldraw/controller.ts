@@ -8,6 +8,7 @@ import { libraryCacheScope, readCachedDocumentList } from '../library-cache'
 import {
     AssetRecordType,
     createShapeId,
+    DefaultFontFaces,
     DefaultFontFamilies,
     isShapeId,
     Mat,
@@ -184,7 +185,7 @@ export class StudioController {
     /** PDF page size in points, reported by pdf.js once the file loads. */
     pdfPtSize: { w: number; h: number } | null = null
     private editor!: Editor
-    private font: Font | null = null
+    private fonts = new Map<ProjectionFamily, Font>()
     pageMeta: PageMeta = {
         docType: 'notebook',
         template: null,
@@ -524,21 +525,46 @@ export class StudioController {
 
     /** Font loading retries on demand: a single failed fetch must not stop
      *  text from ever syncing this session. */
-    private fontLoad: Promise<Font | null> | null = null
-    private async ensureFont(): Promise<Font | null> {
-        if (this.font) return this.font
-        if (!this.opts.fontUrl) return null
-        this.fontLoad ??= (async () => {
+    private fontLoads = new Map<ProjectionFamily, Promise<Font | null>>()
+
+    private ensureFont(shape?: TLShape): Promise<Font | null> {
+        const family = projectionFamily(shape)
+        const cached = this.fonts.get(family)
+        if (cached) return Promise.resolve(cached)
+        const url = family === 'draw' ? this.opts.fontUrl : projectionFontUrls[family]
+        if (!url) return Promise.resolve(null)
+        const loading = this.fontLoads.get(family)
+        if (loading) return loading
+
+        const work = (async () => {
             try {
-                const buf = await (await fetch(this.opts.fontUrl!)).arrayBuffer()
-                this.font = parseFont(buf)
-                return this.font
+                const response = await fetch(url)
+                if (!response.ok) return null
+                const font = parseFont(await response.arrayBuffer())
+                // Wait before measuring text or label bounds: fallback CSS
+                // metrics can wrap the right outlines at the wrong positions.
+                if (family !== 'draw' && !this.disposed) {
+                    await this.editor.fonts.ensureFontIsLoaded(DefaultFontFaces[`tldraw_${family}`].normal.normal)
+                }
+                this.fonts.set(family, font)
+                return font
             } catch {
-                this.fontLoad = null // transient failure: retry next flush
                 return null
             }
-        })()
-        return this.fontLoad
+        })().finally(() => this.fontLoads.delete(family))
+        this.fontLoads.set(family, work)
+        return work
+    }
+
+    private missingProjectionFonts(): Map<ProjectionFamily, TLShape> {
+        const missing = new Map<ProjectionFamily, TLShape>()
+        for (const id of this.pendingShapeIds) {
+            const shape = this.editor.getShape(id as TLShapeId)
+            if (shape && needsProjectionFont(shape) && !this.fonts.has(projectionFamily(shape))) {
+                missing.set(projectionFamily(shape), shape)
+            }
+        }
+        return missing
     }
 
     /** Detached-shape resolution: re-render from props (text stays text). */
@@ -546,8 +572,8 @@ export class StudioController {
         if (this.disposed) return
         const shape = this.editor.getShape(shapeId as TLShapeId)
         if (!shape) return
-        if (!this.font && needsProjectionFont(shape)) {
-            if (!(await this.ensureFont()) || this.disposed || this.editor.getShape(shape.id) !== shape) return
+        if (!this.fonts.has(projectionFamily(shape)) && needsProjectionFont(shape)) {
+            if (!(await this.ensureFont(shape)) || this.disposed || this.editor.getShape(shape.id) !== shape) return
         }
         const opacity = this.storedOpacity(shapeId)
         const op = this.projectShape(shape)
@@ -1632,9 +1658,7 @@ export class StudioController {
                 await Promise.all([...this.pendingCommands])
                 await this.flush()
                 if (this.disposed) return
-                const missingFont = !this.font && [...this.pendingShapeIds].some((id) =>
-                    needsProjectionFont(this.editor.getShape(id as TLShapeId)),
-                )
+                const missingFont = this.missingProjectionFonts().size > 0
                 const gestureInProgress = this.pendingInkTransforms.size > 0 && this.editor.inputs.getIsPointing()
                 if (missingFont || gestureInProgress) throw new Error('Some edits could not be projected yet')
                 const failure = this.saveFailure
@@ -1668,10 +1692,9 @@ export class StudioController {
 
     private async flushBatch(): Promise<void> {
         if (this.disposed) return
-        if (!this.font && [...this.pendingShapeIds].some((id) =>
-            needsProjectionFont(this.editor.getShape(id as TLShapeId)),
-        )) {
-            await this.ensureFont()
+        const missingFonts = this.missingProjectionFonts()
+        if (missingFonts.size) {
+            await Promise.all([...missingFonts.values()].map((shape) => this.ensureFont(shape)))
             if (this.disposed) return
         }
         const ops: LocalOp[] = []
@@ -1758,7 +1781,7 @@ export class StudioController {
                 }
                 continue
             }
-            if (!this.font && needsProjectionFont(shape)) {
+            if (!this.fonts.has(projectionFamily(shape)) && needsProjectionFont(shape)) {
                 this.pendingShapeIds.add(shapeId)
                 this.pendingShapeVersions.set(shapeId, captured)
                 if (opacityWrite && !this.pendingOpacityWrites.has(shapeId)) this.pendingOpacityWrites.set(shapeId, opacityWrite)
@@ -2682,7 +2705,8 @@ export class StudioController {
                 }
             }
             case 'text': {
-                if (!this.font) return null
+                const font = this.fonts.get(projectionFamily(shape))
+                if (!font) return null
                 const props = shape.props as {
                     richText?: unknown
                     size?: string
@@ -2717,7 +2741,7 @@ export class StudioController {
                     font: (shape.props as { font?: string }).font,
                 })
                 const parts = textToGlyphParts(
-                    this.font,
+                    font,
                     { text, fontSize },
                     { x: shape.x, y: shape.y, rotation: shape.rotation, m: [t.a, t.b, t.c, t.d, t.e, t.f] },
                     colorOf(shape),
@@ -2755,7 +2779,7 @@ export class StudioController {
                 // LABEL: text typed inside a shape (a rectangle/arrow/line label)
                 // renders on the web but was dropped from the tablet entirely.
                 const label = extractPlainText(shape.props as { richText?: unknown; text?: string })
-                if (this.font && label.trim()) parts.push(...this.projectLabel(shape, label))
+                if (label.trim()) parts.push(...this.projectLabel(shape, label))
                 if (parts.length === 0) return null
                 return {
                     type: 'upsert-shape',
@@ -2775,7 +2799,7 @@ export class StudioController {
                     strokes: [stroke],
                 }))
                 const label = extractPlainText(shape.props as { richText?: unknown; text?: string })
-                if (this.font && label.trim()) parts.push(...this.projectLabel(shape, label))
+                if (label.trim()) parts.push(...this.projectLabel(shape, label))
                 if (parts.length === 0) return null
                 return {
                     type: 'upsert-shape',
@@ -2931,7 +2955,8 @@ export class StudioController {
      *  it. Local glyph coords are composed with the shape page transform so a
      *  grouped/rotated shape's label follows. */
     private projectLabel(shape: TLShape, label: string): { partKey: string; strokes: InkStroke[] }[] {
-        if (!this.font) return []
+        const font = this.fonts.get(projectionFamily(shape))
+        if (!font) return []
         const props = shape.props as {
             size?: string
             scale?: number
@@ -2971,7 +2996,7 @@ export class StudioController {
         })
         const blockH = spans?.length
             ? Math.max(...spans.map((s) => s.y + s.h)) - Math.min(...spans.map((s) => s.y))
-            : wrappedLineCount(this.font, { text: label, fontSize }, innerW) *
+            : wrappedLineCount(font, { text: label, fontSize }, innerW) *
               fontSize *
               lineHeight
         // top-left of the text block in shape-LOCAL px: horizontally inset by
@@ -2994,7 +3019,7 @@ export class StudioController {
             t.b * originX + t.d * originY + t.f,
         ]
         return textToGlyphParts(
-            this.font,
+            font,
             { text: label, fontSize },
             { x: shape.x, y: shape.y, rotation: shape.rotation, m },
             colorOf(shape),
@@ -3359,8 +3384,8 @@ export class StudioController {
         // Re-project the repaired text so the overlay/projection converge.
         const updated = this.editor.getShape(shapeId as TLShapeId)
         if (updated) {
-            if (!this.font) {
-                if (!(await this.ensureFont()) || this.disposed || this.editor.getShape(updated.id) !== updated) return
+            if (!this.fonts.has(projectionFamily(updated))) {
+                if (!(await this.ensureFont(updated)) || this.disposed || this.editor.getShape(updated.id) !== updated) return
             }
             const op = this.projectShape(updated, undefined, undefined, editVersion)
             if (op) await this.session.apply([op])
@@ -3523,6 +3548,22 @@ function collectSubpaths(
     }
     visit(geometry)
     return out
+}
+
+// Normal faces of the WOFF2s used by editor-assets. The tablet projection
+// parser reads WOFF, but not WOFF2. Keep the formats separate from family
+// selection so a failed face never silently writes another family's outlines.
+const projectionFontUrls = {
+    sans: '/fonts/projection/WeftOverlaySans.woff',
+    serif: '/fonts/projection/WeftOverlaySerif.woff',
+    mono: '/fonts/projection/WeftOverlayMono.woff',
+} as const
+
+type ProjectionFamily = 'draw' | keyof typeof projectionFontUrls
+
+function projectionFamily(shape?: TLShape): ProjectionFamily {
+    const family = (shape?.props as { font?: string } | undefined)?.font
+    return family === 'sans' || family === 'serif' || family === 'mono' ? family : 'draw'
 }
 
 function needsProjectionFont(shape?: TLShape): boolean {
