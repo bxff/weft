@@ -12,6 +12,10 @@ test("direct notebook links use a shared public shell with the generic fallback"
     const read = async (path: string) => (await fetch(`http://localhost:${server.port}${path}`, { headers: { accept: "text/html" } })).text();
     writeFileSync(join(dir, "index.html"), "generic shell");
     expect(await read("/app/notebook/sheet")).toBe("generic shell");
+    writeFileSync(join(dir, "200.html"), "new generic shell");
+    writeFileSync(join(dir, "index.html"), "homepage");
+    expect(await read("/")).toBe("homepage");
+    expect(await read("/app/notebook/sheet")).toBe("new generic shell");
 
     mkdirSync(join(dir, "app/shell"), { recursive: true });
     writeFileSync(join(dir, "app/shell/shell.html"), "public notebook shell");
@@ -25,7 +29,7 @@ test("direct notebook links use a shared public shell with the generic fallback"
     expect(await read("/app/another/notebook")).toBe("public notebook shell");
     expect(await read("/app/notebook/sheet/")).toBe("public notebook shell");
     expect((await fetch(`http://localhost:${server.port}/app/notebook/asset.svg`, { headers: { accept: "text/html" } })).status).toBe(404);
-    expect(await read("/library")).toBe("generic shell");
+    expect(await read("/library")).toBe("new generic shell");
   } finally {
     server.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -39,6 +43,7 @@ test("Bun static delivery matches the hosted rules for a built site", async () =
   try {
     const files = {
       "/index.html": "entry",
+      "/200.html": "client shell",
       "/app/shell/shell.html": "notebook shell",
       "/docs.html": "documentation",
       "/docs/setup.html": "setup documentation",
@@ -58,12 +63,12 @@ test("Bun static delivery matches the hosted rules for a built site", async () =
       ["/docs/__data.json", { accept: "application/json" }, "docs data"],
       ["/docs/missing", nav, null],
       ["/docs/missing", { ...nav, "sec-fetch-dest": "empty" }, null],
-      ["/library", nav, "entry"],
-      ["/login/", nav, "entry"],
-      ["/join", nav, "entry"],
-      ["/install", nav, "entry"],
-      ["/settings", nav, "entry"],
-      ["/settings/keys", nav, "entry"],
+      ["/library", nav, "client shell"],
+      ["/login/", nav, "client shell"],
+      ["/join", nav, "client shell"],
+      ["/install", nav, "client shell"],
+      ["/settings", nav, "client shell"],
+      ["/settings/keys", nav, "client shell"],
       ["/app/book/page", nav, "notebook shell"],
       ["/app/book/page/", { accept: "TEXT/HTML" }, "notebook shell"],
       ["/app/book/page", { ...nav, "sec-fetch-dest": "empty" }, null],

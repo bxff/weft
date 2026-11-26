@@ -60,7 +60,7 @@
         "Vary": "Accept, Sec-Fetch-Dest",
         "Cache-Control": "no-store"
       },
-      "dest": "/index.html"
+      "dest": "/200.html"
     },
     {
       "src": "^(/docs(?:/[a-zA-Z0-9_-]+)*)/?$",

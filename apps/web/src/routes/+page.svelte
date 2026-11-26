@@ -68,6 +68,7 @@
                     src={heroImage.src}
                     srcset={heroSrcset}
                     sizes="(min-width: 1280px) 1248px, calc(100vw - 32px)"
+                    fetchpriority="high"
                     width={heroImage.width}
                     height={heroImage.height}
                     alt="The same annotated notebook page on a reMarkable tablet and in the Weft browser editor."

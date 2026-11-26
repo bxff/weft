@@ -156,6 +156,12 @@ const notebookPage = /^\/app\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\/?$/;
 const docsPage = /^\/docs(?:\/[a-zA-Z0-9_-]+)*\/?$/;
 const acceptsHtml = /^(?:[^,]*,)*\s*text\/html\s*(?=[;,]|$)(?![^,]*;\s*q\s*=\s*0(?:\.0*)?\s*(?:[;,]|$))[^,]*(?:,.*)?$/i;
 
+async function spaFallback(dir: string): Promise<string> {
+  const shell = dir + "/200.html";
+  // Releases built before the homepage was prerendered used index.html as the SPA shell.
+  return await Bun.file(shell).exists() ? shell : dir + "/index.html";
+}
+
 async function serveStatic(dir: string, pathname: string, req: Request): Promise<Response> {
   const rel = pathname === "/" ? "/index.html" : pathname;
   if (rel.includes("..")) return new Response("bad path", { status: 400 });
@@ -176,9 +182,9 @@ async function serveStatic(dir: string, pathname: string, req: Request): Promise
     if (notebookPage.test(rel)) {
       const shell = dir + "/app/shell/shell.html";
       // A self-hosted relay may still be serving a previous web build.
-      path = await Bun.file(shell).exists() ? shell : dir + "/index.html";
+      path = await Bun.file(shell).exists() ? shell : await spaFallback(dir);
     } else if (clientPage.test(rel)) {
-      path = dir + "/index.html";
+      path = await spaFallback(dir);
     } else if (docsPage.test(rel)) {
       path = dir + rel.replace(/\/$/, "") + ".html";
     } else {

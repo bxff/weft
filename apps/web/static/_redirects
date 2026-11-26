@@ -1,0 +1,15 @@
+# Cloudflare Pages: keep client-only routes on the generic shell, not the homepage.
+# /library and /docs have their own built HTML.
+# The .html file is served by Pages at the extensionless URL.
+/install /200 200
+/install/ /200 200
+/join /200 200
+/join/ /200 200
+/login /200 200
+/login/ /200 200
+/settings /200 200
+/settings/ /200 200
+/settings/keys /200 200
+/settings/keys/ /200 200
+/app/:doc/:page /200 200
+/app/:doc/:page/ /200 200

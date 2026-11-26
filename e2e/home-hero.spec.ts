@@ -41,3 +41,19 @@ for (const [width, height, dpr] of [
         })
     })
 }
+
+test('homepage artwork is present and fits before JavaScript runs', async ({ browser, baseURL }) => {
+    const page = await browser.newPage({ baseURL, javaScriptEnabled: false, viewport: { width: 390, height: 844 } })
+    try {
+        const response = await page.goto('/')
+        expect(response?.ok()).toBe(true)
+        const image = page.getByRole('img', { name: 'The same annotated notebook page on a reMarkable tablet and in the Weft browser editor.' })
+        await expect(image).toBeVisible()
+        await expect.poll(() => image.evaluate((img: HTMLImageElement) => img.complete && img.naturalWidth > 0)).toBe(true)
+        const rect = await image.boundingBox()
+        expect(rect!.width / rect!.height).toBeCloseTo(1200 / 528, 2)
+        expect(rect!.x + rect!.width).toBeLessThanOrEqual(391)
+    } finally {
+        await page.close()
+    }
+})
