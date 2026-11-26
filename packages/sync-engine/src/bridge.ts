@@ -17,7 +17,7 @@
  * NEW tablet items (and tombstones xochitl made).
  */
 
-import { RmDocument, mergeRootTextInto, rootTextUnresolvedMergeSlots, type CrdtId, type SceneLineItemBlock } from '@weft/rm-format'
+import { RmDocument, mergeRootTextInto, rootTextUnresolvedMergeSlots, type CrdtId, type SceneLineItemBlock, type TreeNodeBlock } from '@weft/rm-format'
 import {
     applyInkDeltas,
     idToOpRef,
@@ -220,7 +220,8 @@ function diffDocuments(prevDoc: RmDocument | null, nextDoc: RmDocument): DiffRes
     }
     if (complete) {
         const prevFp = prevDoc ? structureFingerprint(prevDoc) : ''
-        if (structureFingerprint(nextDoc) !== prevFp) complete = false
+        if (structureFingerprint(nextDoc) !== prevFp ||
+            (prevDoc && changedLayerVisibilityRegister(prevDoc, nextDoc))) complete = false
     }
     return { ops, complete }
 }
@@ -432,12 +433,98 @@ export function gateTombstonesByBase(ops: Op[], causalBaseRm: Uint8Array | null)
     })
 }
 
+/** The native author number is only meaningful in its own file. */
+function portableLayerId(id: CrdtId, authors: ReadonlyMap<number, string>): string | undefined {
+    if (id.part1 === 0) return `system:${id.part2}`
+    const uuid = authors.get(id.part1)
+    return uuid ? `${uuid.toLowerCase()}:${id.part2}` : undefined
+}
+
+function layerVisibilityRecords(doc: RmDocument, authors: ReadonlyMap<number, string>) {
+    const layers = new Set(doc.layers().map(({ nodeId }) => `${nodeId.part1}:${nodeId.part2}`))
+    const records = new Map<string, TreeNodeBlock | null>()
+    for (const block of doc.blocks) {
+        if (block.type !== 'treeNode' || !layers.has(`${block.nodeId.part1}:${block.nodeId.part2}`)) continue
+        const key = portableLayerId(block.nodeId, authors)
+        if (key) records.set(key, records.has(key) ? null : block)
+    }
+    return records
+}
+
+function visibilityRegister(block: TreeNodeBlock, authors: ReadonlyMap<number, string>) {
+    const timestamp = portableLayerId(block.visible.timestamp, authors)
+    return timestamp === undefined ? undefined : `${timestamp}:${block.visible.value}`
+}
+
+/** Layer visibility isn't carried by native ink deltas. Even an unchanged
+ * boolean can bear a new write and must then take the snapshot path. */
+function changedLayerVisibilityRegister(before: RmDocument, after: RmDocument): boolean {
+    const beforeAuthors = before.authorTable()
+    const afterAuthors = after.authorTable()
+    const beforeLayers = layerVisibilityRecords(before, beforeAuthors)
+    for (const [key, current] of layerVisibilityRecords(after, afterAuthors)) {
+        const prior = beforeLayers.get(key)
+        if (!current || !prior) continue
+        const next = visibilityRegister(current, afterAuthors)
+        const previous = visibilityRegister(prior, beforeAuthors)
+        if (next !== undefined && previous !== undefined && next !== previous) return true
+    }
+    return false
+}
+
+/** Don't bind unmapped native references to a newly imported visibility author. */
+function reservedAuthorSlots(doc: RmDocument, authors: ReadonlyMap<number, string>): Set<number> {
+    const slots = new Set<number>()
+    const visit = (value: unknown): void => {
+        if (!value || typeof value !== 'object' || ArrayBuffer.isView(value)) return
+        if ('part1' in value && 'part2' in value && typeof value.part1 === 'number') {
+            if (value.part1 !== 0 && !authors.has(value.part1)) slots.add(value.part1)
+            return
+        }
+        if (value instanceof Map) {
+            for (const item of value.values()) visit(item)
+        } else {
+            for (const item of Object.values(value)) visit(item)
+        }
+    }
+    for (const block of doc.blocks) visit(block)
+    return slots
+}
+
+/** Keep a relay visibility write that the tablet's file only carries through
+ * from its known ancestor. An actual tablet edit keeps publisher precedence.
+ * Scope this to matched, unambiguous existing layers; don't merge topology. */
+function keepUnchangedLayerVisibility(incoming: RmDocument, cloud: RmDocument, ancestor: RmDocument): void {
+    const inputAuthors = incoming.authorTable()
+    const cloudAuthors = cloud.authorTable()
+    const ancestorAuthors = ancestor.authorTable()
+    const inputLayers = layerVisibilityRecords(incoming, inputAuthors)
+    const cloudLayers = layerVisibilityRecords(cloud, cloudAuthors)
+    const ancestorLayers = layerVisibilityRecords(ancestor, ancestorAuthors)
+    let reserved: Set<number> | undefined
+    for (const [key, input] of inputLayers) {
+        const prior = ancestorLayers.get(key)
+        const current = cloudLayers.get(key)
+        if (!input || !prior || !current) continue
+        const original = visibilityRegister(prior, ancestorAuthors)
+        const received = visibilityRegister(input, inputAuthors)
+        const latest = visibilityRegister(current, cloudAuthors)
+        if (original === undefined || received !== original || latest === undefined || latest === original) continue
+        const { timestamp, value } = current.visible
+        const uuid = timestamp.part1 === 0 ? undefined : cloudAuthors.get(timestamp.part1)
+        const part1 = uuid === undefined ? 0 : incoming.resolveAuthor(uuid, reserved ??= reservedAuthorSlots(incoming, inputAuthors))
+        input.visible = { timestamp: { part1, part2: timestamp.part2 }, value }
+    }
+}
+
 /**
  * CRDT-merge for snapshot publication: union `other` (the server's current
  * reconstruction — edits the publisher may not have seen) INTO `base` (the
  * incoming bytes). Ink unions by item id with deleted-wins (via the same
  * diff the device path uses); root text unions per character id with
  * deleted-wins and LWW styles; the publisher's tree/anchor structure wins.
+ * For a tablet with a known ancestor, carry forward a relay visibility
+ * change where the tablet did not edit that existing layer register.
  * Lines whose parent group does not exist in `base` reparent to the first
  * layer instead of orphaning invisibly.
  *
@@ -494,6 +581,9 @@ export function mergeForSnapshot(
         }
     }
     mergeRootTextInto(baseDoc, otherDoc)
+    if (typeof absence === 'object') {
+        keepUnchangedLayerVisibility(baseDoc, otherDoc, RmDocument.parse(absence.baseRm))
+    }
     return baseDoc.serialize()
 }
 
