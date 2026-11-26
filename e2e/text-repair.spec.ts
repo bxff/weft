@@ -148,7 +148,15 @@ test('adopting repeated tablet move snapshots repositions text without drawing i
         })
         expect(put.ok()).toBe(true)
         totalDx += dx
-        await expect.poll(readView).toEqual({ x: before.x! + totalDx * RM_SCALE, looseInkCount: 0 })
+        // Native points round to Float32 on serialization. Keep a subpixel
+        // tolerance on the inferred move, but require exact ink ownership.
+        await expect.poll(async () => {
+            const { x, looseInkCount } = await readView()
+            return {
+                atExpectedX: x !== undefined && Math.abs(x - (before.x! + totalDx * RM_SCALE)) < 0.001,
+                looseInkCount,
+            }
+        }).toEqual({ atExpectedX: true, looseInkCount: 0 })
     }
 })
 
