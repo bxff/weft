@@ -11,5 +11,7 @@ and marked-up PDFs, edit pages, and sync changes back to the tablet.
 - [View the source or report an issue](https://github.com/bxff/weft) on GitHub.
 
 The source is public. The hosted service is still invite-only.
+Before connecting a tablet to hosted Weft, read the [Privacy Notice](/privacy)
+for what sync sends to the relay and how that data is handled.
 
 Building your own client? [Use the API](/docs/api) to list your notebooks and download a page.
