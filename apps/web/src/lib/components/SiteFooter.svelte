@@ -7,7 +7,7 @@
     <span class="wf-foot-brand">weft</span>
     <span class="wf-foot-meta text-right">
         <a href={source}>bxff/weft</a> · made by
-        <a href={author}>musaab.io</a> · <a href="/privacy">Privacy</a>
+        <a href={author}>musaab.io</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Hosted Terms</a>
     </span>
 </footer>
 
