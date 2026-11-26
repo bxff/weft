@@ -1,5 +1,6 @@
 @import 'tailwindcss';
 @import 'tldraw/tldraw.css';
+@import './native-font-profile.generated.css';
 @import "tw-animate-css";
 @import "shadcn-svelte/tailwind.css";
 

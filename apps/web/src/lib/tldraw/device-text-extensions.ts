@@ -47,7 +47,7 @@ function isDeviceColumn(editor?: TextEditor): boolean {
     return element instanceof HTMLElement && !!element.closest('[data-shape-type="device-text"]')
 }
 
-const labelEntryState = new WeakMap<TextEditor, TextEditor['state']>()
+const entryFocusState = new WeakMap<TextEditor, TextEditor['state']>()
 const PreserveLabelCaret = Extension.create({
     name: 'weftPreserveLabelCaret',
     addCommands() {
@@ -56,8 +56,8 @@ const PreserveLabelCaret = Extension.create({
                 // tldraw also retries focus('end') after mount. Keep the caret
                 // if the user has already typed or moved it since entry.
                 if (position === 'end' && props.dispatch) {
-                    const initial = labelEntryState.get(props.editor)
-                    labelEntryState.delete(props.editor)
+                    const initial = entryFocusState.get(props.editor)
+                    entryFocusState.delete(props.editor)
                     if (
                         initial &&
                         (props.state.doc !== initial.doc || !props.state.selection.eq(initial.selection))
@@ -231,6 +231,12 @@ export const richTextConfig = {
     onBeforeCreate({ editor }: { editor: TextEditor }) {
         if (isDeviceColumn(editor)) {
             editor.setOptions({ enableInputRules: deviceRules, enablePasteRules: deviceRules })
+            // Native toolbar entry has no click position or select-all event.
+            // Preserve changes made before the SDK's delayed focus('end') retry.
+            queueMicrotask(() => {
+                if (!editor.isDestroyed) entryFocusState.set(editor, editor.state)
+            })
+            return
         }
         const element = editor.options.element
         if (
@@ -278,7 +284,7 @@ export const richTextConfig = {
             editor.off('create', initializeLabel)
             initializeLabel({ editor })
             focusText()
-            if (editor.view.hasFocus()) labelEntryState.set(editor, editor.state)
+            if (editor.view.hasFocus()) entryFocusState.set(editor, editor.state)
 
             // Chromium can blur the newly mounted text view when it completes
             // the entry click on the old canvas target. An actual focus move
