@@ -401,3 +401,58 @@ test('a tablet END-anchor uses the heading baseline, then reflows to a blank fin
     await open()
     await expect.poll(y).toBeCloseTo((rawY + rootY + 100) * RM_SCALE, 1)
 })
+
+test('layer visibility reaches native ink and images below a nested group', async ({ page, request }) => {
+    const { RmDocument, crdtId, crdtIdEquals, lww, uuidToBytesLE } = await import('../packages/rm-format/src/index')
+    const opts = { authorUuid: DEVICE_AUTHOR }
+    const doc = RmDocument.empty(DEVICE_AUTHOR)
+    const layer = doc.layers()[0]!.nodeId
+    const group = doc.createLayer('Nested group', opts)
+    const link = doc.blocks.find(block =>
+        block.type === 'sceneGroupItem' && block.nodeId && crdtIdEquals(block.nodeId, group))
+    if (link?.type !== 'sceneGroupItem') throw new Error('missing nested group link')
+    link.parentId = layer
+    const { first } = await anchoredReflowPushes()
+    const stroke = RmDocument.parse(first as never).blocks.find(block => block.type === 'sceneLineItem')
+    if (stroke?.type !== 'sceneLineItem' || !stroke.line) throw new Error('missing stroke')
+    doc.appendLine(stroke.line, { ...opts, parentId: group })
+    const uuid = crypto.randomUUID()
+    const filename = `${uuid}.png`
+    const stamp = crdtId(doc.resolveAuthor(DEVICE_AUTHOR), doc.maxClock() + 1)
+    doc.appendImage({
+        kind: 'image', uuid: lww(stamp, uuidToBytesLE(uuid)), timestamp: stamp,
+        vertices: [10, 20, 0, 0, 110, 20, 1, 0, 110, 100, 1, 1, 10, 100, 0, 1],
+        indices: [0, 1, 2, 2, 3, 0], filename: null,
+    }, { ...opts, parentId: group })
+    doc.blocks.push({
+        type: 'sceneImageInfo', version: { min: 3, current: 3 }, extraData: new Uint8Array(),
+        images: [{ uuid, filename: lww(stamp, filename), flags: lww(stamp, new Uint8Array([17, 0])) }],
+    })
+    const id = crypto.randomUUID()
+    const endpoint = `/api/documents/${DOC}/pages/${id}`
+    expect((await request.put(`${endpoint}/assets/${filename}`, { data: await readFile('fixtures/test-photo.png') })).ok()).toBe(true)
+    expect((await request.put(`${endpoint}/rm`, { data: Buffer.from(doc.serialize()) })).ok()).toBe(true)
+    await page.goto(`/app/${DOC}/${id}`)
+    await expect(page.getByTestId('sync-status')).toHaveText('synced')
+    const opacities = () => page.evaluate(() => {
+        const ed = (window as unknown as { __weftEditor: Editor }).__weftEditor
+        return Object.fromEntries(ed.getCurrentPageShapes()
+            .filter(shape => shape.type === 'draw' || shape.type === 'image')
+            .map(shape => [shape.type, shape.opacity]))
+    })
+    await expect.poll(opacities).toEqual({ draw: 1, image: 1 })
+    await page.getByTestId('layers-toggle').click()
+    const eye = page.getByTestId('layer-eye-Layer 1')
+    await eye.click()
+    await expect.poll(opacities).toEqual({ draw: 0, image: 0 })
+    await expect.poll(async () => {
+        const saved = await request.get(`${endpoint}/rm`)
+        return RmDocument.parse(new Uint8Array(await saved.body()) as never).layers()[0]?.visible
+    }).toBe(false)
+    await page.reload()
+    await expect(page.getByTestId('sync-status')).toHaveText('synced')
+    await expect.poll(opacities).toEqual({ draw: 0, image: 0 })
+    await page.getByTestId('layers-toggle').click()
+    await eye.click()
+    await expect.poll(opacities).toEqual({ draw: 1, image: 1 })
+})

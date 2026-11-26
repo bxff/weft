@@ -2174,12 +2174,20 @@ export class StudioController {
             doc
                 .layers()
                 .filter((l) => !l.visible)
-                .map((l) => `${l.nodeId.part1}:${l.nodeId.part2}`),
+                .map((l) => crdtIdKey(l.nodeId)),
         )
-        // item -> parent layer key
+        // Use live group links to expand hidden layers to every descendant.
+        const children = hidden.size ? new Map<string, string[]>() : undefined
         const parentOf = new Map<string, string>()
         const resolver = new RefResolver(doc)
         for (const block of doc.blocks) {
+            if (children && block.type === 'sceneGroupItem' && !block.deletedLength && block.nodeId) {
+                const parent = crdtIdKey(block.parentId)
+                const group = crdtIdKey(block.nodeId)
+                const siblings = children.get(parent)
+                if (siblings) siblings.push(group)
+                else children.set(parent, [group])
+            }
             if (
                 block.type !== 'sceneLineItem' &&
                 block.type !== 'sceneGlyphItem' &&
@@ -2188,7 +2196,18 @@ export class StudioController {
                 continue
             const ref = resolver.toRef(block.itemId)
             if (ref) {
-                parentOf.set(itemRefKey(ref), `${block.parentId.part1}:${block.parentId.part2}`)
+                parentOf.set(itemRefKey(ref), crdtIdKey(block.parentId))
+            }
+        }
+        if (children) {
+            const pending = [...hidden]
+            while (pending.length) {
+                const parent = pending.pop()!
+                for (const group of children.get(parent) ?? []) {
+                    if (hidden.has(group)) continue
+                    hidden.add(group)
+                    pending.push(group)
+                }
             }
         }
         this.remote(() => {
