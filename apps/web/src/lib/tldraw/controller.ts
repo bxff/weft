@@ -75,6 +75,7 @@ import {
 } from './device-text-richtext'
 import { textFromNode, eraseRichTextGlyphs, canonicalRichText } from './richtext-plain'
 import {
+    NATIVE_FONT_PRELOADS,
     canvasMeasure,
     layoutText,
     metricsFor,
@@ -821,12 +822,7 @@ export class StudioController {
     private async settleDeviceFonts(): Promise<void> {
         if (typeof document === 'undefined' || !document.fonts) return
         // the px size is irrelevant to WHICH face loads; use a nominal one
-        const specs = [
-            `10px 'RM Noto Sans'`,
-            `500 10px 'RM Noto Sans'`,
-            `700 10px 'RM Noto Sans'`,
-            `16px 'RM Noto Serif'`,
-        ]
+        const specs = NATIVE_FONT_PRELOADS
         if (specs.every((s) => document.fonts.check(s))) return // already correct
         try {
             await Promise.all(specs.map((s) => document.fonts.load(s)))

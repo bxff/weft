@@ -3,6 +3,7 @@
 import type { TextParagraph } from '@weft/rm-format'
 import { RM_SCALE } from '@weft/rm-ink'
 import { OPEN_FONT_ADVANCES } from './noto-font-advances'
+import { nativeFontProfile, PROFILE_SANS, PROFILE_SERIF } from './native-font-profile'
 
 /** body paragraph baseline->baseline step. */
 export const PARA_STRIDE_INK = 69.546875
@@ -16,8 +17,20 @@ export const DEVICE_TEXT_LEFT_MARGIN_INK = 4
 /** right pad, symmetric. */
 export const DEVICE_TEXT_RIGHT_MARGIN_INK = 4
 
-export const BODY_FAMILY = "'RM Noto Sans', sans-serif"
-const SERIF_FAMILY = "'RM Noto Serif', serif"
+export const BODY_FAMILY = nativeFontProfile
+    ? `'${PROFILE_SANS}', 'RM Noto Sans', sans-serif`
+    : "'RM Noto Sans', sans-serif"
+const SERIF_FAMILY = nativeFontProfile
+    ? `'${PROFILE_SERIF}', 'RM Noto Serif', serif`
+    : "'RM Noto Serif', serif"
+export const NATIVE_FONT_PRELOADS = nativeFontProfile
+    ? [
+        `10px '${PROFILE_SANS}'`, `500 10px '${PROFILE_SANS}'`,
+        `700 10px '${PROFILE_SANS}'`, `italic 10px '${PROFILE_SANS}'`,
+        `italic 700 10px '${PROFILE_SANS}'`, `16px '${PROFILE_SERIF}'`,
+        `700 16px '${PROFILE_SERIF}'`,
+      ]
+    : ["10px 'RM Noto Sans'", "500 10px 'RM Noto Sans'", "700 10px 'RM Noto Sans'", "16px 'RM Noto Serif'"]
 
 /** body em 32 ink: the device's Qt pixelSize. */
 export const BODY_EM_INK = 32
@@ -199,15 +212,31 @@ function spanFontKey(m: StyleMetrics, span?: SpanStyle): string {
     return m.fontKey // serif italics keep regular metrics
 }
 
-/** Glyph advance in ink units using the bundled open typefaces. */
+const PROFILE_ADVANCE_TABLE: Record<number, string> = {
+    32: 'sans32', 36: 'med36', 46: 'serif46', 64: 'serif64',
+}
+
+/** Glyph advance in ink units using the selected font profile. */
 export function glyphAdvanceInk(
     ch: string,
     m: StyleMetrics,
     span?: SpanStyle,
     measure?: MeasureFn,
 ): number {
-    const advance = OPEN_FONT_ADVANCES[spanFontKey(m, span)]?.[ch]
-    if (advance !== undefined) return advance * m.emInk
+    const font = spanFontKey(m, span)
+    if (nativeFontProfile) {
+        const both = span?.bold && span?.italic
+        const italic = span?.italic && !both
+        const bold = span?.bold && !both
+        const key = !bold && !italic ? PROFILE_ADVANCE_TABLE[m.emInk]
+            : m.emInk === 32 ? italic ? 'ital32' : 'bold32' : undefined
+        const hinted = key === undefined ? undefined : nativeFontProfile.advances[key]?.[ch]
+        const advance = hinted ?? nativeFontProfile.staticAdvances[font]?.[ch]
+        if (advance !== undefined) return advance * m.emInk
+    } else {
+        const advance = OPEN_FONT_ADVANCES[font]?.[ch]
+        if (advance !== undefined) return advance * m.emInk
+    }
     if (measure) return measure(ch, m.font) * INK_PER_PX
     return 0.55 * m.emInk
 }
@@ -222,9 +251,14 @@ export function penPositions(
 ): { xs: number[]; end: number } {
     const xs: number[] = []
     let pen = 0
+    let previous = ''
+    const kerning = nativeFontProfile?.kerning[spanFontKey(m, span)]
     for (const ch of text) {
+        const pair = previous && kerning?.[previous + ch]
+        if (pair) pen += Math.round(pair * m.emInk * 64 / 1000) / 64
         xs.push(pen)
         pen += glyphAdvanceInk(ch, m, span, measure)
+        previous = ch
     }
     return { xs, end: pen }
 }

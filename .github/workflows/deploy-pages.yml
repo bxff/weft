@@ -53,6 +53,32 @@ jobs:
           node-version: "22.22.3"
       - run: bun install --frozen-lockfile
 
+      - name: Stage the optional native font profile
+        if: vars.WEFT_FONT_PROFILE_SHA256 != ''
+        env:
+          PROFILE_SHA256: ${{ vars.WEFT_FONT_PROFILE_SHA256 }}
+          PROFILE_SOURCE: ${{ vars.WEFT_FONT_PROFILE_SSH_DEST }}
+          PROFILE_PORT: ${{ vars.WEFT_FONT_PROFILE_SSH_PORT || '22' }}
+          PROFILE_KEY: ${{ secrets.WEFT_FONT_PROFILE_SSH_KEY }}
+          PROFILE_KNOWN_HOSTS: ${{ secrets.WEFT_FONT_PROFILE_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$PROFILE_SOURCE" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+          [[ "$PROFILE_PORT" =~ ^[0-9]{1,5}$ ]]
+          : "${PROFILE_KEY:?Configure the read-only profile key}"
+          : "${PROFILE_KNOWN_HOSTS:?Configure a pinned host key}"
+          temp=$(mktemp -d)
+          trap 'rm -rf "$temp"' EXIT
+          printf '%s\n' "$PROFILE_KEY" > "$temp/key"
+          printf '%s\n' "$PROFILE_KNOWN_HOSTS" > "$temp/known_hosts"
+          unset PROFILE_KEY PROFILE_KNOWN_HOSTS
+          timeout 25 ssh -T -i "$temp/key" -p "$PROFILE_PORT" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=8 \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$temp/known_hosts" \
+            "$PROFILE_SOURCE" < /dev/null | head -c 2000001 > "$temp/profile.gz"
+          node scripts/stage-native-font-profile.mjs "$temp/profile.gz" "$PROFILE_SHA256"
+
       - name: Build the production frontend
         working-directory: apps/web
         env:

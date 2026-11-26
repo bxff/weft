@@ -22,6 +22,56 @@
     src: url('/fonts/JetBrainsMono-Italic.woff2') format('woff2');
 }
 
+/* Optional deployment-supplied native text profile. */
+@font-face {
+    font-family: 'RM Profile Sans';
+    font-style: normal;
+    font-weight: 400;
+    font-display: block;
+    src: url('/fonts/native-profile/regular.ttf') format('truetype');
+}
+@font-face {
+    font-family: 'RM Profile Sans';
+    font-style: normal;
+    font-weight: 500;
+    font-display: block;
+    src: url('/fonts/native-profile/medium.ttf') format('truetype');
+}
+@font-face {
+    font-family: 'RM Profile Sans';
+    font-style: normal;
+    font-weight: 700;
+    font-display: block;
+    src: url('/fonts/native-profile/bold.ttf') format('truetype');
+}
+@font-face {
+    font-family: 'RM Profile Sans';
+    font-style: italic;
+    font-weight: 400;
+    font-display: block;
+    src: url('/fonts/native-profile/italic.ttf') format('truetype');
+}
+@font-face {
+    font-family: 'RM Profile Sans';
+    font-style: italic;
+    font-weight: 700;
+    font-display: block;
+    src: url('/fonts/native-profile/bold-italic.ttf') format('truetype');
+}
+@font-face {
+    font-family: 'RM Profile Serif';
+    font-style: normal;
+    font-weight: 400;
+    font-display: block;
+    src: url('/fonts/native-profile/serif.ttf') format('truetype');
+}
+@font-face {
+    font-family: 'RM Profile Serif';
+    font-style: normal;
+    font-weight: 700;
+    font-display: block;
+    src: url('/fonts/native-profile/serif-bold.ttf') format('truetype');
+}
 /* Openly licensed typefaces used for native text rendering. */
 @font-face {
     font-family: 'RM Noto Sans';
