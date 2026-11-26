@@ -403,6 +403,7 @@ test('a tablet END-anchor uses the heading baseline, then reflows to a blank fin
 })
 
 test('layer visibility reaches native ink and images below a nested group', async ({ page, request }) => {
+    await page.setViewportSize({ width: 1600, height: 900 })
     const { RmDocument, crdtId, crdtIdEquals, lww, uuidToBytesLE } = await import('../packages/rm-format/src/index')
     const opts = { authorUuid: DEVICE_AUTHOR }
     const doc = RmDocument.empty(DEVICE_AUTHOR)
