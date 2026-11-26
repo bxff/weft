@@ -1,0 +1,51 @@
+{
+    "wide": [
+        {
+            "src": "/hero/weft-wide-960.43eb1eaab067.webp",
+            "width": 960,
+            "height": 422
+        },
+        {
+            "src": "/hero/weft-wide-1440.19ad3fe4a77c.webp",
+            "width": 1440,
+            "height": 634
+        },
+        {
+            "src": "/hero/weft-wide-1920.f84158482285.webp",
+            "width": 1920,
+            "height": 845
+        },
+        {
+            "src": "/hero/weft-wide-2880.d474013904ae.webp",
+            "width": 2880,
+            "height": 1267
+        },
+        {
+            "src": "/hero/weft-wide-3600.b553abfe4198.webp",
+            "width": 3600,
+            "height": 1584
+        }
+    ],
+    "narrow": [
+        {
+            "src": "/hero/weft-narrow-480.50218ef8e127.webp",
+            "width": 480,
+            "height": 658
+        },
+        {
+            "src": "/hero/weft-narrow-720.9e66ee11477e.webp",
+            "width": 720,
+            "height": 987
+        },
+        {
+            "src": "/hero/weft-narrow-1080.ae3fb9b26e95.webp",
+            "width": 1080,
+            "height": 1481
+        },
+        {
+            "src": "/hero/weft-narrow-1440.2259c4206830.webp",
+            "width": 1440,
+            "height": 1974
+        }
+    ]
+}

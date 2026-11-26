@@ -4,6 +4,14 @@
     import { currentUserLabel, clerkEnabled, joinWaitlist } from '$lib/auth'
     import SiteHeader from '$lib/components/SiteHeader.svelte'
     import SiteFooter from '$lib/components/SiteFooter.svelte'
+    import heroManifest from '$lib/home-hero.json'
+
+    type HeroImage = { src: string; width: number; height: number }
+    const wide: HeroImage[] = heroManifest.wide
+    const narrow: HeroImage[] = heroManifest.narrow
+    const wideImage = wide.at(-1)
+    const narrowImage = narrow.at(-1)
+    const srcset = (images: HeroImage[]) => images.map(({ src, width }) => `${src} ${width}w`).join(', ')
 
     // Auth state for the in-body CTA (the header has its own copy).
     let userLabel = $state<string | null>(null)
@@ -57,6 +65,27 @@
                     <a href={docsUrl()} class="wf-link" style="margin-left: 1rem; display: inline-block; white-space: nowrap">Read the docs &rarr;</a>
                 {/if}
             </p>
+
+            {#if wideImage && narrowImage}
+                <picture class="my-6 block">
+                    <source
+                        media="(max-width: 639px)"
+                        srcset={srcset(narrow)}
+                        sizes="calc(100vw - 32px)"
+                        width={narrowImage.width}
+                        height={narrowImage.height}
+                    />
+                    <img
+                        class="block h-auto w-full"
+                        src={wideImage.src}
+                        srcset={srcset(wide)}
+                        sizes="(min-width: 1280px) 1248px, calc(100vw - 32px)"
+                        width={wideImage.width}
+                        height={wideImage.height}
+                        alt="The same annotated notebook page on a reMarkable tablet and in the Weft browser editor."
+                    />
+                </picture>
+            {/if}
 
             <p class="my-4">
                 <a href="/install" class="wf-link">Set up the tablet</a> once and sync runs
