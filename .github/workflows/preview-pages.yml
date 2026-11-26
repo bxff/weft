@@ -38,6 +38,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CI_SHA: ${{ github.event.workflow_run.head_sha }}
           MANUAL_PR: ${{ inputs.pr }}
+          OWNER_ID: ${{ github.repository_owner_id }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
@@ -66,6 +67,15 @@ jobs:
             passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event pull_request \
               --commit "$sha" --status success --limit 1 --json headSha --jq '.[0].headSha // ""')
             [[ "$passed" == "$sha" ]] || { echo 'CI must pass on the current PR head.'; exit 1; }
+          fi
+          if ! gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$pr/events?per_page=100" | jq -e \
+            --arg owner "$OWNER_ID" \
+            '[.[][] | select((.event == "labeled" or .event == "unlabeled") and .label.name == "preview")]
+             | sort_by(.created_at, .id) | last
+             | .event == "labeled" and (.actor.id | tostring) == $owner and .performed_via_github_app == null' >/dev/null; then
+            echo 'The repository owner must apply the preview label.'
+            [[ "$GITHUB_EVENT_NAME" != workflow_dispatch ]]
+            exit
           fi
           printf 'pr=%s\nsha=%s\n' "$pr" "$sha" >> "$GITHUB_OUTPUT"
 
@@ -135,12 +145,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.select.outputs.pr }}
           SHA: ${{ needs.select.outputs.sha }}
+          OWNER_ID: ${{ github.repository_owner_id }}
         run: |
           set -euo pipefail
           gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" | jq -e \
             --arg sha "$SHA" --arg repo "$GITHUB_REPOSITORY" \
             '.state == "open" and .base.ref == "main" and .head.sha == $sha and
              .head.repo.full_name == $repo and any(.labels[]; .name == "preview")' >/dev/null
+          pr="$PR"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$pr/events?per_page=100" | jq -e \
+            --arg owner "$OWNER_ID" \
+            '[.[][] | select((.event == "labeled" or .event == "unlabeled") and .label.name == "preview")]
+             | sort_by(.created_at, .id) | last
+             | .event == "labeled" and (.actor.id | tostring) == $owner and .performed_via_github_app == null' >/dev/null
       - name: Upload only to a non-production branch alias
         id: deploy
         working-directory: ${{ runner.temp }}

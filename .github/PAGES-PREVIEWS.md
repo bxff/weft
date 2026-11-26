@@ -23,13 +23,15 @@ unreachable relay by default.
 
 ## Usage
 
-A maintainer adds `preview` to an open PR from a branch in this repo targeting
+The repository owner adds `preview` to an open PR from a branch in this repo targeting
 `main`. The next successful CI run for its current head builds a preview.
 If CI already passed before labeling, use **Actions → Preview Weft Pages →
 Run workflow** from `main` and enter the PR number. Look in the job summary
 or the environment link for the stable `pr-N.<project>.pages.dev` URL.
 
-Forks cannot preview. The branch build runs with read-only GitHub permissions
+Forks cannot preview. The workflow verifies the last label event was applied
+by the repository owner's GitHub account, not a triager, other collaborator,
+or GitHub App. It checks that again before upload. The branch build runs with read-only GitHub permissions
 and no Pages or production secrets. A fresh upload runner never checks out or
 executes the branch code and rejects Pages Functions and symbolic links. It
 checks the PR label and head again, and refuses to upload to the Pages
