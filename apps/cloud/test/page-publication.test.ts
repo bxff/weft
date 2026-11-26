@@ -563,6 +563,23 @@ test('a guarded mixed snapshot accepts or rejects its history deltas with the sn
         expect(server.store.opsSince(...PAGE_KEY, 0)).toEqual([])
         expect(server.store.changesSince(USER, 0)).toEqual([])
 
+        // A valid request must not get a receipt when the relay cannot
+        // reconstruct the existing page for the merge. Retrying after
+        // recovery must publish both layers, not return a phantom receipt.
+        const brokenMerge = spyOn(server.store, 'reconstructDevicePage').mockImplementationOnce(() => {
+            throw new Error('injected snapshot reconstruction failure')
+        })
+        try {
+            expect((await publish(before)).status).toBe(500)
+            expect(server.store.latestSnapshotSeq(...PAGE_KEY)).toBe(before)
+            expect(server.store.opsSince(...PAGE_KEY, 0)).toEqual([])
+            expect(server.store.changesSince(USER, 0)).toEqual([])
+            expect(inspect.query('SELECT count(*) AS count FROM page_snapshot_receipts').get())
+                .toEqual({ count: 0 })
+        } finally {
+            brokenMerge.mockRestore()
+        }
+
         inspect.run(`CREATE TRIGGER reject_mixed_delivery BEFORE INSERT ON changes BEGIN
             SELECT RAISE(ABORT, 'injected mixed delivery failure'); END`)
         expect((await publish(before)).status).toBe(500)

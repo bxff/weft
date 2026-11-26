@@ -1386,7 +1386,7 @@ export class CloudStore {
     | { kind: "stale"; currentSeq: number } {
     const hash = (baseSeq === undefined ? "" : `base:${baseSeq}:`) + sha256hex(bytes);
     return this.publishPage(user, doc, page, () => {
-      const key = [user, doc, page, batchId] as const;
+      const key: [string, string, string, string] = [user, doc, page, batchId];
       const prior = this.db.query<
         { request_hash: string; first_seq: number; last_seq: number },
         typeof key
@@ -1448,7 +1448,11 @@ export class CloudStore {
       if (blocked !== null) return { kind: "blocked", response: blocked };
 
       if (batch) this.appendOps(user, doc, page, batch.deltas, batch.author);
-      const { seq, merged } = this.putSnapshotMerged(user, doc, page, batch?.snapshot ?? bytes);
+      // A mixed publication pins its checkpoint past the deltas just appended.
+      // Do not acknowledge a checkpoint we could not reconstruct and merge.
+      const { seq, merged } = this.putSnapshotMerged(
+        user, doc, page, batch?.snapshot ?? bytes, { requireMerge: batch !== undefined },
+      );
       if (publication) {
         this.db.run(
           `INSERT INTO page_snapshot_receipts
@@ -1474,12 +1478,19 @@ export class CloudStore {
     doc: string,
     page: string,
     container: Uint8Array,
+    { requireMerge = false }: { requireMerge?: boolean } = {},
   ): { seq: number; merged: boolean } {
     const hasBase =
       this.latestSnapshot(user, doc, page) !== null ||
       this.latestOpSeq(user, doc, page) > 0;
-    if (!hasBase)
+    if (!hasBase) {
+      if (requireMerge) {
+        const snapshot = decodeSnapshot(container);
+        RmDocument.parse(snapshot.rm);
+        if (!Array.isArray(snapshot.overlay?.shapes)) throw new Error("Invalid snapshot overlay");
+      }
       return { seq: this.putSnapshot(user, doc, page, container), merged: false };
+    }
     let bytes: Uint8Array;
     let merged: boolean;
     try {
@@ -1516,7 +1527,7 @@ export class CloudStore {
       // add visible content, so avoid decoding them again to prove that.
       merged = Buffer.compare(snap.rm, mergedRm) !== 0 && contentBeyond(snap.rm, mergedRm);
     } catch (error) {
-      if (error instanceof RootTextAuthorConflict) throw error;
+      if (requireMerge || error instanceof RootTextAuthorConflict) throw error;
       // the snapshot channel is contractually OPAQUE: anything we cannot
       // parse (tests, future formats) stores verbatim, exactly as before —
       // the merge is best-effort protection for real .rm containers
