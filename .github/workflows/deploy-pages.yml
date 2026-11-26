@@ -57,6 +57,7 @@ jobs:
         working-directory: apps/web
         env:
           PUBLIC_CLOUD_URL: ${{ vars.PUBLIC_CLOUD_URL }}
+          PUBLIC_WEFT_PAGES_ORIGIN: https://weft.page
           PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ vars.PUBLIC_CLERK_PUBLISHABLE_KEY }}
           PUBLIC_TLDRAW_LICENSE_KEY: ${{ secrets.PUBLIC_TLDRAW_LICENSE_KEY }}
         run: |
@@ -66,6 +67,8 @@ jobs:
           : "${PUBLIC_TLDRAW_LICENSE_KEY:?Configure PUBLIC_TLDRAW_LICENSE_KEY in pages-production}"
           bun run build
           test -s build/index.html
+          test -s build/library.html
+          node ../../scripts/prepare-pages-library.mjs
 
       - name: Install the pinned deploy tool without credentials
         run: npm install --prefix "$RUNNER_TEMP/weft-pages" --no-audit --no-fund wrangler@4.168.0
