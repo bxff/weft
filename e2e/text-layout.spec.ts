@@ -377,7 +377,7 @@ test('a tablet END-anchor uses the heading baseline, then reflows to a blank fin
     const { first } = await anchoredReflowPushes()
     const seeded = RmDocument.parse(first as never)
     setParagraphStyle(seeded, crdtId(0, 0), 2, { authorUuid: DEVICE_AUTHOR })
-    const native = (doc: RmDocument) => doc.blocks.flatMap(b =>
+    const native = (doc: InstanceType<typeof RmDocument>) => doc.blocks.flatMap(b =>
         b.type === 'sceneLineItem' && b.line && b.deletedLength === 0 ? [b.line.points] : [])
     const initial = native(seeded)
     const rawY = Math.min(...initial[0]!.map(p => p.y))
