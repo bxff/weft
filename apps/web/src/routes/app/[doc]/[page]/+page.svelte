@@ -50,11 +50,11 @@
     // Keep the outgoing notebook mounted while its pending edits still
     // belong to the original relay. The Settings link opens a separate tab.
     beforeNavigate(({ cancel, to, type }) => {
-        if (type !== 'leave' && to && opensAppPage(to.url) && checkNotebookScope()) cancel()
+        if (type !== 'leave' && to?.url && opensAppPage(to.url) && checkNotebookScope()) cancel()
     })
 
     afterNavigate(({ from, to }) => {
-        if (from?.url.pathname !== to?.url.pathname && !checkNotebookScope()) reconnectRequired = false
+        if (to?.url && from?.url?.pathname !== to.url.pathname && !checkNotebookScope()) reconnectRequired = false
     })
 
     onMount(() => {
