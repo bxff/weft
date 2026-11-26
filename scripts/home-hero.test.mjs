@@ -8,8 +8,8 @@ const manifest = JSON.parse(readFileSync(new URL('src/lib/home-hero.json', web),
 test('every immutable homepage image is a content-addressed WebP in the manifest', () => {
     const paths = []
     for (const [family, widths] of [
-        ['wide', [960, 1440, 1920, 2880, 3600]],
-        ['narrow', [480, 720, 1080, 1440]],
+        ['wide', [960, 1440, 1920, 2880, 3600, 4320]],
+        ['narrow', [480, 720, 1080, 1440, 1920]],
     ]) {
         const images = manifest[family]
         expect(images.map(({ width }) => width)).toEqual(widths)
