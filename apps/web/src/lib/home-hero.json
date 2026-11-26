@@ -1,51 +1,61 @@
 {
     "wide": [
         {
-            "src": "/hero/weft-wide-960.1cbc92fb674a.webp",
+            "src": "/hero/weft-wide-960.8dde00f6e78e.webp",
             "width": 960,
-            "height": 422
+            "height": 423
         },
         {
-            "src": "/hero/weft-wide-1440.57f44d3750aa.webp",
+            "src": "/hero/weft-wide-1440.5d217b30e36c.webp",
             "width": 1440,
             "height": 634
         },
         {
-            "src": "/hero/weft-wide-1920.d8c82feb7026.webp",
+            "src": "/hero/weft-wide-1920.907f45fa207d.webp",
             "width": 1920,
             "height": 845
         },
         {
-            "src": "/hero/weft-wide-2880.9217939a4afe.webp",
+            "src": "/hero/weft-wide-2880.32274705b2c1.webp",
             "width": 2880,
-            "height": 1267
+            "height": 1268
         },
         {
-            "src": "/hero/weft-wide-3600.8f079af622a7.webp",
+            "src": "/hero/weft-wide-3600.ba4f0b7d7b90.webp",
             "width": 3600,
-            "height": 1584
+            "height": 1585
+        },
+        {
+            "src": "/hero/weft-wide-4320.a649c38b2768.webp",
+            "width": 4320,
+            "height": 1902
         }
     ],
     "narrow": [
         {
-            "src": "/hero/weft-narrow-480.7a0242c38fc9.webp",
+            "src": "/hero/weft-narrow-480.e50c6914cfb8.webp",
             "width": 480,
-            "height": 658
+            "height": 659
         },
         {
-            "src": "/hero/weft-narrow-720.0846e13ddabe.webp",
+            "src": "/hero/weft-narrow-720.193020bb63cb.webp",
             "width": 720,
-            "height": 987
+            "height": 988
         },
         {
-            "src": "/hero/weft-narrow-1080.49c55ed69dba.webp",
+            "src": "/hero/weft-narrow-1080.3ad787385cd2.webp",
             "width": 1080,
-            "height": 1481
+            "height": 1482
         },
         {
-            "src": "/hero/weft-narrow-1440.e9ed8196b32e.webp",
+            "src": "/hero/weft-narrow-1440.7c07a63b5c87.webp",
             "width": 1440,
-            "height": 1974
+            "height": 1976
+        },
+        {
+            "src": "/hero/weft-narrow-1920.95ae72a23d0d.webp",
+            "width": 1920,
+            "height": 2635
         }
     ]
 }

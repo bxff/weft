@@ -5,8 +5,10 @@ test.use({ serviceWorkers: 'block' })
 for (const [family, width, height, dpr, expectedRatio] of [
     ['narrow', 390, 844, 2, 620 / 850],
     ['wide', 1440, 900, 1, 1200 / 528],
+    ['wide', 1440, 900, 2, 1200 / 528],
+    ['wide', 1440, 900, 3, 1200 / 528],
 ] as const) {
-    test.describe(`${family} homepage artwork`, () => {
+    test.describe(`${family} homepage artwork at ${dpr}x`, () => {
         test.use({ viewport: { width, height }, deviceScaleFactor: dpr })
 
         test('loads one correctly cropped static image and keeps the main actions', async ({ page }) => {
@@ -24,6 +26,8 @@ for (const [family, width, height, dpr, expectedRatio] of [
             expect(images[0]).toContain(`/hero/weft-${family}-`)
             const rect = await image.boundingBox()
             expect(rect).not.toBeNull()
+            const assetWidth = Number(images[0].match(/-(\d+)\./)?.[1])
+            expect(assetWidth).toBeGreaterThanOrEqual(rect!.width * dpr * 0.95)
             expect(rect!.width / rect!.height).toBeCloseTo(expectedRatio, 2)
             await expect(page.getByRole('link', { name: 'Read the docs' })).toBeVisible()
         })
