@@ -20,34 +20,6 @@
     })
 
     const showSignIn = $derived(ready && clerkEnabled() && !userLabel)
-
-    // API example, hand-highlighted with the wf-code token classes. Static and
-    // self-authored, so @html is safe.
-    const kw = (s: string) => `<span class="tok-keyword">${s}</span>`
-    const str = (s: string) => `<span class="tok-string">${s}</span>`
-    const fn = (s: string) => `<span class="tok-variableName">${s}</span>`
-    const prop = (s: string) => `<span class="tok-propertyName">${s}</span>`
-    const op = (s: string) => `<span class="tok-operator">${s}</span>`
-    const cmt = (s: string) => `<span class="tok-comment">${s}</span>`
-    const API_EXAMPLE_HTML = [
-        `${kw('const')} base ${op('=')} ${str('"https://api.weft.page"')}`,
-        `${kw('const')} headers ${op('=')} { ${str('"x-api-key"')}: apiKey }`,
-        ``,
-        `${kw('const')} list ${op('=')} ${kw('await')} ${fn('fetch')}(base + ${str('"/api/documents"')}, { headers })`,
-        `${kw('if')} (!list.ok) ${kw('throw new')} Error(${str('"Could not list notebooks"')})`,
-        `${kw('const')} { ${prop('documents')} } ${op('=')} ${kw('await')} list.${fn('json')}()`,
-        `${kw('const')} doc ${op('=')} documents.${fn('find')}(d ${op('=&gt;')} d.type === ${str('"notebook"')} &amp;&amp; d.pages?.length)`,
-        `${kw('if')} (!doc) ${kw('throw new')} Error(${str('"No synced notebook pages yet"')})`,
-        ``,
-        `${kw('const')} page ${op('=')} ${kw('await')} ${fn('fetch')}(`,
-        `  base + ${str('`/api/documents/${doc.id}/pages/${doc.pages[0].id}/rm`')},`,
-        `  { headers },`,
-        `)`,
-        `${kw('if')} (!page.ok) ${kw('throw new')} Error(${str('"Could not download the page"')})`,
-        `${kw('const')} bytes ${op('=')} ${kw('await')} page.${fn('arrayBuffer')}() ${cmt('// native .rm bytes')}`,
-    ]
-        .map((l) => `<span class="line">${l || ' '}</span>`)
-        .join('')
 </script>
 
 <div
@@ -117,18 +89,8 @@
             </p>
 
             <p class="my-4">
-                Other apps can build on your notes too. The relay API accepts keys scoped to
-                your account (create one in
-                <a href="/settings/keys" class="wf-link">settings</a>, revoke it any time).
-                The API is still evolving. This lists synced notebooks and downloads one
-                page&rsquo;s native <code>.rm</code> bytes. It isn&rsquo;t a full notebook export:
-                browser-only shape metadata and linked assets are separate.
+                Other apps can build on your notes too. See the <a href="/docs/api" class="wf-link">API docs</a>.
             </p>
-
-            <div class="my-4">
-                <!-- eslint-disable-next-line svelte/no-at-html-tags -- static, self-authored -->
-                <code class="wf-code">{@html API_EXAMPLE_HTML}</code>
-            </div>
 
             <p class="my-4">
                 Under the hood weft reads and writes the reMarkable&rsquo;s CRDT file format

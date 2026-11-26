@@ -295,37 +295,6 @@
     }
 }
 
-/* ANSI syntax tokens (exact tangram mapping) */
-.tok-keyword {
-    color: var(--magenta);
-}
-.tok-className,
-.tok-typeName,
-.tok-namespace {
-    color: var(--blue);
-}
-.tok-propertyName {
-    color: var(--cyan);
-}
-.tok-string,
-.tok-number,
-.tok-bool,
-.tok-macroName,
-.tok-deleted {
-    color: var(--red);
-}
-.tok-inserted {
-    color: var(--green);
-}
-.tok-comment {
-    color: var(--gray-7);
-}
-.tok-operator,
-.tok-punctuation,
-.tok-variableName {
-    color: var(--gray-b);
-}
-
 /* =========================================================================
    DOCS — native SvelteKit /docs. Flat terminal layout: uniform 16px, the
    [250px | content | 250px] grid, white headings, blue links, flat #111 code.
