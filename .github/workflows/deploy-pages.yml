@@ -1,6 +1,10 @@
 name: Deploy Weft Pages
 
 on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -13,10 +17,18 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/main'
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     environment: pages-production
+    env:
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
       - name: Require a green CI run for this main commit
         env:
@@ -24,15 +36,16 @@ jobs:
         run: |
           set -euo pipefail
           green=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event push \
-            --branch main --commit "$GITHUB_SHA" --status success --limit 1 --json headSha \
+            --branch main --commit "$DEPLOY_SHA" --status success --limit 1 --json headSha \
             --jq '.[0].headSha // ""')
-          if [[ "$green" != "$GITHUB_SHA" ]]; then
+          if [[ "$green" != "$DEPLOY_SHA" ]]; then
             echo "CI has not passed on this exact main commit."
             exit 1
           fi
 
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.DEPLOY_SHA }}
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-node@v4
@@ -70,11 +83,11 @@ jobs:
           : "${CLOUDFLARE_PAGES_PROJECT:?Configure CLOUDFLARE_PAGES_PROJECT in pages-production}"
           : "${CLOUDFLARE_PAGES_PRODUCTION_BRANCH:?Configure CLOUDFLARE_PAGES_PRODUCTION_BRANCH in pages-production}"
           : "${CLOUDFLARE_API_TOKEN:?Configure CLOUDFLARE_API_TOKEN in pages-production}"
-          if [[ "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" != "$GITHUB_SHA" ]]; then
+          if [[ "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" != "$DEPLOY_SHA" ]]; then
             echo "main has advanced. Dispatch the current commit after CI passes."
             exit 1
           fi
           unset GH_TOKEN
           "$RUNNER_TEMP/weft-pages/node_modules/.bin/wrangler" pages deploy apps/web/build \
             --project-name="$CLOUDFLARE_PAGES_PROJECT" --branch="$CLOUDFLARE_PAGES_PRODUCTION_BRANCH" \
-            --commit-hash="$GITHUB_SHA"
+            --commit-hash="$DEPLOY_SHA"

@@ -22,10 +22,12 @@ The existing Pages project can keep its production branch name even if
 the GitHub repo uses `main`. If the Pages setting changes, update the
 environment variable before the next deploy.
 
-After CI passes on `main`, open **Actions → Deploy Weft Pages → Run workflow**
-and select `main`. The job refuses other branches, requires a successful push
-CI run on the exact commit, and checks that the commit is still at the head of
-`main` immediately before upload. It is never triggered by a pull request.
+A successful CI run on a push to `main` starts the deployment automatically.
+Pull requests and failed CI runs do not deploy. The workflow checks out the
+exact tested commit and checks that it is still the current head of `main`
+before uploading. If needed, use **Actions → Deploy Weft Pages → Run workflow**
+on `main` as a manual fallback; the same checks apply.
+
 Confirm in the Pages dashboard that the new deployment is marked Production
 and that the custom domain still serves the app. For a rollback, use the
 previous known-good production deployment in the Pages dashboard.
