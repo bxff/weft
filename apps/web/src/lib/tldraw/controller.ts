@@ -73,6 +73,7 @@ import {
     styleForNodeKind,
     type RichLine,
 } from './device-text-richtext'
+import { arrowRecordProps, restoreArrowLinks, unpackArrowProps } from './arrow-persistence'
 import { textFromNode, eraseRichTextGlyphs, canonicalRichText } from './richtext-plain'
 import {
     NATIVE_FONT_PRELOADS,
@@ -453,8 +454,10 @@ export class StudioController {
         )
         this.storeUnsub = this.editor.store.listen(
             ({ changes }) => {
-                for (const record of Object.values(changes.added))
+                for (const record of Object.values(changes.added)) {
                     this.noteChange(record as TLShape)
+                    if (record.typeName === 'binding' && record.type === 'arrow') this.queueArrow(record.fromId)
+                }
                 for (const [before, after] of Object.values(changes.updated)) {
                     if (before.typeName === 'shape' && after.typeName === 'shape' && after.meta.rmBrush &&
                         before.parentId !== after.parentId && sameNativeShapeGeometry(before, after)) {
@@ -466,9 +469,16 @@ export class StudioController {
                         if (previous && samePageTransform(previous, this.editor.getShapePageTransform(after))) continue
                     }
                     this.noteChange(after as TLShape, before as TLShape)
+                    if (after.typeName === 'binding' && after.type === 'arrow') this.queueArrow(after.fromId)
+                    if (after.typeName === 'shape') {
+                        for (const binding of this.editor.getBindingsToShape(after.id, 'arrow')) {
+                            this.queueArrow(binding.fromId)
+                        }
+                    }
                 }
                 for (const record of Object.values(changes.removed)) {
                     const shape = record as TLShape
+                    if (record.typeName === 'binding' && record.type === 'arrow') this.queueArrow(record.fromId)
                     if (shape.typeName === 'shape') this.pendingDeletes.set(shape.id, this.shapeEditVersion(shape.id))
                 }
                 this.schedule()
@@ -654,7 +664,7 @@ export class StudioController {
             }
             this.overlayPropsChecks.set(type, check)
         }
-        return check(shape.props)
+        return check(type === 'arrow' ? unpackArrowProps(shape.props).props : shape.props)
     }
 
     get hasUnreadableShapes(): boolean {
@@ -960,7 +970,7 @@ export class StudioController {
                 y: shape.y,
                 rotation: shape.rotation,
                 index: this.displayIndex(shape),
-                props: shape.props as never,
+                props: browserOverlayProps(shape) as never,
                 opacity: displayOpacity(shape),
                 meta: { weft: true, detached: shape.state === 'detached' },
             }))
@@ -981,11 +991,22 @@ export class StudioController {
         })
         if (toCreate.length) this.editor.createShapes(toCreate as never[])
         if (toUpdate.length) this.editor.updateShapes(toUpdate as never[])
+        this.restoreOverlayArrowLinks()
         this.applyBrowserOrderTies()
         // Re-apply per-layer visibility on every render: the scene walk yields
         // hidden-layer items too, so without this a hidden layer renders VISIBLE
         // on open / re-bootstrap / editRootText. Idempotent (reads the doc).
         this.applyLayerVisibility()
+    }
+
+    private restoreOverlayArrowLinks(): void {
+        for (const shape of this.session.currentOverlay.shapes) {
+            const id = shape.shapeId as TLShapeId
+            if (shape.kind === 'arrow' && shape.state === 'live' && !this.hasUnprojectedShape(id) &&
+                shape.props && typeof shape.props === 'object') {
+                restoreArrowLinks(this.editor, id, shape.props)
+            }
+        }
     }
 
     private displayIndex(shape: OverlayShape): IndexKey | undefined {
@@ -1478,6 +1499,14 @@ export class StudioController {
     }
 
     // ----- local edits -> engine -----
+
+    private queueArrow(id: TLShapeId): void {
+        const arrow = this.editor.getShape(id)
+        if (arrow?.type !== 'arrow' || arrow.meta.detached) return
+        this.orderOnlyShapeIds.delete(id)
+        this.pendingShapeIds.add(id)
+        this.pendingShapeVersions.set(id, this.captureShapeEdit(id))
+    }
 
     private noteChange(record: TLShape, before?: TLShape): void {
         if (record.typeName !== 'shape') return
@@ -2634,10 +2663,14 @@ export class StudioController {
         opacityWrite?: { opacity: number; opacityVersion: OpVersion },
         version = this.shapeEditVersion(shape.id),
     ): LocalOp | null {
+        const previous = shape.type === 'arrow'
+            ? this.session.currentOverlay.shapes.find(record => record.shapeId === shape.id)?.props
+            : undefined
         const base: Omit<OverlayShape, 'rendered' | 'state'> = {
             shapeId: shape.id,
             kind: shape.type as OverlayShape['kind'],
-            props: shape.props,
+            props: shape.type === 'arrow' ? arrowRecordProps(this.editor, shape,
+                previous && typeof previous === 'object' ? previous : undefined) : shape.props,
             x: shape.x,
             y: shape.y,
             rotation: shape.rotation,
@@ -3324,7 +3357,7 @@ export class StudioController {
                         y: patch.shape.y,
                         rotation: patch.shape.rotation,
                         index: this.displayIndex(patch.shape),
-                        props: patch.shape.props as never,
+                        props: browserOverlayProps(patch.shape) as never,
                         opacity: displayOpacity(patch.shape),
                         meta: { weft: true, detached: patch.shape.state === 'detached' },
                     }
@@ -3355,6 +3388,7 @@ export class StudioController {
                 }
                 applyPatch(patch)
             }
+            if (patches.some(patch => patch.type === 'shape-upserted')) this.restoreOverlayArrowLinks()
             paintInk()
             if (orderChanged) this.applyBrowserOrderTies()
             if (visibilityChanged) this.applyLayerVisibility()
@@ -3455,6 +3489,12 @@ const PROJECTION_VERSION: Record<string, number> = {
     highlight: 2,
 }
 
+function browserOverlayProps(shape: OverlayShape): unknown {
+    return shape.kind === 'arrow' && shape.props && typeof shape.props === 'object'
+        ? unpackArrowProps(shape.props).props
+        : shape.props
+}
+
 function hashOf(shape: TLShape, editor: Editor): string {
     // the PAGE transform, not just local x/y: a child of a moved FRAME keeps
     // its frame-local coords, and a props-only hash made the content-
@@ -3462,11 +3502,12 @@ function hashOf(shape: TLShape, editor: Editor): string {
     // following on the tablet)
     const t = editor.getShapePageTransform(shape)
     // Ignore equivalent TipTap default attrs so hydration does not reproject glyphs.
-    const props = shape.props as { richText?: unknown }
+    const saved = shape.type === 'arrow' ? arrowRecordProps(editor, shape) : shape.props
+    const props = saved as { richText?: unknown }
     const p =
         props && props.richText !== undefined
             ? { ...props, richText: canonicalRichText(props.richText) }
-            : shape.props
+            : saved
     const json = JSON.stringify({
         v: PROJECTION_VERSION[shape.type] ?? 1,
         p,
