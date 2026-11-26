@@ -4,6 +4,9 @@ on:
   workflow_run:
     workflows: [ci]
     types: [completed]
+  pull_request_target:
+    branches: [main]
+    types: [labeled]
   workflow_dispatch:
     inputs:
       pr:
@@ -19,6 +22,10 @@ jobs:
       github.ref == 'refs/heads/main' &&
       vars.WEFT_PRIVATE_PREVIEWS_ENABLED == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request_target' &&
+        github.event.label.name == 'preview' &&
+        github.event.sender.id == github.repository_owner_id &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
        (github.event.workflow_run.event == 'pull_request' &&
         github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.head_repository.full_name == github.repository))
@@ -38,12 +45,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           CI_SHA: ${{ github.event.workflow_run.head_sha }}
           MANUAL_PR: ${{ inputs.pr }}
+          LABELED_PR: ${{ github.event.pull_request.number }}
+          LABELED_SHA: ${{ github.event.pull_request.head.sha }}
           OWNER_ID: ${{ github.repository_owner_id }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             [[ "$MANUAL_PR" =~ ^[1-9][0-9]*$ ]]
             candidates=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$MANUAL_PR" | jq '[.]')
+          elif [[ "$GITHUB_EVENT_NAME" == pull_request_target ]]; then
+            [[ "$LABELED_PR" =~ ^[1-9][0-9]*$ && "$LABELED_SHA" =~ ^[0-9a-f]{40}$ ]]
+            CI_SHA="$LABELED_SHA"
+            candidates=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$LABELED_PR" | jq '[.]')
           else
             [[ "$CI_SHA" =~ ^[0-9a-f]{40}$ ]]
             candidates=$(gh api "repos/$GITHUB_REPOSITORY/commits/$CI_SHA/pulls")
@@ -63,10 +76,15 @@ jobs:
           pr=$(jq -r .number <<< "$candidate")
           sha=$(jq -r .head.sha <<< "$candidate")
           [[ "$pr" =~ ^[1-9][0-9]*$ && "$sha" =~ ^[0-9a-f]{40}$ ]]
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+          if [[ "$GITHUB_EVENT_NAME" != workflow_run ]]; then
             passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event pull_request \
               --commit "$sha" --status success --limit 1 --json headSha --jq '.[0].headSha // ""')
-            [[ "$passed" == "$sha" ]] || { echo 'CI must pass on the current PR head.'; exit 1; }
+            if [[ "$passed" != "$sha" ]]; then
+              echo 'CI must pass on the current PR head.'
+              # A successful CI completion will pick up the label if CI is still running.
+              [[ "$GITHUB_EVENT_NAME" == pull_request_target ]]
+              exit
+            fi
           fi
           if ! gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/$pr/events?per_page=100" | jq -e \
             --arg owner "$OWNER_ID" \
@@ -79,6 +97,7 @@ jobs:
           fi
           printf 'pr=%s\nsha=%s\n' "$pr" "$sha" >> "$GITHUB_OUTPUT"
 
+  # Only this credential-free job runs the PR head; select and upload run the base workflow.
   build:
     needs: select
     if: needs.select.outputs.pr != ''
