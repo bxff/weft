@@ -1448,10 +1448,10 @@ export class CloudStore {
       if (blocked !== null) return { kind: "blocked", response: blocked };
 
       if (batch) this.appendOps(user, doc, page, batch.deltas, batch.author);
-      // A mixed publication pins its checkpoint past the deltas just appended.
-      // Do not acknowledge a checkpoint we could not reconstruct and merge.
+      // Guarded publications may pin past both existing and newly appended
+      // deltas. Do not acknowledge a checkpoint we could not safely merge.
       const { seq, merged } = this.putSnapshotMerged(
-        user, doc, page, batch?.snapshot ?? bytes, { requireMerge: batch !== undefined },
+        user, doc, page, batch?.snapshot ?? bytes, { requireMerge: publication !== null },
       );
       if (publication) {
         this.db.run(
@@ -1496,6 +1496,10 @@ export class CloudStore {
     try {
       const snap = decodeSnapshot(container);
       const prev = this.reconstructDevicePage(user, doc, page).bytes;
+      if (requireMerge && (!prev || Buffer.compare(snap.rm, prev) === 0)) {
+        // The merge fast path otherwise returns these bytes without parsing.
+        RmDocument.parse(snap.rm);
+      }
       // web publishers keep explicit tombstones for every deletion, so an
       // absent item can only mean "never seen" — always re-add ("never").
       const mergedRm = mergeForSnapshot(snap.rm, prev, "never");

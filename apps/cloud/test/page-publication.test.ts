@@ -504,10 +504,10 @@ test('guarded snapshot publications require both headers and validate the base c
     process.env.CLOUD_DEV_USER = '1'
     const server = startCloud({ port: 0, db: join(dir, 'relay.sqlite') })
     const id = crypto.randomUUID()
-    const opaque = Uint8Array.of(1, 2, 3)
-    const put = (headers: Record<string, string>) =>
+    const snapshot = encodeSnapshot(blank, overlay)
+    const put = (headers: Record<string, string>, body = snapshot) =>
         fetch(`http://localhost:${server.port}/api/documents/${DOC}/pages/${PAGE}/snapshot`, {
-            method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, ...headers }, body: opaque,
+            method: 'POST', headers: { authorization: `Bearer ${TOKEN}`, ...headers }, body,
         })
     try {
         expect((await put({})).status).toBe(400)
@@ -519,8 +519,27 @@ test('guarded snapshot publications require both headers and validate the base c
         }
         expect(server.store.latestSnapshot(...PAGE_KEY)).toBeNull()
         expect(server.store.changesSince(USER, 0)).toEqual([])
-        expect((await put({ 'x-snapshot-publication-id': id, 'x-snapshot-base-seq': '0' })).status).toBe(200)
-        expect(server.store.latestSnapshot(...PAGE_KEY)?.bytes).toEqual(opaque)
+        const first = { 'x-snapshot-publication-id': id, 'x-snapshot-base-seq': '0' }
+        expect((await put(first, Uint8Array.of(1, 2, 3))).status).toBe(500)
+        expect(server.store.latestSnapshot(...PAGE_KEY)).toBeNull()
+        expect(server.store.changesSince(USER, 0)).toEqual([])
+        expect((await put(first)).status).toBe(200)
+        expect(server.store.latestSnapshot(...PAGE_KEY)?.bytes).toEqual(snapshot)
+
+        const base = server.store.latestSnapshotSeq(...PAGE_KEY)
+        const next = { 'x-snapshot-publication-id': crypto.randomUUID(), 'x-snapshot-base-seq': String(base) }
+        const failedRead = spyOn(server.store, 'reconstructDevicePage').mockImplementationOnce(() => {
+            throw new Error('injected snapshot reconstruction failure')
+        })
+        try {
+            expect((await put(next)).status).toBe(500)
+            expect(server.store.latestSnapshotSeq(...PAGE_KEY)).toBe(base)
+            expect(server.store.changesSince(USER, 0)).toHaveLength(1)
+        } finally {
+            failedRead.mockRestore()
+        }
+        expect((await put(next)).status).toBe(200)
+        expect(server.store.changesSince(USER, 0)).toHaveLength(2)
     } finally {
         server.stop()
         rmSync(dir, { recursive: true, force: true })
