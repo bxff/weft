@@ -24,6 +24,7 @@ export function svgContentBounds(
 }
 import type { TLRichText } from 'tldraw'
 import {
+    canvasMeasure,
     DEVICE_TEXT_LEFT_MARGIN_INK,
     MARKER_BASELINE_DROP_INK,
     MARKER_RIGHT_GAP_INK,
@@ -118,7 +119,8 @@ function markerText(
 export function buildSvgLines(richText: TLRichText, widthInk: number): SvgLine[] {
     const lines = richTextToLines(richText)
     const paragraphs = lines.map(toParagraph)
-    const layout = layoutText(paragraphs, widthInk)
+    const measure = canvasMeasure()
+    const layout = layoutText(paragraphs, widthInk, measure)
     const out: SvgLine[] = []
     const counters = { l1: 0, l2: 0 }
     lines.forEach((line, i) => {
@@ -137,7 +139,6 @@ export function buildSvgLines(richText: TLRichText, widthInk: number): SvgLine[]
             const runs: SvgRun[] = []
             let pen = xStart
             let pos = 0
-            let lastGlyphEnd = xStart
             for (const seg of spans) {
                 const s0 = pos
                 const s1 = pos + seg.text.length
@@ -147,7 +148,7 @@ export function buildSvgLines(richText: TLRichText, widthInk: number): SvgLine[]
                 if (b <= a) continue
                 const text = seg.text.slice(a - s0, b - s0)
                 const span = { bold: seg.bold, italic: seg.italic }
-                const pp = penPositions(text, m, span)
+                const pp = penPositions(text, m, span, measure)
                 runs.push({
                     xs: pp.xs.map((x) => pen + x),
                     text,
@@ -155,11 +156,8 @@ export function buildSvgLines(richText: TLRichText, widthInk: number): SvgLine[]
                     italic: seg.italic,
                 })
                 pen += pp.end
-                const trimmed = text.replace(/ +$/, '')
-                if (trimmed)
-                    lastGlyphEnd =
-                        pen - penPositions(text.slice(trimmed.length), m, span).end
             }
+            const lastGlyphEnd = xStart + para.lineWidthsInk[li]!
             const sl: SvgLine = {
                 y,
                 top: y - para.baselineOffsetInk,
@@ -179,7 +177,7 @@ export function buildSvgLines(richText: TLRichText, widthInk: number): SvgLine[]
                         sl.marker = { text: marker, x: m.marker.xInk }
                     } else {
                         // numbered: right-aligned at indent - MARKER_RIGHT_GAP, x rounded to integer ink
-                        const w = penPositions(marker, m).end
+                        const w = penPositions(marker, m, undefined, measure).end
                         sl.marker = {
                             text: marker,
                             x: Math.round(m.indentInk - MARKER_RIGHT_GAP_INK - w),
@@ -238,11 +236,13 @@ function Checkbox({ x, y, checked }: { x: number; y: number; checked: boolean })
 export function DeviceTextSvgContent({
     richText,
     widthInk,
+    layoutGen,
 }: {
     richText: TLRichText
     widthInk: number
+    layoutGen: number
 }) {
-    const lines = useMemo(() => buildSvgLines(richText, widthInk), [richText, widthInk])
+    const lines = useMemo(() => buildSvgLines(richText, widthInk), [richText, widthInk, layoutGen])
     return (
         // geometricPrecision: glyph outlines must scale like the ink paths.
         // The default hint-snaps glyphs to the device-pixel grid, re-quantizing
