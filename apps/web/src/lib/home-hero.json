@@ -1,49 +1,49 @@
 {
     "wide": [
         {
-            "src": "/hero/weft-wide-960.43eb1eaab067.webp",
+            "src": "/hero/weft-wide-960.1cbc92fb674a.webp",
             "width": 960,
             "height": 422
         },
         {
-            "src": "/hero/weft-wide-1440.19ad3fe4a77c.webp",
+            "src": "/hero/weft-wide-1440.57f44d3750aa.webp",
             "width": 1440,
             "height": 634
         },
         {
-            "src": "/hero/weft-wide-1920.f84158482285.webp",
+            "src": "/hero/weft-wide-1920.d8c82feb7026.webp",
             "width": 1920,
             "height": 845
         },
         {
-            "src": "/hero/weft-wide-2880.d474013904ae.webp",
+            "src": "/hero/weft-wide-2880.9217939a4afe.webp",
             "width": 2880,
             "height": 1267
         },
         {
-            "src": "/hero/weft-wide-3600.b553abfe4198.webp",
+            "src": "/hero/weft-wide-3600.8f079af622a7.webp",
             "width": 3600,
             "height": 1584
         }
     ],
     "narrow": [
         {
-            "src": "/hero/weft-narrow-480.50218ef8e127.webp",
+            "src": "/hero/weft-narrow-480.7a0242c38fc9.webp",
             "width": 480,
             "height": 658
         },
         {
-            "src": "/hero/weft-narrow-720.9e66ee11477e.webp",
+            "src": "/hero/weft-narrow-720.0846e13ddabe.webp",
             "width": 720,
             "height": 987
         },
         {
-            "src": "/hero/weft-narrow-1080.ae3fb9b26e95.webp",
+            "src": "/hero/weft-narrow-1080.49c55ed69dba.webp",
             "width": 1080,
             "height": 1481
         },
         {
-            "src": "/hero/weft-narrow-1440.2259c4206830.webp",
+            "src": "/hero/weft-narrow-1440.e9ed8196b32e.webp",
             "width": 1440,
             "height": 1974
         }
