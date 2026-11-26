@@ -33,29 +33,29 @@
     ],
     "narrow": [
         {
-            "src": "/hero/weft-narrow-480.88855c624309.webp",
+            "src": "/hero/weft-narrow-480.d16598c98a1f.webp",
             "width": 480,
-            "height": 659
+            "height": 697
         },
         {
-            "src": "/hero/weft-narrow-720.43d0d42f3a09.webp",
+            "src": "/hero/weft-narrow-720.aec533bb76b6.webp",
             "width": 720,
-            "height": 988
+            "height": 1046
         },
         {
-            "src": "/hero/weft-narrow-1080.1189d550da1c.webp",
+            "src": "/hero/weft-narrow-1080.47e02f451e58.webp",
             "width": 1080,
-            "height": 1482
+            "height": 1569
         },
         {
-            "src": "/hero/weft-narrow-1440.05f8b5c1cf8b.webp",
+            "src": "/hero/weft-narrow-1440.0daec879c1ea.webp",
             "width": 1440,
-            "height": 1976
+            "height": 2091
         },
         {
-            "src": "/hero/weft-narrow-1920.632140728987.webp",
+            "src": "/hero/weft-narrow-1920.307107addd6a.webp",
             "width": 1920,
-            "height": 2635
+            "height": 2789
         }
     ]
 }
