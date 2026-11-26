@@ -8,8 +8,8 @@ import { libraryCacheScope, readCachedDocumentList } from '../library-cache'
 import {
     AssetRecordType,
     createShapeId,
-    DefaultFontFaces,
     DefaultFontFamilies,
+    getDisplayValues,
     isShapeId,
     Mat,
     T,
@@ -23,6 +23,7 @@ import {
     type ShapeUtil,
     type TLDrawShape,
     type TLShape,
+    type TLRichText,
     type TLShapeId,
 } from 'tldraw'
 import {
@@ -54,6 +55,8 @@ import {
     tldrawWidthToRmMarkerWidth,
     RM_SCALE,
     type InkStroke,
+    type ShapeTransform,
+    type GlyphPart,
 } from '@weft/rm-ink'
 import { RefResolver, remapImagesByUuid, type LiveImage } from '@weft/sync-engine'
 import {
@@ -83,7 +86,8 @@ import {
     DEVICE_TEXT_LEFT_MARGIN_INK,
 } from './text-metrics'
 import { computeAnchorOffsets } from './text-anchor-layout'
-import { parse as parseFont, type Font } from 'opentype.js'
+import { ProjectionFontLoader, type ProjectionFamily, type ProjectionFontKey } from './projection-fonts'
+import { measureRichProjection, richProjection } from './richtext-projection'
 import { adoptOrphanAuthor, cachedDocuments, ensureUniqueAuthorUuid, uuidv4 } from '../transport'
 import { fetchDataUrl, seedAssetBytes } from '../authedAsset'
 import { getPointsFromDrawSegments } from 'tldraw'
@@ -176,6 +180,8 @@ function sameNativeLine(a: Line, b: Line): boolean {
         })
 }
 
+const RETRY_TEXT_PROJECTION = Symbol('retry-text-projection')
+
 const closingReplicas = new Map<string, Promise<void>>()
 
 export class StudioController {
@@ -185,7 +191,7 @@ export class StudioController {
     /** PDF page size in points, reported by pdf.js once the file loads. */
     pdfPtSize: { w: number; h: number } | null = null
     private editor!: Editor
-    private fonts = new Map<ProjectionFamily, Font>()
+    private readonly fonts: ProjectionFontLoader
     pageMeta: PageMeta = {
         docType: 'notebook',
         template: null,
@@ -206,6 +212,7 @@ export class StudioController {
     /** UI subscription for late-arriving page metadata (background doclist). */
     onMetaChanged: (() => void) | null = null
     private pendingShapeIds = new Set<string>()
+    private deferredTextProjection = new Set<string>()
     private readonly deferredOpacityRepaints = new Set<string>()
     private readonly pendingOpacityWrites = new Map<string, { opacity: number; opacityVersion: OpVersion }>()
     private pendingBrowserOrder = new Map<string, IndexKey>()
@@ -248,7 +255,9 @@ export class StudioController {
     private assetUnsub: (() => void) | null = null
     private docListUnsub: (() => void) | null = null
 
-    constructor(private readonly opts: ControllerOptions) {}
+    constructor(private readonly opts: ControllerOptions) {
+        this.fonts = new ProjectionFontLoader(opts.fontUrl)
+    }
 
     /**
      * Cache-primary election: every tab edits (own author identity); the lock
@@ -523,45 +532,26 @@ export class StudioController {
         if (toDelete.length) this.editor.deleteShapes(toDelete)
     }
 
-    /** Font loading retries on demand: a single failed fetch must not stop
-     *  text from ever syncing this session. */
-    private fontLoads = new Map<ProjectionFamily, Promise<Font | null>>()
-
-    private ensureFont(shape?: TLShape): Promise<Font | null> {
-        const family = projectionFamily(shape)
-        const cached = this.fonts.get(family)
-        if (cached) return Promise.resolve(cached)
-        const url = family === 'draw' ? this.opts.fontUrl : projectionFontUrls[family]
-        if (!url) return Promise.resolve(null)
-        const loading = this.fontLoads.get(family)
-        if (loading) return loading
-
-        const work = (async () => {
-            try {
-                const response = await fetch(url)
-                if (!response.ok) return null
-                const font = parseFont(await response.arrayBuffer())
-                // Wait before measuring text or label bounds: fallback CSS
-                // metrics can wrap the right outlines at the wrong positions.
-                if (family !== 'draw' && !this.disposed) {
-                    await this.editor.fonts.ensureFontIsLoaded(DefaultFontFaces[`tldraw_${family}`].normal.normal)
-                }
-                this.fonts.set(family, font)
-                return font
-            } catch {
-                return null
-            }
-        })().finally(() => this.fontLoads.delete(family))
-        this.fontLoads.set(family, work)
-        return work
+    private ensureFont(key: ProjectionFontKey = 'draw') {
+        return this.fonts.ensure(key, this.editor.getContainer().ownerDocument)
     }
 
-    private missingProjectionFonts(): Map<ProjectionFamily, TLShape> {
-        const missing = new Map<ProjectionFamily, TLShape>()
+    private projectionReady(shape: TLShape): boolean {
+        return [...projectionKeys(shape)].every((key) => this.fonts.get(key))
+    }
+
+    private async ensureShapeFonts(shape: TLShape): Promise<boolean> {
+        const faces = await Promise.all([...projectionKeys(shape)].map((key) => this.ensureFont(key)))
+        return faces.every(Boolean)
+    }
+
+    private missingProjectionFonts(): Set<ProjectionFontKey> {
+        const missing = new Set<ProjectionFontKey>()
         for (const id of this.pendingShapeIds) {
             const shape = this.editor.getShape(id as TLShapeId)
-            if (shape && needsProjectionFont(shape) && !this.fonts.has(projectionFamily(shape))) {
-                missing.set(projectionFamily(shape), shape)
+            if (!shape) continue
+            for (const key of projectionKeys(shape)) {
+                if (!this.fonts.get(key)) missing.add(key)
             }
         }
         return missing
@@ -572,12 +562,12 @@ export class StudioController {
         if (this.disposed) return
         const shape = this.editor.getShape(shapeId as TLShapeId)
         if (!shape) return
-        if (!this.fonts.has(projectionFamily(shape)) && needsProjectionFont(shape)) {
-            if (!(await this.ensureFont(shape)) || this.disposed || this.editor.getShape(shape.id) !== shape) return
+        if (!this.projectionReady(shape)) {
+            if (!(await this.ensureShapeFonts(shape)) || this.disposed || this.editor.getShape(shape.id) !== shape) return
         }
         const opacity = this.storedOpacity(shapeId)
         const op = this.projectShape(shape)
-        if (!op) return
+        if (!op || op === RETRY_TEXT_PROJECTION) return
         await this.trackCommand(this.applyLocal([op], () => this.remote(() => {
             this.editor.updateShape({
                 id: shape.id,
@@ -1660,7 +1650,7 @@ export class StudioController {
                 if (this.disposed) return
                 const missingFont = this.missingProjectionFonts().size > 0
                 const gestureInProgress = this.pendingInkTransforms.size > 0 && this.editor.inputs.getIsPointing()
-                if (missingFont || gestureInProgress) throw new Error('Some edits could not be projected yet')
+                if (missingFont || this.deferredTextProjection.size || gestureInProgress) throw new Error('Some edits could not be projected yet')
                 const failure = this.saveFailure
                 const renders = [...this.renderAfterRetry]
                 await this.session.savePending()
@@ -1694,7 +1684,7 @@ export class StudioController {
         if (this.disposed) return
         const missingFonts = this.missingProjectionFonts()
         if (missingFonts.size) {
-            await Promise.all([...missingFonts.values()].map((shape) => this.ensureFont(shape)))
+            await Promise.all([...missingFonts].map((key) => this.ensureFont(key)))
             if (this.disposed) return
         }
         const ops: LocalOp[] = []
@@ -1702,6 +1692,7 @@ export class StudioController {
         for (const [shapeId, version] of this.pendingDeletes) {
             this.deferredOpacityRepaints.delete(shapeId)
             this.pendingShapeIds.delete(shapeId)
+            this.deferredTextProjection.delete(shapeId)
             this.pendingShapeVersions.delete(shapeId)
             this.pendingOpacityWrites.delete(shapeId)
             this.pendingBrowserOrder.delete(shapeId)
@@ -1762,6 +1753,7 @@ export class StudioController {
         const projected: string[] = []
         for (const shapeId of this.projectionOrder(batch)) {
             const shape = this.editor.getShape(shapeId as TLShapeId)
+            this.deferredTextProjection.delete(shapeId)
             if (!shape) continue
             const opacityWrite = opacityBatch.get(shapeId)
             const captured = versions.get(shapeId) ?? this.captureShapeEdit(shapeId)
@@ -1781,14 +1773,17 @@ export class StudioController {
                 }
                 continue
             }
-            if (!this.fonts.has(projectionFamily(shape)) && needsProjectionFont(shape)) {
+            const op = this.projectionReady(shape)
+                ? this.projectShape(shape, orderVersion, opacityWrite, editVersion)
+                : RETRY_TEXT_PROJECTION
+            if (op === RETRY_TEXT_PROJECTION) {
+                this.deferredTextProjection.add(shapeId)
                 this.pendingShapeIds.add(shapeId)
                 this.pendingShapeVersions.set(shapeId, captured)
                 if (opacityWrite && !this.pendingOpacityWrites.has(shapeId)) this.pendingOpacityWrites.set(shapeId, opacityWrite)
                 retries++
                 continue
             }
-            const op = this.projectShape(shape, orderVersion, opacityWrite, editVersion)
             if (op) {
                 ops.push(op)
                 projected.push(shapeId)
@@ -2637,7 +2632,7 @@ export class StudioController {
         orderVersion?: OpVersion,
         opacityWrite?: { opacity: number; opacityVersion: OpVersion },
         version = this.shapeEditVersion(shape.id),
-    ): LocalOp | null {
+    ): LocalOp | null | typeof RETRY_TEXT_PROJECTION {
         const base: Omit<OverlayShape, 'rendered' | 'state'> = {
             shapeId: shape.id,
             kind: shape.type as OverlayShape['kind'],
@@ -2728,25 +2723,25 @@ export class StudioController {
                 const t = this.editor.getShapePageTransform(shape)
                 // browser-measured spans (the SAME layout the DOM rendered);
                 // null in tests / when the measurer is unavailable
-                const spans = this.measureSpans(text, {
+                const measure = {
                     fontSize: FONT_SIZES[props.size ?? 'm'] ?? 24,
                     scale,
-                    width:
-                        props.autoSize === false && typeof props.w === 'number'
-                            ? Math.max(16, Math.floor(props.w))
-                            : Math.ceil(
-                                  this.editor.getShapeGeometry(shape).bounds.w / scale,
-                              ) + 2,
+                    width: props.autoSize === false && typeof props.w === 'number'
+                        ? Math.max(16, Math.floor(props.w))
+                        : Math.ceil(this.editor.getShapeGeometry(shape).bounds.w / scale) + 2,
                     textAlign: props.textAlign ?? 'start',
-                    font: (shape.props as { font?: string }).font,
-                })
-                const parts = textToGlyphParts(
-                    font,
-                    { text, fontSize },
-                    { x: shape.x, y: shape.y, rotation: shape.rotation, m: [t.a, t.b, t.c, t.d, t.e, t.f] },
-                    colorOf(shape),
-                    spans ? { spans } : { width, align: props.textAlign },
-                )
+                    font: projectionFamily(shape),
+                }
+                const styled = this.measureStyled(shape, measure)
+                if (styled === null) return RETRY_TEXT_PROJECTION
+                const spans = styled?.spans ?? this.measureSpans(text, measure)
+                const transform: ShapeTransform = {
+                    x: shape.x, y: shape.y, rotation: shape.rotation, m: [t.a, t.b, t.c, t.d, t.e, t.f],
+                }
+                const color = colorOf(shape)
+                const parts = textToGlyphParts(font, { text, fontSize }, transform, color,
+                    spans ? { spans } : { width, align: props.textAlign })
+                if (styled) parts.unshift(...this.projectTextExtras(styled, font, fontSize, transform, color))
                 if (parts.length === 0) return null
                 return {
                     type: 'upsert-shape',
@@ -2779,7 +2774,11 @@ export class StudioController {
                 // LABEL: text typed inside a shape (a rectangle/arrow/line label)
                 // renders on the web but was dropped from the tablet entirely.
                 const label = extractPlainText(shape.props as { richText?: unknown; text?: string })
-                if (label.trim()) parts.push(...this.projectLabel(shape, label))
+                if (label.trim()) {
+                    const labelParts = this.projectLabel(shape, label)
+                    if (!labelParts) return RETRY_TEXT_PROJECTION
+                    parts.push(...labelParts)
+                }
                 if (parts.length === 0) return null
                 return {
                     type: 'upsert-shape',
@@ -2799,7 +2798,11 @@ export class StudioController {
                     strokes: [stroke],
                 }))
                 const label = extractPlainText(shape.props as { richText?: unknown; text?: string })
-                if (label.trim()) parts.push(...this.projectLabel(shape, label))
+                if (label.trim()) {
+                    const labelParts = this.projectLabel(shape, label)
+                    if (!labelParts) return RETRY_TEXT_PROJECTION
+                    parts.push(...labelParts)
+                }
                 if (parts.length === 0) return null
                 return {
                     type: 'upsert-shape',
@@ -2861,6 +2864,45 @@ export class StudioController {
             if (line.length >= 2) out.push({ points: polylineToPoints(line, { width }), color })
         }
         return out
+    }
+
+    private measureStyled(
+        shape: TLShape,
+        opts: { fontSize: number; scale: number; width: number; textAlign: string; font: ProjectionFamily; lineHeight?: number },
+    ) {
+        const rich = shapeRichText(shape)
+        if (!rich || !richProjection(rich, opts.font).styled) return undefined
+        return measureRichProjection(this.editor, this.fonts, rich, { ...opts, family: opts.font, align: opts.textAlign })
+    }
+
+    private projectTextExtras(
+        measured: NonNullable<ReturnType<typeof measureRichProjection>>,
+        font: NonNullable<ReturnType<ProjectionFontLoader['get']>>,
+        fontSize: number,
+        transform: ShapeTransform,
+        color: string,
+    ): GlyphPart[] {
+        const extra: GlyphPart[] = measured.highlight.map(({ x, y, w, h }, i) => {
+            // A native yellow mark is transparent over ink and can survive
+            // separate stroke reuse. Inset ends to account for the round caps.
+            const thickness = Math.min(h * 0.82, w)
+            const mid = y + h / 2
+            const points = mapToRmSpace([
+                { x: x + thickness / 2, y: mid },
+                { x: x + w - thickness / 2 + 0.01, y: mid },
+            ], transform)
+            return { partKey: `highlight:${i}`, strokes: [{
+                points: polylineToPoints(points, { width: tldrawWidthToRmMarkerWidth(thickness) }),
+                color: 'yellow', pen: Pen.HIGHLIGHTER_2,
+            }] }
+        })
+        for (const { text, sourceIndex, x, baseline } of measured.markers) {
+            const strokes = textToGlyphParts(font, { text, fontSize }, transform, color, {
+                spans: [{ text, x, y: 0, w: 0, h: 0, baseline }],
+            }).flatMap((part) => part.strokes)
+            if (strokes.length) extra.push({ partKey: `marker:${sourceIndex}`, strokes })
+        }
+        return extra
     }
 
     /** The browser's own text layout via tldraw's TextManager: the exact
@@ -2954,9 +2996,52 @@ export class StudioController {
      *  wrapped to the shape width and centered in its bounds like tldraw draws
      *  it. Local glyph coords are composed with the shape page transform so a
      *  grouped/rotated shape's label follows. */
-    private projectLabel(shape: TLShape, label: string): { partKey: string; strokes: InkStroke[] }[] {
+    private projectLabel(shape: TLShape, label: string): GlyphPart[] | null {
         const font = this.fonts.get(projectionFamily(shape))
         if (!font) return []
+        const rich = shapeRichText(shape)
+        if (rich && richProjection(rich, projectionFamily(shape)).styled &&
+            (shape.type === 'geo' || shape.type === 'arrow' || shape.type === 'note')) {
+            const util = this.editor.getShapeUtil(shape)
+            const geometry = util.getGeometry(shape)
+            const labelBox = ('children' in geometry
+                ? (geometry.children as { isLabel: boolean; bounds: typeof geometry.bounds }[]).find((child) => child.isLabel)
+                : undefined)?.bounds
+            if (!labelBox) return []
+            // Editor.getShapeUtil exposes base ShapeUtil options; the three
+            // built-in labelled utilities all implement these display methods.
+            const options = util.options as Parameters<typeof getDisplayValues>[0]['options']
+            const display = getDisplayValues({ editor: this.editor, options }, shape) as {
+                labelFontSize: number; labelLineHeight: number; labelPadding: number;
+                labelHorizontalAlign?: string;
+            }
+            const scale = (shape.props as { scale?: number }).scale ?? 1
+            const { labelFontSize, labelLineHeight, labelPadding } = display
+            const note = shape.type === 'note' && 'getLabelSize' in util
+                ? (util.getLabelSize as (shape: TLShape) => { fontSizeAdjustment?: number })(shape)
+                : undefined
+            const baseSize = labelFontSize * (note?.fontSizeAdjustment ?? 1)
+            const pad = labelPadding * scale
+            const measured = measureRichProjection(this.editor, this.fonts, rich, {
+                family: projectionFamily(shape), fontSize: baseSize, scale,
+                width: Math.max(1, (labelBox.w - 2 * pad) / scale),
+                align: shape.type === 'arrow' ? 'center' : display.labelHorizontalAlign ?? 'center',
+                lineHeight: labelLineHeight,
+            })
+            if (!measured) return null
+            const x = labelBox.x + pad
+            const y = labelBox.y + (labelBox.h - measured.height) / 2
+            const t = this.editor.getShapePageTransform(shape)
+            const transform: ShapeTransform = {
+                x: shape.x, y: shape.y, rotation: shape.rotation,
+                m: [t.a, t.b, t.c, t.d, t.a * x + t.c * y + t.e, t.b * x + t.d * y + t.f],
+            }
+            const fontSize = baseSize * scale
+            const color = colorOf(shape)
+            const parts = textToGlyphParts(font, { text: label, fontSize }, transform, color, { spans: measured.spans })
+            return [...this.projectTextExtras(measured, font, fontSize, transform, color), ...parts]
+                .map(({ partKey, strokes }) => ({ partKey: `label:${partKey}`, strokes }))
+        }
         const props = shape.props as {
             size?: string
             scale?: number
@@ -2987,18 +3072,11 @@ export class StudioController {
             props.align === 'end' || props.align === 'start' || props.align === 'middle'
                 ? props.align
                 : 'middle'
-        const spans = this.measureSpans(label, {
-            fontSize: LABEL_SIZES[size],
-            scale,
-            width: wrapW,
-            textAlign: align,
-            font: (shape.props as { font?: string }).font,
-        })
+        const measure = { fontSize: LABEL_SIZES[size], scale, width: wrapW, textAlign: align, font: projectionFamily(shape) }
+        const spans = this.measureSpans(label, measure)
         const blockH = spans?.length
             ? Math.max(...spans.map((s) => s.y + s.h)) - Math.min(...spans.map((s) => s.y))
-            : wrappedLineCount(font, { text: label, fontSize }, innerW) *
-              fontSize *
-              lineHeight
+            : wrappedLineCount(font, { text: label, fontSize }, innerW) * fontSize * lineHeight
         // top-left of the text block in shape-LOCAL px: horizontally inset by
         // the pad; vertical follows verticalAlign (default middle, as tldraw).
         const originX = bounds.x + pad
@@ -3384,11 +3462,17 @@ export class StudioController {
         // Re-project the repaired text so the overlay/projection converge.
         const updated = this.editor.getShape(shapeId as TLShapeId)
         if (updated) {
-            if (!this.fonts.has(projectionFamily(updated))) {
-                if (!(await this.ensureFont(updated)) || this.disposed || this.editor.getShape(updated.id) !== updated) return
+            if (!this.projectionReady(updated)) {
+                if (!(await this.ensureShapeFonts(updated)) || this.disposed || this.editor.getShape(updated.id) !== updated) return
             }
             const op = this.projectShape(updated, undefined, undefined, editVersion)
-            if (op) await this.session.apply([op])
+            if (op === RETRY_TEXT_PROJECTION) {
+                this.pendingShapeIds.add(updated.id)
+                if (!this.pendingShapeVersions.has(updated.id)) {
+                    this.pendingShapeVersions.set(updated.id, { stamp: editVersion })
+                }
+                this.schedule()
+            } else if (op) await this.session.apply([op])
         }
     }
 }
@@ -3550,17 +3634,6 @@ function collectSubpaths(
     return out
 }
 
-// Normal faces of the WOFF2s used by editor-assets. The tablet projection
-// parser reads WOFF, but not WOFF2. Keep the formats separate from family
-// selection so a failed face never silently writes another family's outlines.
-const projectionFontUrls = {
-    sans: '/fonts/projection/WeftOverlaySans.woff',
-    serif: '/fonts/projection/WeftOverlaySerif.woff',
-    mono: '/fonts/projection/WeftOverlayMono.woff',
-} as const
-
-type ProjectionFamily = 'draw' | keyof typeof projectionFontUrls
-
 function projectionFamily(shape?: TLShape): ProjectionFamily {
     const family = (shape?.props as { font?: string } | undefined)?.font
     return family === 'sans' || family === 'serif' || family === 'mono' ? family : 'draw'
@@ -3571,6 +3644,23 @@ function needsProjectionFont(shape?: TLShape): boolean {
     if (shape.type === 'text') return true
     return (shape.type === 'geo' || shape.type === 'arrow' || shape.type === 'line' || shape.type === 'note') &&
         !!extractPlainText(shape.props as { richText?: unknown; text?: string }).trim()
+}
+
+function shapeRichText(shape: TLShape): TLRichText | undefined {
+    const value = (shape.props as { richText?: unknown }).richText
+    try {
+        const rich = typeof value === 'string' ? JSON.parse(value) : value
+        return rich?.type === 'doc' && Array.isArray(rich.content) ? rich as TLRichText : undefined
+    } catch {
+        return undefined
+    }
+}
+
+function projectionKeys(shape: TLShape): Iterable<ProjectionFontKey> {
+    if (!needsProjectionFont(shape)) return []
+    const family = projectionFamily(shape)
+    const rich = shapeRichText(shape)
+    return rich ? richProjection(rich, family).fonts : [family]
 }
 
 function extractPlainText(props: { richText?: unknown; text?: string }): string {

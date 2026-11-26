@@ -209,6 +209,9 @@ export interface MeasuredSpan {
     h: number
     /** Outline face selected by the browser for this styled run. */
     font?: Font
+    fontSize?: number
+    sourceIndex?: number
+    color?: string
     /** Measured baseline y in the same scaled shape-local coordinates as y. */
     baseline?: number
     /** Inline marks painted in the text color, attached to their source glyphs. */
@@ -313,8 +316,6 @@ export function textToGlyphParts(
     const desc = (Math.abs(font.descender) / font.unitsPerEm) * fontSize
     const lineBox = fontSize * lineHeight
     const baselineOf = (line: number) => line * lineBox + (lineBox - (asc + desc)) / 2 + asc
-    const strokeWidth = Math.max(0.3, fontSize * 0.04)
-    const rmWidth = tldrawWidthToRmMarkerWidth(strokeWidth)
     const advanceOf = (ch: string) => glyphAdvance(font, fontSize, ch)
     const wrapW = box.width && box.width > 0 ? box.width : Infinity
     const align = box.align ?? 'start'
@@ -323,23 +324,26 @@ export function textToGlyphParts(
     const emitGlyph = (
         ch: string, x: number, baseline: number, srcIdx: number,
         face = font, decorationEnd?: number, lines?: ReturnType<typeof decorationLines>,
+        size = fontSize, color = rmColor,
     ): void => {
         const strokes: InkStroke[] = []
         try {
             const glyph = face.charToGlyph(ch)
-            const path = glyph.getPath(x, baseline, fontSize)
+            const path = glyph.getPath(x, baseline, size)
+            const strokeWidth = Math.max(0.3, size * 0.04)
+            const rmWidth = tldrawWidthToRmMarkerWidth(strokeWidth)
             const contours = extractContours(path).filter((c) => c.length >= 4)
             for (const contour of contours) {
                 strokes.push({
                     points: polylineToPoints(mapToRmSpace(contour, shape), { width: rmWidth }),
-                    color: rmColor,
+                    color,
                 })
             }
             // fill the interior: outline alone is hollow on the device.
             for (const fill of fillContours(contours, strokeWidth * 0.8)) {
                 strokes.push({
                     points: polylineToPoints(mapToRmSpace(fill, shape), { width: rmWidth }),
-                    color: rmColor,
+                    color,
                 })
             }
         } catch {
@@ -350,7 +354,7 @@ export function textToGlyphParts(
                 const y = baseline + offset
                 strokes.push({
                     points: polylineToPoints(mapToRmSpace([{ x, y }, { x: decorationEnd, y }], shape), { width }),
-                    color: rmColor,
+                    color,
                 })
             }
         }
@@ -380,8 +384,9 @@ export function textToGlyphParts(
             // changing its contentHash and re-minting the entire word (N chars
             // -> ~N^2/2 strokes). Prefix offsets are overhead-free and stable.
             const face = span.font ?? font
-            const lines = span.decorations ? decorationLines(face, fontSize, span.decorations) : undefined
-            const advances = chars.map(face === font ? advanceOf : (ch) => glyphAdvance(face, fontSize, ch))
+            const size = span.fontSize ?? fontSize
+            const lines = span.decorations ? decorationLines(face, size, span.decorations) : undefined
+            const advances = chars.map(face === font && size === fontSize ? advanceOf : (ch) => glyphAdvance(face, size, ch))
             const total = advances.reduce((a, b) => a + b, 0)
             const fit = total > 0 && span.w > 0 && Number.isFinite(span.w) ? span.w / total : 1
             const offsets = span.offsets
@@ -395,6 +400,7 @@ export function textToGlyphParts(
                 span.y + (span.h - (runAsc + runDesc)) / 2 + runAsc
             const right = span.x + span.w
             let ci = 0
+            if (span.sourceIndex !== undefined) src = span.sourceIndex
             for (const ch of span.text) {
                 let srcIdx: number | null = null
                 if (source[src] === ch) {
@@ -422,7 +428,7 @@ export function textToGlyphParts(
                     if (bound > x && bound > span.x && x < right) end = Math.min(bound, right)
                 }
                 if (!isWhitespace || end !== undefined) {
-                    emitGlyph(ch, x, baseline, srcIdx ?? src, face, end, lines)
+                    emitGlyph(ch, x, baseline, srcIdx ?? src, face, end, lines, size, span.color)
                 }
             }
         }
