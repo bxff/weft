@@ -1,61 +1,42 @@
-{
-    "wide": [
-        {
-            "src": "/hero/weft-wide-960.d6f064ea547c.webp",
-            "width": 960,
-            "height": 423
-        },
-        {
-            "src": "/hero/weft-wide-1440.5d09d5a50cd7.webp",
-            "width": 1440,
-            "height": 634
-        },
-        {
-            "src": "/hero/weft-wide-1920.4d182082a918.webp",
-            "width": 1920,
-            "height": 845
-        },
-        {
-            "src": "/hero/weft-wide-2880.1d572603a6ee.webp",
-            "width": 2880,
-            "height": 1268
-        },
-        {
-            "src": "/hero/weft-wide-3600.03e010dbc6f9.webp",
-            "width": 3600,
-            "height": 1585
-        },
-        {
-            "src": "/hero/weft-wide-4320.d52733300b36.webp",
-            "width": 4320,
-            "height": 1902
-        }
-    ],
-    "narrow": [
-        {
-            "src": "/hero/weft-narrow-480.d16598c98a1f.webp",
-            "width": 480,
-            "height": 697
-        },
-        {
-            "src": "/hero/weft-narrow-720.aec533bb76b6.webp",
-            "width": 720,
-            "height": 1046
-        },
-        {
-            "src": "/hero/weft-narrow-1080.47e02f451e58.webp",
-            "width": 1080,
-            "height": 1569
-        },
-        {
-            "src": "/hero/weft-narrow-1440.0daec879c1ea.webp",
-            "width": 1440,
-            "height": 2091
-        },
-        {
-            "src": "/hero/weft-narrow-1920.307107addd6a.webp",
-            "width": 1920,
-            "height": 2789
-        }
-    ]
-}
+[
+    {
+        "src": "/hero/weft-wide-480.ce23f006917b.webp",
+        "width": 480,
+        "height": 211
+    },
+    {
+        "src": "/hero/weft-wide-720.8dac820c8b12.webp",
+        "width": 720,
+        "height": 317
+    },
+    {
+        "src": "/hero/weft-wide-960.d6f064ea547c.webp",
+        "width": 960,
+        "height": 423
+    },
+    {
+        "src": "/hero/weft-wide-1440.5d09d5a50cd7.webp",
+        "width": 1440,
+        "height": 634
+    },
+    {
+        "src": "/hero/weft-wide-1920.4d182082a918.webp",
+        "width": 1920,
+        "height": 845
+    },
+    {
+        "src": "/hero/weft-wide-2880.1d572603a6ee.webp",
+        "width": 2880,
+        "height": 1268
+    },
+    {
+        "src": "/hero/weft-wide-3600.03e010dbc6f9.webp",
+        "width": 3600,
+        "height": 1585
+    },
+    {
+        "src": "/hero/weft-wide-4320.d52733300b36.webp",
+        "width": 4320,
+        "height": 1902
+    }
+]
