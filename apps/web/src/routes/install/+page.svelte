@@ -181,6 +181,12 @@
             <a href="/settings" class="wf-link">Settings → Server</a>.
         </p>
 
+        <p class="my-4">
+            If you connect to hosted Weft, the tablet sends synced notebooks and related files
+            to the weft.page relay. Hosted sync is not end-to-end encrypted.
+            Read the <a href="/privacy" class="wf-link">Privacy Notice</a> before connecting.
+        </p>
+
         <!-- The command is always visible; signing in just fills the <TOKEN>. -->
         <div class="my-4 flex items-center gap-3">
             <code class="installer-cmd wf-code flex-1"><span class="line">{command}</span></code>
