@@ -45,9 +45,19 @@ const fonts = names.map((slot) => {
 })
 
 const root = overrideRoot ? resolve(overrideRoot) : dirname(dirname(fileURLToPath(import.meta.url)))
-const fontsDir = join(root, 'apps/web/static/fonts/native-profile')
+const fontsDir = join(root, 'apps/web/static/fonts/native-profile', expected)
 mkdirSync(fontsDir, { recursive: true })
 for (const [slot, data] of fonts) writeFileSync(join(fontsDir, slot + '.ttf'), data)
+const faces = [
+    ['Sans','regular','normal',400], ['Sans','medium','normal',500],
+    ['Sans','bold','normal',700], ['Sans','italic','italic',400],
+    ['Sans','bold-italic','italic',700], ['Serif','serif','normal',400],
+    ['Serif','serif-bold','normal',700],
+]
+writeFileSync(join(root, 'apps/web/src/native-font-profile.generated.css'), faces.map(
+    ([family,slot,style,weight]) =>
+        `@font-face { font-family: 'RM Profile ${family}'; font-style: ${style}; font-weight: ${weight}; font-display: block; src: url('/fonts/native-profile/${expected}/${slot}.ttf') format('truetype'); }`,
+).join('\n') + '\n')
 // Write the enabling manifest last. The default checked-in value is null.
 const { advances, staticAdvances, kerning } = profile
 writeFileSync(join(root, 'apps/web/src/lib/tldraw/native-font-profile.generated.json'),

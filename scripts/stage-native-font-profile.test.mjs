@@ -29,6 +29,9 @@ test('only stages complete, hash-pinned font data', () => {
         expect(readFileSync(manifest,'utf8')).toBe('null\n')
         expect(stage(encode(data)).exitCode).toBe(0)
         expect(JSON.parse(readFileSync(manifest,'utf8')).kerning.sansRegular.WA).toBe(-50)
-        expect(readFileSync(join(dir,'apps/web/static/fonts/native-profile/regular.ttf'))).toEqual(font)
+        const sha = createHash('sha256').update(encode(data)).digest('hex')
+        expect(readFileSync(join(dir,'apps/web/static/fonts/native-profile',sha,'regular.ttf'))).toEqual(font)
+        expect(readFileSync(join(dir,'apps/web/src/native-font-profile.generated.css'),'utf8'))
+            .toContain(`/fonts/native-profile/${sha}/regular.ttf`)
     } finally { rmSync(dir,{recursive:true,force:true}) }
 })
