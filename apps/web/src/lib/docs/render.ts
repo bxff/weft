@@ -99,7 +99,10 @@ export interface RenderedDoc {
 
 export async function renderDoc(slug: string): Promise<RenderedDoc | null> {
     const src = bySlug[slug]
-    if (!src) return null
+    return src ? renderMarkdownDoc(slug, src) : null
+}
+
+export async function renderMarkdownDoc(slug: string, src: string): Promise<RenderedDoc> {
     const { data, content } = matter(src)
     const hl = await highlighter()
     const toc: RenderedDoc['toc'] = []
