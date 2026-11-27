@@ -1338,7 +1338,6 @@ dependencies = [
  "hex",
  "notify",
  "reqwest",
- "ring",
  "serde",
  "serde_json",
  "sha2",

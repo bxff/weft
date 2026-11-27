@@ -13,12 +13,11 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
-import { downloadVerifiedDaemon } from './tablet-release.ts'
 
 const command = process.argv[2]
 const flags = (() => {
@@ -35,7 +34,6 @@ const flags = (() => {
                 'two-way': { type: 'boolean' },
                 'no-auto-reinstall': { type: 'boolean' },
                 'experimental-rm2': { type: 'boolean' },
-                'from-source': { type: 'boolean' },
             },
         }).values
     } catch {
@@ -51,21 +49,44 @@ const DRY = flags['dry-run']
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '../../..')
 const DAEMON_BIN = join(REPO_ROOT, 'device/target/aarch64-unknown-linux-musl/release/rmsyncd')
 
-/** Local source builds are explicit; published installs never fall back to the relay. */
-async function daemonBinary(arch: 'aarch64' | 'armv7'): Promise<{ path: string; sha?: string }> {
+/** Daemon binary for `arch`: a local source-tree build if present, otherwise
+ *  downloaded from the cloud's release endpoint (the file tablets self-update
+ *  from). */
+async function daemonBinary(arch: 'aarch64' | 'armv7'): Promise<string> {
     const target = arch === 'armv7' ? 'armv7-unknown-linux-musleabihf' : 'aarch64-unknown-linux-musl'
-    if (flags['from-source']) {
-        const path = join(REPO_ROOT, `device/target/${target}/release/rmsyncd`)
-        if (!existsSync(path)) throw Error(`Missing local daemon: cd device && cargo zigbuild --release --target ${target}`)
-        return { path }
+    const local = join(REPO_ROOT, `device/target/${target}/release/rmsyncd`)
+    if (existsSync(local)) return local
+    if (!CLOUD || !TOKEN) {
+        console.error(
+            'no daemon binary: not in a source tree and no --cloud/--token to download from.\n' +
+                'Use the setup page (it fills both in), or build from source:\n' +
+                `  cd device && cargo zigbuild --release --target ${target}`,
+        )
+        process.exit(1)
     }
-    console.log(`  downloading signed daemon (${arch}) from GitHub Releases`)
-    const { bytes, sha } = await downloadVerifiedDaemon(arch)
-    const dir = mkdtempSync(join(tmpdir(), 'weft-daemon-'))
-    process.once('exit', () => rmSync(dir, { recursive: true, force: true }))
-    const path = join(dir, 'rmsyncd')
-    writeFileSync(path, bytes, { mode: 0o600 })
-    return { path, sha }
+    process.stdout.write(`  downloading daemon (${arch}) from ${CLOUD} ... `)
+    const r = await fetch(`${CLOUD}/api/daemon/release?arch=${arch}`, {
+        headers: { 'x-device-token': TOKEN },
+    }).catch((e: unknown) => {
+        console.error(`\ncouldn't reach ${CLOUD}: ${e instanceof Error ? e.message : e}`)
+        return process.exit(1)
+    })
+    if (!r.ok) {
+        console.error(
+            `\ndaemon download failed (${r.status})${r.status === 401 ? ' — bad or expired token' : ''}` +
+                `${r.status === 404 && arch === 'armv7' ? ' — the server has no armv7 release yet' : ''}`,
+        )
+        process.exit(1)
+    }
+    const bytes = new Uint8Array(await r.arrayBuffer())
+    if (bytes.length < 1024 * 1024 || bytes[0] !== 0x7f || bytes[1] !== 0x45) {
+        console.error('\ndownloaded file does not look like the daemon binary')
+        process.exit(1)
+    }
+    const path = join(tmpdir(), `weft-rmsyncd-${process.pid}`)
+    writeFileSync(path, bytes)
+    console.log(`ok (${(bytes.length / 1024 / 1024).toFixed(1)} MB)`)
+    return path
 }
 
 const INSTALL_DIR = '/home/root/weft'
@@ -232,8 +253,8 @@ RestartSec=3
 WantedBy=multi-user.target
 `
 
-/** Activate in one remote operation, restoring the previous installation on failure. */
-function activateSetup(configured: boolean): void {
+/** Install manually in one remote operation so a failed takeover restores stock sync. */
+function activateManualSetup(configured: boolean): void {
     const activate = `set -e
 stock_mask=$(systemctl is-enabled rm-sync.service 2>/dev/null) || :
 stock_active=$(systemctl is-active rm-sync.service 2>/dev/null) || :
@@ -252,12 +273,7 @@ esac
 
 mount -o remount,rw / 2>/dev/null || true
 backup=$(mktemp -d "${INSTALL_DIR}/setup-rollback.XXXXXX")
-paths="${INSTALL_DIR}/rmsyncd${AUTO_REINSTALL ? `
-${INSTALL_DIR}/boot-guard.sh
-${INSTALL_DIR}/firmware-mismatch
-${INSTALL_DIR}/install-service.sh
-/usr/bin/rm-sync.original` : ''}
-${configured ? `
+paths="${INSTALL_DIR}/rmsyncd${configured ? `
 ${INSTALL_DIR}/cloud.json` : ''}
 /usr/lib/systemd/system/weft.service
 /usr/lib/systemd/system/multi-user.target.wants/weft.service
@@ -318,17 +334,15 @@ if [ "$stock_active" = active ]; then
 fi
 
 files_changed=1
-chmod +x ${INSTALL_DIR}/rmsyncd.new
-mv -f ${INSTALL_DIR}/rmsyncd.new ${INSTALL_DIR}/rmsyncd
-${AUTO_REINSTALL ? `chmod +x ${INSTALL_DIR}/boot-guard.sh.new
-mv -f ${INSTALL_DIR}/boot-guard.sh.new ${INSTALL_DIR}/boot-guard.sh
-` : ''}
+rm -f ${INSTALL_DIR}/rmsyncd
+mv ${INSTALL_DIR}/rmsyncd.new ${INSTALL_DIR}/rmsyncd
+chmod +x ${INSTALL_DIR}/rmsyncd
 ${configured ? `rm -f ${INSTALL_DIR}/cloud.json
 mv ${INSTALL_DIR}/cloud.json.new ${INSTALL_DIR}/cloud.json
 ` : ''}mkdir -p /usr/lib/systemd/system/multi-user.target.wants /usr/lib/systemd/system/xochitl.service.d
 rm -f /usr/lib/systemd/system/weft.service /usr/lib/systemd/system/xochitl.service.d/weft.conf
 cat > /usr/lib/systemd/system/weft.service <<'WEFT_UNIT'
-${unit(AUTO_REINSTALL)}WEFT_UNIT
+${unit(false)}WEFT_UNIT
 cat > /usr/lib/systemd/system/xochitl.service.d/weft.conf <<'WEFT_DROP_IN'
 [Service]
 Environment=XOCHITL_STORE_TIMEOUT=${STORE_TIMEOUT}
@@ -346,7 +360,7 @@ systemctl is-active --quiet weft.service
 wget -q -O- http://127.0.0.1:9000/api/health
 systemctl restart xochitl
 `
-    step('activate setup', run([...sshBase(), 'sh -s'], activate))
+    step('activate manual setup', run([...sshBase(), 'sh -s'], activate))
 }
 
 // ----- commands -----
@@ -380,35 +394,63 @@ async function setup(): Promise<void> {
         process.exit(1)
     }
     step('check firmware compatibility', ssh(firmwarePreflight))
-    const daemonBin = DRY ? { path: DAEMON_BIN } : await daemonBinary(isArm32 ? 'armv7' : 'aarch64').catch(error => {
-        console.error(`Daemon download failed: ${error instanceof Error ? error.message : error}. The tablet was not changed.`)
-        return process.exit(1)
-    })
+    const daemonBin = DRY ? DAEMON_BIN : await daemonBinary(isArm32 ? 'armv7' : 'aarch64')
     step('create install dir', ssh(`mkdir -p ${INSTALL_DIR}`))
-    step('deploy daemon', scp(daemonBin.path, `${INSTALL_DIR}/rmsyncd.new`))
-    if (daemonBin.sha) {
-        step('verify staged daemon on tablet', ssh(
-            `printf '%s  %s\\n' '${daemonBin.sha}' '${INSTALL_DIR}/rmsyncd.new' | sha256sum -c -`,
-        ))
-    }
+    step('deploy daemon', scp(daemonBin, `${INSTALL_DIR}/rmsyncd.new`))
     // file contents travel via stdin, never heredocs inside joined commands
     console.log(
         `  config: store-timeout=${STORE_TIMEOUT}ms, auto-reinstall=${AUTO_REINSTALL ? 'on' : 'off'}, ` +
             `cloud=${CLOUD ? CLOUD : 'unchanged (keeping existing config if present)'}`,
     )
     if (AUTO_REINSTALL) {
-        step('stage boot guard', run(
-            [...sshBase(), `cat > ${INSTALL_DIR}/boot-guard.sh.new`],
-            bootGuard(STORE_TIMEOUT),
-        ))
+        step(
+            'install boot guard',
+            run(
+                [...sshBase(), `cat > ${INSTALL_DIR}/boot-guard.sh && chmod +x ${INSTALL_DIR}/boot-guard.sh`],
+                bootGuard(STORE_TIMEOUT),
+            ),
+        )
+
+        step(
+            'install unit',
+            // /usr/lib is persistent rootfs; /etc is a tmpfs overlay wiped on reboot
+            run(
+                [...sshBase(), 'mount -o remount,rw / 2>/dev/null; cat > /usr/lib/systemd/system/weft.service'],
+                unit(AUTO_REINSTALL),
+            ),
+        )
+        if (CLOUD && TOKEN) {
+            step(
+                'connect to weft account',
+                run([...sshBase(), `cat > ${INSTALL_DIR}/cloud.json`], JSON.stringify({ url: CLOUD, token: TOKEN })),
+            )
+        }
+        step(
+            'activate',
+            ssh(
+                [
+                    `mv ${INSTALL_DIR}/rmsyncd.new ${INSTALL_DIR}/rmsyncd && chmod +x ${INSTALL_DIR}/rmsyncd`,
+                    // enable via /usr/lib wants-symlink (survives reboot; /etc doesn't)
+                    'mkdir -p /usr/lib/systemd/system/multi-user.target.wants',
+                    'ln -sf ../weft.service /usr/lib/systemd/system/multi-user.target.wants/weft.service',
+                    'rm -f /etc/systemd/system/weft.service /etc/systemd/system/multi-user.target.wants/weft.service 2>/dev/null || true',
+                    'systemctl daemon-reload',
+                    'systemctl restart weft.service',
+                    'sleep 2',
+                    'systemctl restart xochitl',
+                ].join(' && '),
+            ),
+        )
+        step('daemon healthy', ssh('sleep 3; wget -q -O- http://127.0.0.1:9000/api/health'))
+    } else {
+        if (CLOUD && TOKEN) {
+            step(
+                'stage cloud config',
+                run([...sshBase(), `umask 077; cat > ${INSTALL_DIR}/cloud.json.new`], JSON.stringify({ url: CLOUD, token: TOKEN })),
+            )
+        }
+        activateManualSetup(Boolean(CLOUD && TOKEN))
     }
-    if (CLOUD && TOKEN) {
-        step('stage cloud config', run(
-            [...sshBase(), `umask 077; cat > ${INSTALL_DIR}/cloud.json.new`],
-            JSON.stringify({ url: CLOUD, token: TOKEN }),
-        ))
-    }
-    activateSetup(Boolean(CLOUD && TOKEN))
     step('unit parses cleanly', ssh('journalctl -u weft --no-pager | grep -c "Missing" | grep -q "^0$" || systemd-analyze verify /usr/lib/systemd/system/weft.service 2>&1 | head -n 2; echo ok'))
     // no --cloud: keep the existing cloud.json, so re-running setup is a safe redeploy
     const keptUrl = CLOUD
@@ -515,6 +557,6 @@ switch (command) {
         link()
         break
     default:
-        console.log('usage: weft <setup [--store-timeout ms] [--no-auto-reinstall] [--experimental-rm2] [--from-source] [--cloud URL --token chd_...]|doctor|uninstall|link> --host root@10.11.99.1 [--password X] [--dry-run]')
+        console.log('usage: weft <setup [--store-timeout ms] [--no-auto-reinstall] [--experimental-rm2] [--cloud URL --token chd_...]|doctor|uninstall|link> --host root@10.11.99.1 [--password X] [--dry-run]')
         process.exit(command ? 1 : 0)
 }

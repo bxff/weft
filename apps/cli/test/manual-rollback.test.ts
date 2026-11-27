@@ -3,10 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlin
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-test.each([
-    ...['success', 'mask', 'stop', 'restart', 'health', 'upgrade'].map(f => [f, false] as const),
-    ['success', true], ['health', true], ['upgrade', true],
-] as const)('setup preserves the prior state (%s, boot guard=%s)', (failure, auto) => {
+test.each(['success', 'mask', 'stop', 'restart', 'health', 'upgrade'])('manual setup restores stock state when activation fails (%s)', failure => {
     const dir = mkdtempSync(join(tmpdir(), 'weft-manual-rollback-'))
     const path = (name: string) => join(dir, name)
     try {
@@ -17,11 +14,9 @@ test.each([
         ]) mkdirSync(path(name), { recursive: true })
         const cli = path('apps/cli/src/cli.ts')
         copyFileSync(join(import.meta.dir, '../src/cli.ts'), cli)
-        copyFileSync(join(import.meta.dir, '../src/tablet-release.ts'), path('apps/cli/src/tablet-release.ts'))
         writeFileSync(path('device/target/aarch64-unknown-linux-musl/release/rmsyncd'), '')
         writeFileSync(path('usr/bin/rm-sync'), 'signal name="documentFinished"\n type="(ay)"\n type="a(ay)"\n type="a(ay)"')
         writeFileSync(path('home/root/weft/cloud.json'), 'original config')
-        writeFileSync(path('home/root/weft/boot-guard.sh'), 'original guard')
         writeFileSync(path('home/root/weft/rmsyncd'), 'original daemon')
         writeFileSync(path('usr/lib/systemd/system/weft.service'), 'original unit')
         writeFileSync(path('usr/lib/systemd/system/xochitl.service.d/weft.conf'), 'original drop-in')
@@ -77,7 +72,7 @@ case "$*" in
 esac
 `)
         const run = Bun.spawnSync([
-            process.execPath, cli, 'setup', '--from-source', ...(auto ? [] : ['--no-auto-reinstall']), '--cloud', 'https://relay.example', '--token', 'sample',
+            process.execPath, cli, 'setup', '--no-auto-reinstall', '--cloud', 'https://relay.example', '--token', 'sample',
         ], {
             env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, TABLET: dir, FAILURE: failure, RM_SSH_PASS: '' },
         })
@@ -87,12 +82,10 @@ esac
             expect(existsSync(path('stock-mask'))).toBe(true)
             expect(existsSync(path('stock-active'))).toBe(false)
             expect(calls).toContain('restart xochitl')
-            expect(readFileSync(path('home/root/weft/boot-guard.sh'), 'utf8').includes('weft-guard')).toBe(auto)
             expect(readFileSync(path('home/root/weft/rmsyncd'), 'utf8')).toBe('new daemon')
             expect(JSON.parse(readFileSync(path('home/root/weft/cloud.json'), 'utf8')).token).toBe('sample')
         } else {
             expect(run.exitCode).toBe(1)
-            expect(readFileSync(path('home/root/weft/boot-guard.sh'), 'utf8')).toBe('original guard')
             expect(existsSync(path('stock-mask'))).toBe(upgrade)
             expect(existsSync(path('stock-active'))).toBe(!upgrade)
             if (upgrade) {
