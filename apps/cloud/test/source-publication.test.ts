@@ -89,6 +89,12 @@ test.each(["ENOSPC", "EDQUOT", "insert", "evict"] as const)(
     const response = await get(server(), "hot");
     expect(response.headers.get("etag")).toBe(etag);
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(old);
+    const validated = await get(server(), "hot", { "if-none-match": etag! });
+    expect(validated.status).toBe(304);
+    const range = await get(server(), "hot", { range: "bytes=50-99" });
+    expect(range.status).toBe(206);
+    expect(range.headers.get("etag")).toBe(etag);
+    expect(new Uint8Array(await range.arrayBuffer())).toEqual(old.slice(50, 100));
     expect(new Uint8Array(await (await get(server(), "cold")).arrayBuffer())).toEqual(cold);
 
     expect((await put(server(), "hot", next)).status).toBe(200);
