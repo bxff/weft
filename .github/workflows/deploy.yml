@@ -56,4 +56,10 @@ jobs:
           VPS_PORT: ${{ vars.VPS_PORT }}
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
           VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
-        run: bash scripts/deploy-vps-ci.sh
+          VPS_DEPLOY_ENABLED: ${{ vars.VPS_DEPLOY_ENABLED }}
+        run: |
+          if [[ "$VPS_DEPLOY_ENABLED" != true ]]; then
+            echo "VPS deployment is disabled. Verify the dedicated production environment before enabling."
+            exit 1
+          fi
+          bash scripts/deploy-vps-ci.sh
