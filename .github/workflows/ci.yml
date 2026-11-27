@@ -25,6 +25,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.3"
+      - name: Smoke test the packed npm installer
+        run: npm run test:package --workspace @bxff/weft
       - run: bun install --frozen-lockfile
       - name: Reject deployment-local font data in Git
         run: |
@@ -95,3 +100,13 @@ jobs:
           PUBLIC_DOCS_URL: ""
           PUBLIC_TLDRAW_LICENSE_KEY: ""
       - run: node node_modules/@playwright/test/cli.js test
+      # Both filename variants have lost their page context in CI. Retain the
+      # failing synthetic fixture's full trace without rerunning its Undo.
+      - name: Retain photo history navigation diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: photo-history-diagnostics-${{ github.run_attempt }}
+          path: test-results/native-source-geometry-pho-*-ce-UUID-new-filename-*/
+          if-no-files-found: ignore
+          retention-days: 2
