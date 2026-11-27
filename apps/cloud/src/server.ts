@@ -228,6 +228,8 @@ export function startCloud(
   const accountOrigin = process.env.WEFT_ACCOUNT_AUTHORIZED_ORIGIN;
   const providerSecret = process.env.CLERK_SECRET_KEY;
   const providerIssuer = process.env.WEFT_ACCOUNT_PROVIDER_ISSUER;
+  // Rotating this credential deliberately pauses old pending jobs. Drain
+  // them or verify and explicitly migrate them before a provider/key change.
   const providerTag = providerIssuer && providerSecret
     ? new Bun.CryptoHasher("sha256").update(JSON.stringify(["weft-clerk-instance-v1", providerIssuer, providerSecret])).digest("hex")
     : null;
@@ -827,7 +829,7 @@ export function startCloud(
         });
       }
 
-      let auth = await authenticate(req, store, opts.testClerk?.jwtKey);
+      let auth = await authenticate(req, store, providerSecret, opts.testClerk?.jwtKey);
       // #70: a browser WS connects with a single-use ?ticket= instead of the
       // session JWT in the URL. Resolve it here (authenticate() only knows
       // headers/JWTs). Consume the nonce unconditionally — even an expired one

@@ -105,7 +105,9 @@ export async function deleteHostedClerkUser(userId: string, secretKey: string): 
     if (!response.ok && response.status !== 404) throw new Error('Account provider deletion failed')
 }
 
-export async function authenticate(req: Request, store: CloudStore, testClerkJwtKey?: string): Promise<AuthContext | null> {
+export async function authenticate(
+    req: Request, store: CloudStore, secretKey: string | undefined, testClerkJwtKey?: string,
+): Promise<AuthContext | null> {
     const deviceToken = req.headers.get('x-device-token')
     if (deviceToken) {
         const userId = store.userForDeviceToken(deviceToken)
@@ -133,7 +135,7 @@ export async function authenticate(req: Request, store: CloudStore, testClerkJwt
     // CLOUD_DEV_USER can't become an impersonation bypass (Bearer dev:<anyone>).
     if (
         process.env.CLOUD_DEV_USER &&
-        !process.env.CLERK_SECRET_KEY &&
+        !secretKey &&
         !process.env.WEFT_PASSWORD &&
         token.startsWith('dev:')
     ) {
@@ -147,7 +149,6 @@ export async function authenticate(req: Request, store: CloudStore, testClerkJwt
         return sub ? { userId: sub, via: 'selfhost' } : null
     }
 
-    const secretKey = process.env.CLERK_SECRET_KEY
     if (!secretKey) return null
     try {
         const payload = await verifyToken(token, { secretKey, jwtKey: testClerkJwtKey })

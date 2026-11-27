@@ -226,6 +226,17 @@ test("worker finishes explicit fenced deletion after a lost provider response wi
       process.env.WEFT_ACCOUNT_PROVIDER_ISSUER = issuer;
     }
 
+    process.env.CLERK_SECRET_KEY = "sk_test_changed_fixture";
+    const changedKey = start(jwtKey, 10);
+    try {
+      await Bun.sleep(35);
+      expect(calls).toEqual([owner]);
+      expect(changedKey.store.manualDeletionComplete(owner, providerTag)).toBe(false);
+    } finally {
+      changedKey.stop();
+      process.env.CLERK_SECRET_KEY = fixtureSecret;
+    }
+
     // Run a new relay process with a different public signer key. This
     // avoids Clerk SDK module-level JWKS caches in the old process.
     const rotated = generateKeyPairSync("rsa", { modulusLength: 2048 }).publicKey
