@@ -31,7 +31,7 @@
 >
     <SiteHeader />
 
-    <!-- Full-width artwork; prose uses the same reading measure as docs. -->
+    <!-- Main: single dense column, terminal-doc style -->
     <main>
         <div>
             <p class="my-4 first:mt-0 last:mb-0" style="color: var(--gray-e)">
@@ -118,10 +118,3 @@
 
     <SiteFooter />
 </div>
-
-<style>
-    main p {
-        max-width: var(--wf-reading-width);
-        margin-inline: auto;
-    }
-</style>
