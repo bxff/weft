@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import type { Editor } from 'tldraw'
-import content from './fixtures/tldraw-5.6-content.json'
+import content from './fixtures/tldraw-5.6-content.json' with { type: 'json' }
 
 test('imports a 5.6 SDK shape and preserves it on a fresh browser', async ({ page, context, browser, request, baseURL }) => {
     const doc = crypto.randomUUID()

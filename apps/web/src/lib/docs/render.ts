@@ -4,8 +4,7 @@ import { Marked } from 'marked'
 import matter from 'gray-matter'
 import { createHighlighter, type Highlighter } from 'shiki'
 
-// Trimmed to the intro for the private beta; more docs return with public release.
-const ORDER = ['index']
+const ORDER = ['index', 'api']
 const raw = import.meta.glob('./content/*.md', { query: '?raw', import: 'default', eager: true }) as Record<
     string,
     string
@@ -100,7 +99,10 @@ export interface RenderedDoc {
 
 export async function renderDoc(slug: string): Promise<RenderedDoc | null> {
     const src = bySlug[slug]
-    if (!src) return null
+    return src ? renderMarkdownDoc(slug, src) : null
+}
+
+export async function renderMarkdownDoc(slug: string, src: string): Promise<RenderedDoc> {
     const { data, content } = matter(src)
     const hl = await highlighter()
     const toc: RenderedDoc['toc'] = []

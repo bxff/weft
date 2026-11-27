@@ -1,18 +1,22 @@
 <script lang="ts">
     import { onMount } from 'svelte'
-    import { docsUrl, connection } from '$lib/settings'
+    import { docsUrl } from '$lib/settings'
     import { currentUserLabel, clerkEnabled, joinWaitlist } from '$lib/auth'
     import SiteHeader from '$lib/components/SiteHeader.svelte'
     import SiteFooter from '$lib/components/SiteFooter.svelte'
+    import heroManifest from '$lib/home-hero.json'
+
+    const heroImage = heroManifest.at(-1)
+    const heroSrcset = heroManifest.map(({ src, width }) => `${src} ${width}w`).join(', ')
 
     // Auth state for the in-body CTA (the header has its own copy).
     let userLabel = $state<string | null>(null)
     let ready = $state(false)
 
     onMount(() => {
-        if (connection().mode === 'cloud') {
+        if (clerkEnabled()) {
             void currentUserLabel()
-                .then((l) => (userLabel = l))
+                .then((l) => (userLabel = l), () => (userLabel = null))
                 .finally(() => (ready = true))
         } else {
             ready = true
@@ -20,34 +24,6 @@
     })
 
     const showSignIn = $derived(ready && clerkEnabled() && !userLabel)
-
-    // API example, hand-highlighted with the wf-code token classes. Static and
-    // self-authored, so @html is safe.
-    const kw = (s: string) => `<span class="tok-keyword">${s}</span>`
-    const str = (s: string) => `<span class="tok-string">${s}</span>`
-    const fn = (s: string) => `<span class="tok-variableName">${s}</span>`
-    const prop = (s: string) => `<span class="tok-propertyName">${s}</span>`
-    const op = (s: string) => `<span class="tok-operator">${s}</span>`
-    const cmt = (s: string) => `<span class="tok-comment">${s}</span>`
-    const API_EXAMPLE_HTML = [
-        `${kw('const')} base ${op('=')} ${str('"https://api.weft.page"')}`,
-        `${kw('const')} headers ${op('=')} { ${str('"x-api-key"')}: apiKey }`,
-        ``,
-        `${kw('const')} list ${op('=')} ${kw('await')} ${fn('fetch')}(base + ${str('"/api/documents"')}, { headers })`,
-        `${kw('if')} (!list.ok) ${kw('throw new')} Error(${str('"Could not list notebooks"')})`,
-        `${kw('const')} { ${prop('documents')} } ${op('=')} ${kw('await')} list.${fn('json')}()`,
-        `${kw('const')} doc ${op('=')} documents.${fn('find')}(d ${op('=&gt;')} d.type === ${str('"notebook"')} &amp;&amp; d.pages?.length)`,
-        `${kw('if')} (!doc) ${kw('throw new')} Error(${str('"No synced notebook pages yet"')})`,
-        ``,
-        `${kw('const')} page ${op('=')} ${kw('await')} ${fn('fetch')}(`,
-        `  base + ${str('`/api/documents/${doc.id}/pages/${doc.pages[0].id}/rm`')},`,
-        `  { headers },`,
-        `)`,
-        `${kw('if')} (!page.ok) ${kw('throw new')} Error(${str('"Could not download the page"')})`,
-        `${kw('const')} bytes ${op('=')} ${kw('await')} page.${fn('arrayBuffer')}() ${cmt('// native .rm bytes')}`,
-    ]
-        .map((l) => `<span class="line">${l || ' '}</span>`)
-        .join('')
 </script>
 
 <div
@@ -55,7 +31,7 @@
 >
     <SiteHeader />
 
-    <!-- Main: single dense column, terminal-doc style -->
+    <!-- Full-width artwork; prose uses the same reading measure as docs. -->
     <main>
         <div>
             <p class="my-4 first:mt-0 last:mb-0" style="color: var(--gray-e)">
@@ -81,10 +57,22 @@
                         Waitlist invites arrive by email. The domain is new, so check spam.
                     </span>
                 {:else}
-                    <a href="/library" class="wf-cta">Open your notes</a>
-                    <a href={docsUrl()} class="wf-link" style="margin-left: 1rem; display: inline-block; white-space: nowrap">Read the docs &rarr;</a>
+                    {#if ready}<a href="/library" class="wf-cta">Open your notes</a>{/if}
+                    <a href={docsUrl()} class="wf-link" style:margin-left={ready ? '1rem' : undefined} style="display: inline-block; white-space: nowrap">Read the docs &rarr;</a>
                 {/if}
             </p>
+
+            {#if heroImage}
+                <img
+                    class="my-6 block h-auto w-full"
+                    src={heroImage.src}
+                    srcset={heroSrcset}
+                    sizes="(min-width: 1280px) 1248px, calc(100vw - 32px)"
+                    width={heroImage.width}
+                    height={heroImage.height}
+                    alt="The same annotated notebook page on a reMarkable tablet and in the Weft browser editor."
+                />
+            {/if}
 
             <p class="my-4">
                 <a href="/install" class="wf-link">Set up the tablet</a> once and sync runs
@@ -117,18 +105,8 @@
             </p>
 
             <p class="my-4">
-                Other apps can build on your notes too. The relay API accepts keys scoped to
-                your account (create one in
-                <a href="/settings/keys" class="wf-link">settings</a>, revoke it any time).
-                The API is still evolving. This lists synced notebooks and downloads one
-                page&rsquo;s native <code>.rm</code> bytes. It isn&rsquo;t a full notebook export:
-                browser-only shape metadata and linked assets are separate.
+                Other apps can build on your notes too. See the <a href="/docs/api" class="wf-link">API docs</a>.
             </p>
-
-            <div class="my-4">
-                <!-- eslint-disable-next-line svelte/no-at-html-tags -- static, self-authored -->
-                <code class="wf-code">{@html API_EXAMPLE_HTML}</code>
-            </div>
 
             <p class="my-4">
                 Under the hood weft reads and writes the reMarkable&rsquo;s CRDT file format
@@ -140,3 +118,10 @@
 
     <SiteFooter />
 </div>
+
+<style>
+    main p {
+        max-width: var(--wf-reading-width);
+        margin-inline: auto;
+    }
+</style>

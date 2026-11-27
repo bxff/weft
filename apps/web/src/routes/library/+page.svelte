@@ -64,6 +64,8 @@
             else if (next !== null) owner = next
         }
         window.addEventListener('storage', checkAccount, { signal: relayWatcher.signal })
+        const source = transport()
+        const initialRead = loadDocuments(source, false, relayWatcher.signal)
         let stopAccountWatch: void | (() => void)
         void ensureClerk().then((clerk) => {
             if (relayWatcher.signal.aborted) return
@@ -73,16 +75,6 @@
         // Re-entering the library: forget remembered 404s so thumbnails that
         // arrived while away get one fresh attempt instead of a blank tile.
         clearAssetMisses()
-        // Warm the editor: the tldraw chunk is slow to fetch+parse on first
-        // use. Kick the import while the user is still browsing.
-        void Promise.all([
-            import('react-dom/client'),
-            import('react'),
-            import('$lib/tldraw/TldrawApp'),
-        ])
-        // Warm the auth token: the first authed request mints a Clerk JWT over
-        // the network. Kick it here so the editor's first fetch reads the cache.
-        void getAuthToken()
         cloud = connection().mode === 'cloud'
         if (cloud) {
             void currentUserLabel().then((label) => {
@@ -95,11 +87,12 @@
             docs = cached
             loaded = true
         }
-        const source = transport()
-        void loadDocuments(source, false, relayWatcher.signal)
-        void source.health().then((fresh) => {
-            if (!relayWatcher.signal.aborted) health = fresh
-        }).catch(() => {})
+        void initialRead.then(() => {
+            if (relayWatcher.signal.aborted) return
+            void source.health().then((fresh) => {
+                if (!relayWatcher.signal.aborted) health = fresh
+            }).catch(() => {})
+        })
         const unsubscribe = source.subscribeDocList(() => {
             // New content may include thumbnails that previously 404'd.
             clearAssetMisses()

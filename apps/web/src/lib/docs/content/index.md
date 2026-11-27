@@ -11,6 +11,8 @@ and marked-up PDFs, edit pages, and sync changes back to the tablet.
 - [View the source or report an issue](https://github.com/bxff/weft) on GitHub.
 
 The source is public. The hosted service is still invite-only.
+On the hosted install page, agree to the [Hosted Terms](/terms) before generating a pairing command.
+Read the [Privacy Notice](/privacy) to see what sync sends to the relay and
+how that data is handled. Neither applies to independently self-hosted Weft.
 
-If you’re building your own client, create or revoke an API key in
-[Settings](/settings/keys). It’s scoped to your account.
+Building your own client? [Use the API](/docs/api) to list your notebooks and download a page.
