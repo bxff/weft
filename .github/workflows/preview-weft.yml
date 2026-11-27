@@ -1,0 +1,229 @@
+name: Preview Weft editor
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Open same-repository PR number (targets main)
+        required: true
+        type: string
+      head_sha:
+        description: Exact 40-character PR head SHA that passed CI
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: weft-editor-preview-slot
+  cancel-in-progress: false
+
+env:
+  PREVIEW_HOST: preview.weft.page
+  PREVIEW_PROJECT: weft-review
+  PREVIEW_BRANCH: review
+  PR_NUMBER: ${{ inputs.pull_request }}
+  PR_SHA: ${{ inputs.head_sha }}
+
+jobs:
+  gate:
+    if: github.ref == 'refs/heads/main' && vars.WEFT_PREVIEW_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      pull-requests: read
+    steps:
+      - name: Verify maintainer, PR, and CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCHER: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,9}$ && "$PR_SHA" =~ ^[0-9a-f]{40}$ ]]
+          for login in "$DISPATCHER" "$TRIGGERING_ACTOR"; do
+            gh api "repos/$GITHUB_REPOSITORY/collaborators/$login/permission" |
+              jq -e '.permission == "admin" or .role_name == "maintain"' >/dev/null
+          done
+          base=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" |
+            jq -er --arg repo "$GITHUB_REPOSITORY" --arg sha "$PR_SHA" '
+              select(.state == "open" and .base.ref == "main" and
+                .head.repo.full_name == $repo and .head.sha == $sha) | .base.sha')
+          [[ "$base" == "$GITHUB_SHA" ]] || { echo "Main changed. Dispatch the current workflow after CI passes."; exit 1; }
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f event=pull_request -f head_sha="$PR_SHA" -F per_page=100 |
+            jq -e --arg repo "$GITHUB_REPOSITORY" --arg sha "$PR_SHA" --arg base "$base" --argjson pr "$PR_NUMBER" '
+              [.workflow_runs[] | select(.head_sha == $sha and .head_repository.full_name == $repo and
+                any(.pull_requests[]?; .number == $pr and .head.sha == $sha and .base.sha == $base))]
+              | max_by(.run_number) | .status == "completed" and .conclusion == "success"' >/dev/null
+          printf '### Preview candidate\nPR #%s at `%s` passed the maintainer and CI gate.\n' "$PR_NUMBER" "$PR_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      # PR-controlled code runs only here, on a fresh hosted runner with no
+      # preview environment, Cloudflare token, production config, or repo-write token.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.3"
+      - run: bun install --frozen-lockfile
+      - name: Build the editor against a same-origin preview relay
+        working-directory: apps/web
+        env:
+          PUBLIC_CLOUD_URL: ""
+          PUBLIC_WEFT_PAGES_ORIGIN: ""
+          PUBLIC_CLERK_PUBLISHABLE_KEY: ""
+          PUBLIC_TLDRAW_LICENSE_KEY: ${{ vars.PUBLIC_TLDRAW_PREVIEW_LICENSE_KEY }}
+        run: |
+          set -euo pipefail
+          : "${PUBLIC_TLDRAW_LICENSE_KEY:?Configure the public preview-host-only tldraw key}"
+          bun run build
+          test -s build/index.html
+          test -s build/library.html
+          # Only trusted ingress decides routing, headers, and service workers.
+          rm -f build/_headers build/service-worker.js{,.br,.gz}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weft-preview-${{ inputs.head_sha }}
+          path: apps/web/build/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      actions: read
+      pull-requests: read
+    # Administrators must restrict this environment to main and require a
+    # maintainer reviewer. Do not put its token in repository-wide secrets.
+    environment:
+      name: pages-preview
+      url: https://preview.weft.page
+    steps:
+      # There is deliberately no checkout in this job. The only PR output is
+      # the untrusted artifact, which is validated as files and never executed.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: weft-preview-${{ inputs.head_sha }}
+          path: ${{ runner.temp }}/weft-preview-static
+      - name: Validate static artifact before exposing credentials
+        env:
+          STATIC_ROOT: ${{ runner.temp }}/weft-preview-static
+        run: |
+          python3 - <<'PY'
+          import os, re, stat
+          from pathlib import Path
+
+          root = Path(os.environ["STATIC_ROOT"])
+          suffixes = {".html", ".js", ".mjs", ".css", ".json", ".txt", ".webp", ".png",
+                      ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".wasm"}
+          reserved = {"functions", "_worker.js", "_headers", "_redirects", "_routes.json",
+                      "service-worker.js", "wrangler.json", "wrangler.jsonc"}
+          files = size = 0
+          for path in root.rglob("*"):
+              parts = path.relative_to(root).parts
+              mode = path.lstat().st_mode
+              plain = path.with_suffix("") if path.suffix in {".br", ".gz"} else path
+              if (any(not re.fullmatch(r"[A-Za-z0-9_()\[\].-]+", p) or p.startswith(".") or
+                      p.lower() in reserved for p in parts) or
+                  parts[0].lower() in {"api", "ws"} or plain.name.lower() in reserved):
+                  raise SystemExit("Artifact contains a reserved or invalid path")
+              if stat.S_ISDIR(mode):
+                  continue
+              if not stat.S_ISREG(mode) or plain.suffix not in suffixes:
+                  raise SystemExit("Artifact contains non-static files")
+              length = path.stat().st_size
+              size += length
+              files += 1
+              if length > 25 * 1024**2 or size > 100 * 1024**2 or files > 2000:
+                  raise SystemExit("Artifact exceeds preview limits")
+          for name in ("index.html", "library.html"):
+              if not (root / name).is_file() or (root / name).stat().st_size == 0:
+                  raise SystemExit("Artifact does not include the Weft editor build")
+          PY
+
+      - name: Install the pinned deploy tool without credentials
+        run: npm install --prefix "$RUNNER_TEMP/weft-preview-tool" --no-audit --no-fund wrangler@4.168.0
+
+      - name: Verify isolated ingress and upload to the fixed preview slot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.WEFT_PREVIEW_CF_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.WEFT_PREVIEW_CF_API_TOKEN }}
+          PRODUCTION_ACCOUNT_ID: ${{ vars.WEFT_PRODUCTION_CF_ACCOUNT_ID }}
+          ACCESS_TEAM_HOST: ${{ vars.WEFT_PREVIEW_ACCESS_TEAM_HOST }}
+          INGRESS_VERIFIED: ${{ vars.WEFT_PREVIEW_INGRESS_VERIFIED }}
+        run: |
+          set -euo pipefail
+          # Ingress must already reserve /api/* and /ws for a test-only relay
+          # (password auth, no Clerk); route other paths to protected Pages;
+          # block Service-Worker: script on the fixed hostname to prevent
+          # branch code persisting across previews; and pass an authenticated
+          # editor open/save/reload smoke test manually before setting this flag.
+          [[ "$INGRESS_VERIFIED" == true ]] || { echo "Preview ingress has not been verified."; exit 1; }
+          [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[a-f0-9]{32}$ &&
+             "$PRODUCTION_ACCOUNT_ID" =~ ^[a-f0-9]{32}$ &&
+             "$CLOUDFLARE_ACCOUNT_ID" != "$PRODUCTION_ACCOUNT_ID" ]] ||
+            { echo "A separate preview Cloudflare account is required."; exit 1; }
+          [[ "$ACCESS_TEAM_HOST" =~ ^[a-z0-9-]+\.cloudflareaccess\.com$ ]]
+          : "${CLOUDFLARE_API_TOKEN:?Configure a preview-only Pages Edit token}"
+
+          # Require a harmless provisioned deployment first: the bare domain
+          # AND wildcard deployment aliases must already have Access policies.
+          # The ingress hostname is trusted infrastructure, not a Pages alias.
+          origin="$PREVIEW_PROJECT.pages.dev"
+          project=$(curl --disable --fail --silent --show-error --max-time 20 \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/$PREVIEW_PROJECT")
+          prior=$(jq -er --arg name "$PREVIEW_PROJECT" --arg origin "$origin" --arg branch "$PREVIEW_BRANCH" '
+            select(.success == true) | .result |
+            select(.name == $name and .subdomain == $origin and .production_branch == $branch and
+                   ((.domains // []) | all(. == $origin))) | .canonical_deployment.url' <<<"$project")
+          alias_regex="^https://[a-f0-9]{8}\\.${PREVIEW_PROJECT}\\.pages\\.dev/?$"
+          [[ "$prior" =~ $alias_regex ]] || { echo "Provision a protected preview canary first."; exit 1; }
+          check_access() {
+            local location
+            location=$(curl --disable --fail --silent --show-error --max-time 15 \
+              --output /dev/null --write-out '%{http_code} %{redirect_url}' "$1")
+            [[ "$location" == "302 https://$ACCESS_TEAM_HOST/cdn-cgi/access/login/"* ]] ||
+              { echo "Expected the configured Cloudflare Access challenge for $1."; return 1; }
+          }
+          check_access "https://$PREVIEW_HOST/"
+          check_access "https://$PREVIEW_HOST/library"
+          check_access "https://$PREVIEW_HOST/api/health"
+          check_access "https://$PREVIEW_HOST/ws"
+          check_access "https://$origin/"
+          check_access "$prior"
+
+          # This trusted workflow is independent of the artifact. Recheck
+          # everything that can change while the publisher awaits approval.
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,9}$ && "$PR_SHA" =~ ^[0-9a-f]{40}$ ]]
+          base=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" |
+            jq -er --arg repo "$GITHUB_REPOSITORY" --arg sha "$PR_SHA" '
+              select(.state == "open" and .base.ref == "main" and
+                .head.repo.full_name == $repo and .head.sha == $sha) | .base.sha')
+          [[ "$base" == "$GITHUB_SHA" ]] || { echo "Main changed. Dispatch the current workflow after CI passes."; exit 1; }
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f event=pull_request -f head_sha="$PR_SHA" -F per_page=100 |
+            jq -e --arg repo "$GITHUB_REPOSITORY" --arg sha "$PR_SHA" --arg base "$base" --argjson pr "$PR_NUMBER" '
+              [.workflow_runs[] | select(.head_sha == $sha and .head_repository.full_name == $repo and
+                any(.pull_requests[]?; .number == $pr and .head.sha == $sha and .base.sha == $base))]
+              | max_by(.run_number) | .status == "completed" and .conclusion == "success"' >/dev/null
+          unset GH_TOKEN
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/weft-preview-tool/node_modules/.bin/wrangler" pages deploy "$RUNNER_TEMP/weft-preview-static" \
+            --project-name="$PREVIEW_PROJECT" --branch="$PREVIEW_BRANCH" --commit-hash="$PR_SHA"
+          printf '### Editor preview\n[Open the fixed preview slot](https://%s) (PR #%s, `%s`).\n' \
+            "$PREVIEW_HOST" "$PR_NUMBER" "$PR_SHA" >> "$GITHUB_STEP_SUMMARY"
