@@ -71,16 +71,47 @@ pub(crate) fn page_dir(root: &Path, doc: &str, page: &str) -> Option<PathBuf> {
     (safe_id(doc) && safe_id(page)).then(|| root.join(doc).join(page))
 }
 
+const CHECKPOINT_LIMIT: usize = 16 * 1024 * 1024;
+const CHECKPOINT_PREFIX: &[u8] = br#"{"checkpointSha256":""#;
+
+fn encode_manifest(payload: &[u8]) -> io::Result<Vec<u8>> {
+    let extra = CHECKPOINT_PREFIX.len() + 64 + 2;
+    if payload.first() != Some(&b'{') || payload.len().saturating_add(extra - 1) > CHECKPOINT_LIMIT
+    {
+        return Err(io::Error::other("invalid or oversized checkpoint manifest"));
+    }
+    let digest = sha256_hex(payload);
+    let mut manifest = Vec::with_capacity(payload.len() + extra - 1);
+    manifest.extend_from_slice(CHECKPOINT_PREFIX);
+    manifest.extend_from_slice(digest.as_bytes());
+    manifest.extend_from_slice(b"\",");
+    manifest.extend_from_slice(&payload[1..]);
+    Ok(manifest)
+}
+
+fn verified_payload(manifest: &mut [u8]) -> Option<&[u8]> {
+    // Serialize the checksum first, so validation hashes the exact UTF-8 bytes
+    // rather than reserializing a parsed object in another language.
+    if manifest.len() > CHECKPOINT_LIMIT || !manifest.starts_with(CHECKPOINT_PREFIX) {
+        return None;
+    }
+    let checksum_end = CHECKPOINT_PREFIX.len() + 64;
+    let (prefix, payload) = manifest.split_at_mut_checked(checksum_end + 1)?;
+    let expected = std::str::from_utf8(prefix.get(CHECKPOINT_PREFIX.len()..checksum_end)?).ok()?;
+    if !is_digest(expected) || prefix[checksum_end] != b'"' || payload.first() != Some(&b',') {
+        return None;
+    }
+    payload[0] = b'{';
+    (sha256_hex(payload) == expected).then_some(payload)
+}
+
 pub(crate) fn load(dir: &Path) -> Option<Checkpoint> {
     let mut file = std::fs::File::open(dir.join("checkpoint.json"))
         .ok()?
-        .take(16 * 1024 * 1024 + 1);
+        .take(CHECKPOINT_LIMIT as u64 + 1);
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).ok()?;
-    if bytes.len() > 16 * 1024 * 1024 {
-        return None;
-    }
-    let saved: Checkpoint = serde_json::from_slice(&bytes).ok()?;
+    let saved: Checkpoint = serde_json::from_slice(verified_payload(&mut bytes)?).ok()?;
     (saved.version == 1
         && saved.head.valid()
         && dir
@@ -245,7 +276,7 @@ pub(crate) fn commit(
     let base = format!("{}.rm", checkpoint.head.native_sha256);
     let base_path = dir.join(&base);
     let needs_base = !file_has_digest(&base_path, &checkpoint.head.native_sha256);
-    let manifest = serde_json::to_vec(&checkpoint)?;
+    let manifest = encode_manifest(&serde_json::to_vec(&checkpoint)?)?;
     let staged_bytes = manifest.len() as u64 + if needs_base { native.len() as u64 } else { 0 };
     let write = || {
         create_durable_dir(dir)?;
@@ -351,5 +382,19 @@ mod tests {
             std::fs::read(&previous_link).unwrap(),
             b"previous link data"
         );
+    }
+
+    #[test]
+    fn checkpoint_checksum_hashes_exact_utf8_bytes() {
+        let payload = r#"{"overlay":{"shapes":["é🙂"]}}"#.as_bytes();
+        let mut manifest = encode_manifest(payload).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&manifest).unwrap(),
+            r#"{"checkpointSha256":"71f0ea1f417157863a3c5dabeef871029a2b8f068862df1a52f28cbb12469e11","overlay":{"shapes":["é🙂"]}}"#
+        );
+        assert_eq!(verified_payload(&mut manifest), Some(payload));
+        assert!(verified_payload(&mut payload.to_vec()).is_none());
+        assert!(verified_payload(&mut b"{\"checkpointSha256\":\"".to_vec()).is_none());
+        assert!(encode_manifest(&vec![b'{'; CHECKPOINT_LIMIT]).is_err());
     }
 }

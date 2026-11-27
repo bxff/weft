@@ -2626,6 +2626,24 @@ mod tests {
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
         assert_eq!(page_hits.load(Ordering::Relaxed), 2);
 
+        // Valid JSON can silently lose overlay data without affecting the
+        // native/asset hashes or stored validator. Simulate a restart and
+        // prove that the exact manifest checksum forces a full refetch.
+        let manifest_path = path.join("checkpoint.json");
+        let original = std::fs::read_to_string(&manifest_path).unwrap();
+        let corrupt = original.replace("shape:target", "shape:changed");
+        assert_ne!(original, corrupt);
+        let parsed = serde_json::from_str::<serde_json::Value>(&corrupt).unwrap();
+        assert_eq!(parsed["etag"], "\"checkpoint-1\"");
+        std::fs::write(&manifest_path, corrupt).unwrap();
+        assert!(recovery::load(&path).is_none());
+        cloud.protected.clear();
+        cloud.pulled_asset_revisions.clear();
+        etag = None;
+        reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
+        assert_eq!(page_hits.load(Ordering::Relaxed), 3);
+        assert_eq!(std::fs::read_to_string(&manifest_path).unwrap(), original);
+
         // Simulate recovery storage loss across a restart. A stale ETag cannot
         // mask a missing asset or a base file with the correct name but bad bytes.
         std::fs::remove_file(&native_asset).unwrap();
@@ -2634,7 +2652,7 @@ mod tests {
         cloud.pulled_asset_revisions.clear();
         etag = None;
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
-        assert_eq!(page_hits.load(Ordering::Relaxed), 3);
+        assert_eq!(page_hits.load(Ordering::Relaxed), 4);
         assert_eq!(std::fs::read(&native_asset).unwrap(), old);
         assert_eq!(
             std::fs::read(path.join(format!("{native_sha}.rm"))).unwrap(),
