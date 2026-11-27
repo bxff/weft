@@ -1855,3 +1855,19 @@ test('deferred projection is transferred only for its exact durable generation',
     await reconnected.disposeAndDrainLocalWrites()
     await peer.disposeAndDrainLocalWrites()
 })
+
+
+test('deferred draft transfer cannot replace an existing draft even if its source matches', async () => {
+    const storage = new MemoryStorage()
+    const first = new Uint8Array([1])
+    const second = new Uint8Array([2])
+    await storage.set('proposed', first)
+    await storage.set('current', second)
+    expect(await storage.consume(['proposed', first], ['current', first], () => true, true)).toBe(false)
+    expect(await storage.get('proposed')).toEqual(first)
+    expect(await storage.get('current')).toEqual(second)
+    await storage.delete('current')
+    expect(await storage.consume(['proposed', first], ['current', first], () => true, true)).toBe(true)
+    expect(await storage.get('proposed')).toBeNull()
+    expect(await storage.get('current')).toEqual(first)
+})

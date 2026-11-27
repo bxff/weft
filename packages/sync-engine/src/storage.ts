@@ -19,7 +19,7 @@ export interface KeyValueStorage {
     setAndDelete?(key: string, value: Uint8Array, deleteKey: string): Promise<void>
     /** Atomically consume the exact generation of a deferred edit. A replaced
      *  or missing source must not change either key. Keys must be distinct. */
-    consume?(source: StorageEntry, destination: StorageEntry, mayWrite: () => boolean): Promise<boolean>
+    consume?(source: StorageEntry, destination: StorageEntry, mayWrite: () => boolean, vacant?: boolean): Promise<boolean>
 }
 
 function sameBytes(left: Uint8Array | null, right: Uint8Array): boolean {
@@ -54,9 +54,10 @@ export class MemoryStorage implements KeyValueStorage {
         this.map.set(key, value.slice())
         this.map.delete(deleteKey)
     }
-    async consume(source: StorageEntry, destination: StorageEntry, mayWrite: () => boolean): Promise<boolean> {
+    async consume(source: StorageEntry, destination: StorageEntry, mayWrite: () => boolean, vacant = false): Promise<boolean> {
         if (source[0] === destination[0]) throw new Error('Cannot consume into the same key')
-        if (!mayWrite() || !sameBytes(this.map.get(source[0]) ?? null, source[1])) return false
+        if (!mayWrite() || (vacant && this.map.has(destination[0])) ||
+            !sameBytes(this.map.get(source[0]) ?? null, source[1])) return false
         this.map.set(destination[0], destination[1].slice())
         this.map.delete(source[0])
         return true
@@ -149,14 +150,19 @@ export class IdbStorage implements KeyValueStorage {
             return store.delete(deleteKey)
         })
     }
-    async consume(source: StorageEntry, destination: StorageEntry, mayWrite: () => boolean): Promise<boolean> {
+    async consume(source: StorageEntry, destination: StorageEntry, mayWrite: () => boolean, vacant = false): Promise<boolean> {
         if (source[0] === destination[0]) throw new Error('Cannot consume into the same key')
         return this.transaction('readwrite', (store) => {
             let consumed = false
+            // IndexedDB runs these reads in enqueue order inside this
+            // readwrite transaction, so the optional presence check has
+            // settled when the source is compared.
+            const priorKey = vacant ? store.getKey(destination[0]) : undefined
             const read = store.get(source[0])
             read.onsuccess = () => {
                 try {
-                    if (!mayWrite() || !sameBytes(this.readBytes(read.result), source[1])) return
+                    if (!mayWrite() || priorKey?.result !== undefined ||
+                        !sameBytes(this.readBytes(read.result), source[1])) return
                     store.put(destination[1], destination[0])
                     store.delete(source[0])
                     consumed = true

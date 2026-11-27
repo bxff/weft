@@ -49,11 +49,11 @@ export function transport(): HttpTransport {
         const valid = () => connection().cloudUrl === relay &&
             (account ? needsHostedProjectionScope() && selectedClerkReplicaAccount() === account
                 : localPreferenceOwner() === `dev:${dev}`)
-        const transport = new HttpTransport({
+        const transport: HttpTransport = new HttpTransport({
             baseUrl: relay,
             documentListBaseUrl: !isSelfHosted() && window.location.origin === import.meta.env.PUBLIC_WEFT_PAGES_ORIGIN
                 ? window.location.origin : undefined,
-            getAuthToken: () => readBoundBearer(
+            getAuthToken: (): Promise<string | null> => readBoundBearer(
                 () => connection().cloudUrl === relay &&
                     (!scope || instance?.transport === transport && valid()),
                 bearer => account ? bearerMatchesClerkReplicaAccount(bearer, account)
@@ -119,6 +119,11 @@ const authorLockName = (uuid: string) => `weft-author:${uuid}`
  *  is already held. Lock release on tab close is also how orphaned pending
  *  queues are detected. Without Web Locks, degrades to per-tab sessionStorage. */
 let uniqueAuthor: Promise<string> | null = null
+let lockedAuthor: string | null = null
+export function holdsAuthorLease(author: string): boolean {
+    return lockedAuthor === author
+}
+
 export function ensureUniqueAuthorUuid(): Promise<string> {
     if (uniqueAuthor) return uniqueAuthor
     uniqueAuthor = (async () => {
@@ -133,6 +138,7 @@ export function ensureUniqueAuthorUuid(): Promise<string> {
                             resolve(false)
                             return
                         }
+                        lockedAuthor = uuid
                         resolve(true)
                         return new Promise<never>(() => {}) // hold for tab lifetime
                     })

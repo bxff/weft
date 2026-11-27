@@ -89,7 +89,7 @@ import {
 import { computeAnchorOffsets } from './text-anchor-layout'
 import { ProjectionFontLoader, type ProjectionFamily, type ProjectionFontKey } from './projection-fonts'
 import { measureRichProjection, richProjection } from './richtext-projection'
-import { adoptOrphanAuthor, cachedDocuments, ensureUniqueAuthorUuid, needsHostedProjectionScope, projectionScope, uuidv4 } from '../transport'
+import { adoptOrphanAuthor, cachedDocuments, ensureUniqueAuthorUuid, holdsAuthorLease, needsHostedProjectionScope, projectionScope, uuidv4 } from '../transport'
 import { fetchDataUrl, seedAssetBytes } from '../authedAsset'
 import { getPointsFromDrawSegments } from 'tldraw'
 import { decodeRmPointData } from '@weft/rm-ink'
@@ -135,6 +135,7 @@ type ProjectionDraft = {
     shape: TLShape
     stamp: OpVersion
     baseline: string
+    authorLeased?: true
     opacity?: { opacity: number; opacityVersion: OpVersion }
     order?: string
 }
@@ -249,6 +250,7 @@ export class StudioController {
     private saveFailure: symbol | null = null
     private pendingCommands = new Set<Promise<void>>()
     private projectionScope: string | undefined
+    private projectionAuthor: string | undefined
     private readonly projectionDrafts = new Map<string, { draft: ProjectionDraft; bytes: Uint8Array }>()
     private projectionDraftWrites = Promise.resolve()
     private projectionDraftFailure: unknown
@@ -429,6 +431,7 @@ export class StudioController {
             this.electCachePrimary(),
         ])
         if (!this.canUseScopedSession()) return
+        this.projectionAuthor = author
         const primaryAtOpen = cachePrimary || this.pageLockRelease !== null
         this.sessionOpening = OfflineSession.open(
             storage,
@@ -682,7 +685,7 @@ export class StudioController {
         const engineWrites = this.session?.disposeAndDrainLocalWrites() ??
             opening?.then(session => session.disposeAndDrainLocalWrites(), () => {})
         const localWrites = this.projectionScope
-            ? Promise.all([engineWrites, this.projectionDraftWrites]) : engineWrites
+            ? Promise.all([engineWrites, this.projectionDraftWrites]).then(() => {}) : engineWrites
         if (!localWrites) {
             release()
             return
@@ -1685,6 +1688,7 @@ export class StudioController {
         const draft: ProjectionDraft = {
             shape, stamp, baseline: this.projectionDrafts.get(shape.id)?.draft.baseline ??
                 this.projectionBaseline(shape.id),
+            ...(this.projectionAuthor && holdsAuthorLease(this.projectionAuthor) && { authorLeased: true }),
             opacity: this.pendingOpacityWrites.get(shape.id),
             order: this.pendingBrowserOrder.get(shape.id),
         }
@@ -1701,18 +1705,53 @@ export class StudioController {
         this.writeProjectionDraft(() => storage.delete(key))
     }
 
+    private decodeProjectionDraft(bytes: Uint8Array): ProjectionDraft | null {
+        try {
+            const draft: ProjectionDraft = JSON.parse(new TextDecoder().decode(bytes))
+            if (typeof draft.baseline !== 'string' || !Number.isSafeInteger(draft.stamp?.ts) ||
+                typeof draft.stamp.actor !== 'string' || !this.draftSupported(draft.shape)) return null
+            return draft
+        } catch { return null }
+    }
+
+    /** Adopt only after the prior tab releases the same exclusive author
+     * lease as the projected queue. Both keys remain within this account's
+     * replica, and the original durable bytes move without restamping.
+     * Don't silently replace an existing draft for the same shape. */
+    private async adoptProjectionDrafts(): Promise<void> {
+        const consume = storage.consume?.bind(storage)
+        if (!consume || !this.canUseScopedSession() || !this.projectionAuthor ||
+            !holdsAuthorLease(this.projectionAuthor)) return
+        const namespace = this.session.deferredDraftNamespace()
+        const ownPrefix = this.session.deferredDraftStorageKey('')
+        for (const source of await storage.keys(namespace)) {
+            if (!this.canUseScopedSession()) return
+            if (source.startsWith(ownPrefix)) continue
+            const [author, draftId, extra] = source.slice(namespace.length).split('/')
+            if (!author || !draftId || extra !== undefined ||
+                !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(author)) continue
+            await adoptOrphanAuthor(author, async () => {
+                if (!this.canUseScopedSession()) return
+                const bytes = await storage.get(source)
+                const draft = bytes && this.decodeProjectionDraft(bytes)
+                if (!bytes || !draft || draft.authorLeased !== true || encodeURIComponent(draft.shape.id) !== draftId) return
+                const key = this.session.deferredDraftStorageKey(draft.shape.id)
+                await consume([source, bytes], [key, bytes], () => this.canUseScopedSession(), true)
+            })
+        }
+    }
+
     private async restoreProjectionDrafts(): Promise<void> {
         if (!this.ownsProjectionDrafts()) return
+        await this.adoptProjectionDrafts()
+        if (!this.canUseScopedSession()) return
         const prefix = this.session.deferredDraftStorageKey('')
         for (const key of await storage.keys(prefix)) {
             const bytes = await storage.get(key)
             if (this.disposed || !this.ownsProjectionDrafts()) return
             if (!bytes) continue
-            let draft: ProjectionDraft
-            try {
-                draft = JSON.parse(new TextDecoder().decode(bytes))
-                if (key !== this.session.deferredDraftStorageKey(draft.shape.id) || !this.draftSupported(draft.shape)) continue
-            } catch { continue }
+            const draft = this.decodeProjectionDraft(bytes)
+            if (!draft || key !== this.session.deferredDraftStorageKey(draft.shape.id)) continue
             if (draft.baseline !== this.projectionBaseline(draft.shape.id)) {
                 this.parkProjectionDraft(draft)
                 continue

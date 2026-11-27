@@ -265,6 +265,65 @@ test('a scoped editor preserves unowned legacy queue bytes without taking them o
     expect(await shapes(request, `/api/documents/${doc}/pages/${sheet}`)).toEqual([])
 })
 
+test('a new tab adopts the exact scoped draft only after the old author lock is released', async ({ page, request, context }) => {
+    test.skip(process.env.WEFT_PROJECTION_JOURNAL_PROOF !== '1', 'requires the loopback-only projection-journal-test build')
+    const api = await open(page)
+    const shell = page.url()
+    const face = '**/fonts/projection/WeftOverlayMonoBoldItalic.woff'
+    await page.route(face, route => route.fulfill({ status: 503 }))
+    const id = 'shape:orphan-label'
+    await create(page, {
+        id, type: 'geo', props: {
+            richText: { type: 'doc', content: [paragraph([word('closed tab draft', 'bold', 'italic', 'underline')])] },
+            geo: 'rectangle', w: 200, h: 110, font: 'mono', size: 'm',
+        },
+    })
+    await expect.poll(() => localProjectionDraft(page, id)).toContain('closed tab draft')
+    const exact = await localProjectionDraft(page, id)
+    expect(JSON.parse(exact!)).toMatchObject({ authorLeased: true })
+    const originalAuthor = await page.evaluate(() => sessionStorage.getItem('weft-author-uuid'))
+    expect(originalAuthor).toBeTruthy()
+    const next = await context.newPage()
+    await next.route(face, route => route.fulfill({ status: 503 }))
+    try {
+        await next.goto(shell)
+        await expect(next.getByTestId('sync-status')).toHaveText('synced', { timeout: 15_000 })
+        const newAuthor = await next.evaluate(() => sessionStorage.getItem('weft-author-uuid'))
+        expect(newAuthor).toBeTruthy()
+        expect(newAuthor).not.toBe(originalAuthor)
+        await expect(next.getByTestId('canvas').getByText('closed tab draft')).toHaveCount(0)
+        expect(await localProjectionDraft(next, id)).toEqual(exact)
+        expect(await shapes(request, api)).toEqual([])
+        await page.close()
+        await expect.poll(() => next.evaluate(async uuid =>
+            (await navigator.locks.query()).held?.some(lock => lock.name === 'weft-author:' + uuid),
+        originalAuthor)).toBe(false)
+        await next.reload()
+        await expect(next.locator('.tl-text-content u')).toHaveText('closed tab draft')
+        expect(await localProjectionDraft(next, id)).toEqual(exact)
+        const stored = await next.evaluate(() => new Promise<string[]>((resolve, reject) => {
+            const open = indexedDB.open('weft', 1)
+            open.onerror = () => reject(open.error)
+            open.onsuccess = () => {
+                const db = open.result
+                const tx = db.transaction('pages')
+                const req = tx.objectStore('pages').getAllKeys()
+                tx.onabort = () => { db.close(); reject(tx.error) }
+                tx.oncomplete = () => { db.close(); resolve(req.result.map(String).filter(k => k.includes('/deferred/'))) }
+            }
+        }))
+        expect(stored).toHaveLength(1)
+        expect(stored[0]).toContain('/deferred/' + newAuthor + '/')
+        await next.unroute(face)
+        const projected = async () => (await shapes(request, api)).filter(shape => shape.shapeId === id)
+        await expect.poll(async () => (await projected())[0]?.rendered.map(part => part.partKey)).toContain('label:glyph:0')
+        expect(await projected()).toHaveLength(1)
+        expect(await localProjectionDraft(next, id)).toBeNull()
+    } finally {
+        await next.close()
+    }
+})
+
 test('sticky-note and arrow labels keep their styled ink on the shape after reload', async ({ page, request }) => {
     const api = await open(page)
     const richText = { type: 'doc', content: [paragraph([word('AB', 'bold'), word('CD', 'italic', 'underline')])] }

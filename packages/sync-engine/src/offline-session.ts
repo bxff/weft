@@ -429,9 +429,13 @@ export class OfflineSession {
         void this.reconcile()
     }
 
-    deferredDraftStorageKey(draftId: string): string {
+    deferredDraftNamespace(): string {
         if (!this.opts.replicaScope) throw new Error('Deferred drafts require a scoped notebook replica')
-        return this.key(`deferred/${this.opts.authorUuid}/${encodeURIComponent(draftId)}`)
+        return this.key('deferred/')
+    }
+
+    deferredDraftStorageKey(draftId: string): string {
+        return `${this.deferredDraftNamespace()}${this.opts.authorUuid}/${encodeURIComponent(draftId)}`
     }
 
     /** Move one already-durable editor draft into this author's outbox.
