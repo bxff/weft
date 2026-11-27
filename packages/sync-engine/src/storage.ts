@@ -4,7 +4,26 @@
  */
 
 export type StorageEntry = readonly [key: string, value: Uint8Array]
-type StoragePair = [Uint8Array | null, Uint8Array | null]
+export type StoragePair = readonly [Uint8Array | null, Uint8Array | null]
+
+type SaveCommit = {
+    expected: StoragePair
+    checkpoint: readonly [StorageEntry, StorageEntry]
+    queue?: { key: string; bytes: Uint8Array | null }
+    mayWrite: () => boolean
+}
+type SaveResult = 'committed' | 'conflict' | 'inactive'
+
+export function sameBytes(a: Uint8Array | null, b: Uint8Array | null): boolean {
+    return a === b || (!!a && !!b && a.length === b.length && a.every((v, i) => v === b[i]))
+}
+
+function validateSave({ checkpoint, queue }: SaveCommit): void {
+    const keys = [...checkpoint.map(([key]) => key), ...(queue ? [queue.key] : [])]
+    if (checkpoint.length !== 2 || !keys.every(Boolean) || new Set(keys).size !== keys.length) {
+        throw new Error('Invalid atomic save checkpoint')
+    }
+}
 
 export interface KeyValueStorage {
     get(key: string): Promise<Uint8Array | null>
@@ -14,7 +33,7 @@ export interface KeyValueStorage {
     /** Check ownership when starting the atomic write, after any storage wait. */
     setPair(first: StorageEntry, second: StorageEntry, mayWrite?: () => boolean): Promise<void>
     /** Atomically retire a confirmed request and save its authoritative checkpoint. */
-    commitSave?(checkpoint: readonly StorageEntry[], queueKey: string, queue: Uint8Array | null, mayWrite: () => boolean): Promise<boolean>
+    commitSave?(commit: SaveCommit): Promise<SaveResult>
     delete(key: string, ...others: string[]): Promise<void>
     keys(prefix: string): Promise<string[]>
     /** Commit both changes together. Required for orphan queue adoption. */
@@ -41,14 +60,21 @@ export class MemoryStorage implements KeyValueStorage {
         this.map.set(first[0], firstValue)
         this.map.set(second[0], secondValue)
     }
-    async commitSave(checkpoint: readonly StorageEntry[], queueKey: string, queue: Uint8Array | null, mayWrite: () => boolean): Promise<boolean> {
-        if (!mayWrite()) return false
+    async commitSave(commit: SaveCommit): Promise<SaveResult> {
+        validateSave(commit)
+        const { checkpoint, expected, queue, mayWrite } = commit
+        if (!mayWrite()) return 'inactive'
+        if (!checkpoint.every(([key], i) => sameBytes(this.map.get(key) ?? null, expected[i]!))) {
+            return 'conflict'
+        }
         const copies = checkpoint.map(([key, value]) => [key, value.slice()] as const)
-        const next = queue?.slice()
+        const next = queue?.bytes?.slice()
         for (const [key, bytes] of copies) this.map.set(key, bytes)
-        if (next) this.map.set(queueKey, next)
-        else this.map.delete(queueKey)
-        return true
+        if (queue) {
+            if (next) this.map.set(queue.key, next)
+            else this.map.delete(queue.key)
+        }
+        return 'committed'
     }
     async delete(key: string, ...others: string[]): Promise<void> {
         this.map.delete(key)
@@ -80,18 +106,21 @@ export class IdbStorage implements KeyValueStorage {
 
     private async transaction<T>(
         mode: IDBTransactionMode,
-        run: (store: IDBObjectStore) => () => T,
+        run: (store: IDBObjectStore, abortWith: (error: unknown) => void) => () => T,
     ): Promise<T> {
         const db = await this.db
         return new Promise<T>((resolve, reject) => {
             const transaction = db.transaction(STORE, mode)
             transaction.onabort = () => reject(transaction.error ?? new DOMException('Storage transaction aborted', 'AbortError'))
             let readResult: () => T
-            try {
-                readResult = run(transaction.objectStore(STORE))
-            } catch (error) {
-                transaction.abort()
+            const abortWith = (error: unknown) => {
                 reject(error)
+                try { transaction.abort() } catch { /* already inactive */ }
+            }
+            try {
+                readResult = run(transaction.objectStore(STORE), abortWith)
+            } catch (error) {
+                abortWith(error)
                 return
             }
             // Request success can still be followed by a transaction abort.
@@ -133,13 +162,31 @@ export class IdbStorage implements KeyValueStorage {
             return () => {}
         })
     }
-    async commitSave(checkpoint: readonly StorageEntry[], queueKey: string, queue: Uint8Array | null, mayWrite: () => boolean): Promise<boolean> {
-        return this.transaction('readwrite', (store) => {
-            if (!mayWrite()) return () => false
-            for (const [key, value] of checkpoint) store.put(value, key)
-            if (queue) store.put(queue, queueKey)
-            else store.delete(queueKey)
-            return () => true
+    async commitSave(commit: SaveCommit): Promise<SaveResult> {
+        validateSave(commit)
+        return this.transaction('readwrite', (store, abortWith) => {
+            const { checkpoint, expected, queue, mayWrite } = commit
+            let result: SaveResult = 'inactive'
+            const reads = checkpoint.map(([key]) => store.get(key))
+            reads[1]!.onsuccess = () => {
+                try {
+                    if (!mayWrite()) return
+                    if (!reads.every((read, i) => {
+                        const bytes = this.readBytes(read.result)
+                        return (read.result === undefined || bytes !== null) && sameBytes(bytes, expected[i]!)
+                    })) {
+                        result = 'conflict'
+                        return
+                    }
+                    for (const [key, value] of checkpoint) store.put(value, key)
+                    if (queue) {
+                        if (queue.bytes) store.put(queue.bytes, queue.key)
+                        else store.delete(queue.key)
+                    }
+                    result = 'committed'
+                } catch (error) { abortWith(error) }
+            }
+            return () => result
         })
     }
     async delete(key: string, ...others: string[]): Promise<void> {

@@ -20,7 +20,7 @@ import {
 } from './ops'
 import { decodeSnapshot, encodeSnapshot, encodeSnapshotBatch } from './snapshot'
 import { applyMoveRewrites, auditOverlay, reconcile as reconcilePolicy } from './reconciler'
-import type { KeyValueStorage } from './storage'
+import { sameBytes, type KeyValueStorage, type StoragePair } from './storage'
 import type { OpRecord, PageEvent, Transport } from './transport'
 import {
     EngineFailure,
@@ -126,6 +126,7 @@ export class OfflineSession {
     private confirmedPrefix = 0
     private deferredOrphan = false
     private checkpointDirty = false
+    private diskCheckpoint: StoragePair = [null, null]
     private pendingWrites = Promise.resolve()
     private overlay: OverlayDocument = { shapes: [] }
     private opCursor = 0
@@ -189,7 +190,7 @@ export class OfflineSession {
     }
 
     private async load(): Promise<void> {
-        const [baseBytes, stateRaw] = await this.storage.getPair(this.key('base'), this.key('state'))
+        const [baseBytes, stateRaw] = this.diskCheckpoint = await this.storage.getPair(this.key('base'), this.key('state'))
         // per-author key: two tabs can never clobber each other's unflushed ops
         const pendingRaw = await this.storage.get(this.pendingKey())
         if (pendingRaw) {
@@ -242,6 +243,38 @@ export class OfflineSession {
         return [[this.key('base'), base], [this.key('state'), stateBytes]] as const
     }
 
+    /** All guarded cache writes share one exact-predecessor rule. A tab
+     * that lost the race cannot clear its immutable journal or overwrite the
+     * winning replica. Reopen from the winner rather than guessing lineage. */
+    private async commitGuardedCheckpoint(
+        checkpoint: ReturnType<OfflineSession['checkpointEntries']>,
+        mayWrite: () => boolean,
+        queue?: { key: string; bytes: Uint8Array | null },
+    ): Promise<boolean> {
+        if (!this.storage.commitSave) throw new Error('Atomic save storage unavailable')
+        const expected = this.diskCheckpoint
+        if ((expected[0] === null) !== (expected[1] === null) ||
+            ![this.lastSnapshotSeq, this.opCursor].every(value => Number.isSafeInteger(value) && value >= 0)) {
+            throw new Error('Cannot replace incomplete checkpoint')
+        }
+        if (expected[1]) {
+            const previous = JSON.parse(new TextDecoder().decode(expected[1])) as PersistedState
+            const oldSnapshot = previous.lastSnapshotSeq ?? 0
+            const oldCursor = previous.opCursor ?? 0
+            if (![oldSnapshot, oldCursor].every(value => Number.isSafeInteger(value) && value >= 0) ||
+                this.lastSnapshotSeq < oldSnapshot || this.opCursor < oldCursor ||
+                (this.lastSnapshotSeq === oldSnapshot && this.opCursor === oldCursor &&
+                    (!sameBytes(checkpoint[0][1], expected[0]) || !sameBytes(checkpoint[1][1], expected[1])))) {
+                throw new Error('Cannot replace checkpoint: relay frontier changed')
+            }
+        }
+        const result = await this.storage.commitSave({ expected, checkpoint, ...(queue ? { queue } : {}), mayWrite })
+        if (result === 'conflict') throw new Error('Another tab saved a newer checkpoint. Reopen this page to retry.')
+        if (result === 'inactive') return false
+        this.diskCheckpoint = [checkpoint[0][1], checkpoint[1][1]]
+        return true
+    }
+
     private async persist(gen = this.generation, nativeBytes?: Uint8Array): Promise<void> {
         // one maintainer per page across tabs (the cache primary); a second
         // writer would interleave a base from one tab with a cursor from
@@ -249,8 +282,10 @@ export class OfflineSession {
         const active = () => gen === this.generation && (!this.disposed || this.drainingWrites) && this.cachePrimary
         if (this.disposed || !active()) return
         this.checkpointDirty = true
-        const [base, state] = this.checkpointEntries(nativeBytes)
-        const write = this.storage.setPair(base, state, active)
+        const checkpoint = this.checkpointEntries(nativeBytes)
+        const write = (this.opts.guardedSaves || this.publication)
+            ? this.commitGuardedCheckpoint(checkpoint, active).then(() => {})
+            : this.storage.setPair(...checkpoint, active)
         this.checkpointWrites.add(write)
         try {
             await write
@@ -789,11 +824,10 @@ export class OfflineSession {
             if (receipt.kind === 'stale') {
                 if (queue) await this.storage.set(this.pendingKey(), queue)
             } else {
-                const commit = this.storage.commitSave?.bind(this.storage)
-                if (!commit) throw new Error('Atomic save storage unavailable')
-                const checkpoint = this.cachePrimary ? this.checkpointEntries() : []
-                if (!await commit(checkpoint, this.pendingKey(), queue, active)) return
-                if (this.cachePrimary && checkpoint.length) this.checkpointDirty = false
+                if (!await this.commitGuardedCheckpoint(this.checkpointEntries(), active, {
+                    key: this.pendingKey(), bytes: queue,
+                })) return
+                this.checkpointDirty = false
                 if (publication.textRefs) {
                     for (const [id, edit] of this.capturedRootText) {
                         this.capturedRootText.set(id, acceptedTextEdit(edit, publication.textRefs) as RootTextEdit)

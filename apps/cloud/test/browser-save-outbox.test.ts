@@ -41,7 +41,7 @@ test.each(['reject', 'accepted-response-lost', 'local-commit-rejected', 'accepte
         }
         class Disk extends MemoryStorage {
             override async commitSave(...args: Parameters<MemoryStorage['commitSave']>) {
-                if (inject && failure === 'local-commit-rejected') throw new Error('transaction aborted')
+                if (args[0].queue && inject && failure === 'local-commit-rejected') throw new Error('transaction aborted')
                 return super.commitSave(...args)
             }
         }
