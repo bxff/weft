@@ -226,8 +226,13 @@ export function startCloud(
 ): CloudServer {
   const staticDir = opts.staticDir;
   const accountOrigin = process.env.WEFT_ACCOUNT_AUTHORIZED_ORIGIN;
+  const providerSecret = process.env.CLERK_SECRET_KEY;
+  const providerIssuer = process.env.WEFT_ACCOUNT_PROVIDER_ISSUER;
+  const providerTag = providerIssuer && providerSecret
+    ? new Bun.CryptoHasher("sha256").update(JSON.stringify(["weft-clerk-instance-v1", providerIssuer, providerSecret])).digest("hex")
+    : null;
   const accountSelfService = process.env.WEFT_ACCOUNT_SELF_SERVICE === "1" &&
-    !!process.env.CLERK_SECRET_KEY && !!accountOrigin;
+    !!providerTag && !!accountOrigin;
   const accountDeletes = new Set<string>();
   const activeExports = new Set<string>();
   // One outstanding ticket per requesting user, consumed before streaming.
@@ -247,21 +252,24 @@ export function startCloud(
 
   const deletionRetryMs = opts.testClerk?.retryMs ?? 15_000;
   const advanceManualDeletion = async (user: string): Promise<boolean> => {
-    if (store.manualDeletionComplete(user)) return true;
-    if (accountDeletes.has(user) || !store.claimManualDeletion(user, Date.now(), deletionRetryMs)) return false;
+    if (!providerTag || !providerSecret) return false;
+    if (store.manualDeletionComplete(user, providerTag)) return true;
+    if (accountDeletes.has(user) ||
+        !store.claimManualDeletion(user, providerTag, Date.now(), deletionRetryMs)) return false;
     accountDeletes.add(user);
     try {
       const work = store.drainAccountPurge(user);
       if (work.remaining > 0) {
-        if (work.removed > 0) store.continueManualDeletion(user);
+        if (work.removed > 0) store.continueManualDeletion(user, providerTag);
         return false;
       }
       try {
-        await (opts.testClerk?.deleteUser ?? deleteHostedClerkUser)(user);
+        if (opts.testClerk) await opts.testClerk.deleteUser(user);
+        else await deleteHostedClerkUser(user, providerSecret);
       } catch (error) {
         if (!error || typeof error !== "object" || !("status" in error) || error.status !== 404) return false;
       }
-      store.completeManualDeletion(user);
+      store.completeManualDeletion(user, providerTag);
       return true;
     } finally {
       accountDeletes.delete(user);
@@ -269,10 +277,10 @@ export function startCloud(
   };
   let manualPollRunning = false;
   const pollManualDeletions = async () => {
-    if (manualPollRunning) return;
+    if (manualPollRunning || !providerTag) return;
     manualPollRunning = true;
     try {
-      await Promise.allSettled(store.dueManualDeletions(Date.now()).map(advanceManualDeletion));
+      await Promise.allSettled(store.dueManualDeletions(providerTag, Date.now()).map(advanceManualDeletion));
     } finally {
       manualPollRunning = false;
     }
@@ -838,7 +846,7 @@ export function startCloud(
       const user = auth.userId;
       const deleteAccount = path === "/api/account" && req.method === "DELETE";
       const hostedAccount = accountSelfService && auth.via === "clerk" &&
-        auth.clerkAuthorizedParty === accountOrigin;
+        auth.clerkAuthorizedParty === accountOrigin && auth.clerkIssuer === providerIssuer;
       // Persisted SQL/blob fences protect writes that were already reading a
       // body when deletion started. Block new HTTP and WS admission too;
       // the one exception is the same signed account retrying its deletion.
@@ -888,7 +896,7 @@ export function startCloud(
 
       if (deleteAccount) {
         const noStore = { "cache-control": "private, no-store" };
-        if (!hostedAccount) {
+        if (!hostedAccount || !providerTag) {
           return json({ error: "not found" }, 404, noStore);
         }
         const result = await readJson(req, 128);
@@ -898,7 +906,7 @@ export function startCloud(
         // Check at the irreversible step, not before an asynchronous body read.
         if (!isRecentClerkSession(auth)) return json({ error: "recent-sign-in-required" }, 403, noStore);
         try {
-          store.stageAccountPurge(user, true);
+          store.stageAccountPurge(user, providerTag);
           closeSockets(user, () => true);
           syncHeartbeats.delete(user);
           for (const [ticket, identity] of wsTickets) {

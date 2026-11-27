@@ -24,10 +24,10 @@ export function initAccountPurge(db: Database): void {
       name TEXT NOT NULL, PRIMARY KEY(user_id, folder, name)
     ) WITHOUT ROWID`);
     db.run(`CREATE TABLE IF NOT EXISTS account_manual_deletions (
-      user_id TEXT PRIMARY KEY, due_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+      user_id TEXT PRIMARY KEY, provider_tag TEXT NOT NULL, due_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
       completed_at INTEGER
     ) WITHOUT ROWID`);
-    db.run("CREATE INDEX IF NOT EXISTS account_manual_deletions_due ON account_manual_deletions(due_at) WHERE completed_at IS NULL");
+    db.run("CREATE INDEX IF NOT EXISTS account_manual_deletions_due ON account_manual_deletions(provider_tag, due_at) WHERE completed_at IS NULL");
     // Authoritative admission even for body reads that started before the
     // fence was written. Device tokens/configuration alone cannot recreate it.
     for (const table of [...ACCOUNT_PURGE_ORDER, ...accountReceiptTables(db)]) {
@@ -51,7 +51,7 @@ export function withAccountBlobWrite<T>(db: Database, userId: string, write: () 
   return db.inTransaction ? guarded() : db.transaction(guarded).immediate();
 }
 
-export function stageAccountPurge(db: Database, userId: string, manual = false): void {
+export function stageAccountPurge(db: Database, userId: string, providerTag?: string): void {
   durableAccountWrite(db, () => {
     if (!isAccountFenced(db, userId)) {
       const plan = planRelayAccountPurge(db, userId);
@@ -67,7 +67,8 @@ export function stageAccountPurge(db: Database, userId: string, manual = false):
     }
     // This marker is written ONLY by the verified, explicit manual route.
     // Its commit and the fence must survive or roll back together.
-    if (manual) db.run("INSERT OR IGNORE INTO account_manual_deletions (user_id,due_at) VALUES (?,?)", [userId, Date.now()]);
+    if (providerTag) db.run("INSERT OR IGNORE INTO account_manual_deletions (user_id,provider_tag,due_at) VALUES (?,?,?)",
+      [userId, providerTag, Date.now()]);
   });
 }
 

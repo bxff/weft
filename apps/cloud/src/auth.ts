@@ -10,6 +10,7 @@ import type { CloudStore } from './store'
 
 export interface AuthContext {
     userId: string
+    clerkIssuer?: string
     clerkAuthorizedParty?: string
     clerkSession?: { issued: number; firstFactorAgeMinutes: number }
     // 'ticket' = browser WS authed by a single-use /api/ws-ticket nonce (resolved
@@ -92,9 +93,7 @@ export function isRecentClerkSession(auth: AuthContext, now = Math.floor(Date.no
         now - factor.issued + factor.firstFactorAgeMinutes * 60 < 4 * 60
 }
 
-export async function deleteHostedClerkUser(userId: string): Promise<void> {
-    const secretKey = process.env.CLERK_SECRET_KEY
-    if (!secretKey) throw new Error('Hosted account provider is unavailable')
+export async function deleteHostedClerkUser(userId: string, secretKey: string): Promise<void> {
     const response = await fetch(`https://api.clerk.com/v1/users/${encodeURIComponent(userId)}`, {
         method: 'DELETE',
         headers: { authorization: 'Bearer ' + secretKey },
@@ -163,6 +162,7 @@ export async function authenticate(req: Request, store: CloudStore, testClerkJwt
         return {
             userId: payload.sub,
             via: 'clerk',
+            ...(typeof payload.iss === 'string' && { clerkIssuer: payload.iss }),
             ...(clerkSession && { clerkSession }),
             ...(clerkAuthorizedParty && { clerkAuthorizedParty }),
         }

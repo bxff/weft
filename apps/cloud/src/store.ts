@@ -389,48 +389,48 @@ export class CloudStore {
     return isAccountFenced(this.db, userId);
   }
 
-  stageAccountPurge(userId: string, manual = false): void {
-    stageAccountPurge(this.db, userId, manual);
+  stageAccountPurge(userId: string, providerTag?: string): void {
+    stageAccountPurge(this.db, userId, providerTag);
   }
 
   drainAccountPurge(userId: string): { removed: number; remaining: number } {
     return drainAccountPurge(this.db, this.filesDir, userId);
   }
 
-  dueManualDeletions(now: number): string[] {
-    return this.db.query<{ user_id: string }, [number]>(
-      "SELECT user_id FROM account_manual_deletions WHERE completed_at IS NULL AND due_at<=? ORDER BY due_at LIMIT 4",
-    ).all(now).map(({ user_id }) => user_id);
+  dueManualDeletions(providerTag: string, now: number): string[] {
+    return this.db.query<{ user_id: string }, [string, number]>(
+      "SELECT user_id FROM account_manual_deletions WHERE provider_tag=? AND completed_at IS NULL AND due_at<=? ORDER BY due_at LIMIT 4",
+    ).all(providerTag, now).map(({ user_id }) => user_id);
   }
 
-  claimManualDeletion(user: string, now: number, base: number): boolean {
+  claimManualDeletion(user: string, providerTag: string, now: number, base: number): boolean {
     // Claim only an explicitly pending, fenced subject. The timed claim keeps
     // concurrent or restarted workers bounded; provider deletion is idempotent.
-    return this.db.query<{ attempts: number }, [number, number, string, number]>(`
+    return this.db.query<{ attempts: number }, [number, number, string, number, string]>(`
       UPDATE account_manual_deletions
       SET due_at = ?1 + min(3600000, ?2 * (1 << min(attempts, 7))), attempts=attempts+1
-      WHERE user_id=?3 AND completed_at IS NULL AND due_at<=?4
+      WHERE user_id=?3 AND completed_at IS NULL AND due_at<=?4 AND provider_tag=?5
       AND EXISTS (SELECT 1 FROM account_purge_fences WHERE user_id=?3)
       RETURNING attempts
-    `).get(now, base, user, now) !== null;
+    `).get(now, base, user, now, providerTag) !== null;
   }
 
-  continueManualDeletion(user: string): void {
-    this.db.run("UPDATE account_manual_deletions SET attempts=0, due_at=? WHERE user_id=? AND completed_at IS NULL",
-      [Date.now(), user]);
+  continueManualDeletion(user: string, providerTag: string): void {
+    this.db.run("UPDATE account_manual_deletions SET attempts=0, due_at=? WHERE user_id=? AND provider_tag=? AND completed_at IS NULL",
+      [Date.now(), user, providerTag]);
   }
 
-  completeManualDeletion(user: string): void {
+  completeManualDeletion(user: string, providerTag: string): void {
     durableAccountWrite(this.db, () => this.db.run(
-      "UPDATE account_manual_deletions SET completed_at=? WHERE user_id=? AND completed_at IS NULL",
-      [Date.now(), user],
+      "UPDATE account_manual_deletions SET completed_at=? WHERE user_id=? AND provider_tag=? AND completed_at IS NULL",
+      [Date.now(), user, providerTag],
     ));
   }
 
-  manualDeletionComplete(user: string): boolean {
+  manualDeletionComplete(user: string, providerTag: string): boolean {
     return this.db.query(
-      "SELECT 1 FROM account_manual_deletions WHERE user_id=? AND completed_at IS NOT NULL",
-    ).get(user) !== null;
+      "SELECT 1 FROM account_manual_deletions WHERE user_id=? AND provider_tag=? AND completed_at IS NOT NULL",
+    ).get(user, providerTag) !== null;
   }
 
   // ----- per-user storage usage (two classes) -----

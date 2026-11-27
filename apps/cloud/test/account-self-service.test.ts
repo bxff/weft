@@ -8,13 +8,17 @@ import { RmDocument } from "@weft/rm-format";
 import { startCloud } from "../src/server";
 
 const owner = "user_synthetic_owner", peer = "user_synthetic_peer";
+const issuer = "https://mock.clerk.invalid";
+const fixtureSecret = "sk_test_fixture";
+const providerTag = new Bun.CryptoHasher("sha256")
+  .update(JSON.stringify(["weft-clerk-instance-v1", issuer, fixtureSecret])).digest("hex");
 const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const jwtKey = publicKey.export({ type: "spki", format: "pem" }).toString();
 const b64 = (v: unknown) => Buffer.from(JSON.stringify(v)).toString("base64url");
-function jwt(sub: string, age: number | null, issuedAgo = 0, azp = "https://synthetic.example") {
+function jwt(sub: string, age: number | null, issuedAgo = 0, azp = "https://synthetic.example", iss = issuer) {
   const now = Math.floor(Date.now() / 1000);
   const data = b64({ alg: "RS256", typ: "JWT" }) + "." + b64({
-    sub, azp, sid: "sess_synthetic_" + sub, iss: "https://mock.clerk.invalid", nbf: now - 60,
+    sub, azp, sid: "sess_synthetic_" + sub, iss, nbf: now - 60,
     iat: now - issuedAgo, exp: now + 60, ...(age === null ? {} : { fva: [age, -1] }),
   });
   return data + "." + sign("RSA-SHA256", Buffer.from(data), privateKey).toString("base64url");
@@ -48,12 +52,13 @@ function tarEntries(archive: Uint8Array) {
 
 test("hosted delete verifies signed recent auth, fences HTTP and WS, and can resume after provider failure", async () => {
   const root = mkdtempSync(join(tmpdir(), "weft-self-service-"));
-  const env = ["HOST", "CLERK_SECRET_KEY", "WEFT_ACCOUNT_SELF_SERVICE", "WEFT_ACCOUNT_AUTHORIZED_ORIGIN", "WEFT_PASSWORD"] as const;
+  const env = ["HOST", "CLERK_SECRET_KEY", "WEFT_ACCOUNT_SELF_SERVICE", "WEFT_ACCOUNT_AUTHORIZED_ORIGIN", "WEFT_ACCOUNT_PROVIDER_ISSUER", "WEFT_PASSWORD"] as const;
   const oldEnv = env.map(key => process.env[key]);
   process.env.HOST = "127.0.0.1";
-  process.env.CLERK_SECRET_KEY = "sk_test_fixture";
+  process.env.CLERK_SECRET_KEY = fixtureSecret;
   process.env.WEFT_ACCOUNT_SELF_SERVICE = "1";
   process.env.WEFT_ACCOUNT_AUTHORIZED_ORIGIN = "https://synthetic.example";
+  process.env.WEFT_ACCOUNT_PROVIDER_ISSUER = issuer;
   delete process.env.WEFT_PASSWORD;
   const deleted: string[] = [];
   let providerDown = true;
@@ -89,6 +94,7 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
     const recent = jwt(owner, 0);
     expect((await erase(recent, "no")).status).toBe(400);
     expect((await erase(jwt(owner, 0, 0, "https://other.example"))).status).toBe(404);
+    expect((await erase(jwt(owner, 0, 0, "https://synthetic.example", "https://different-issuer.invalid"))).status).toBe(404);
     expect((await erase(jwt(owner, 9))).status).toBe(403);
     expect((await erase(jwt(owner, null))).status).toBe(403);
     expect((await erase(jwt(owner, 4, 61))).status).toBe(403);
@@ -152,7 +158,7 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
       testClerk: { jwtKey, retryMs: 10, deleteUser: async user => { deleted.push(user); } },
     });
     ({ call, erase } = calls());
-    await waitFor(() => cloud.store.manualDeletionComplete(owner));
+    await waitFor(() => cloud.store.manualDeletionComplete(owner, providerTag));
     expect((await erase(jwt(owner, 0))).status).toBe(204);
     expect(deleted).toEqual([owner]);
     expect((await call("/api/documents", jwt(owner, 0))).status).toBe(410);
@@ -170,12 +176,13 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
 
 test("worker finishes explicit fenced deletion after a lost provider response without a usable session", async () => {
   const root = mkdtempSync(join(tmpdir(), "weft-manual-deletion-restart-"));
-  const keys = ["HOST", "CLERK_SECRET_KEY", "WEFT_ACCOUNT_SELF_SERVICE", "WEFT_ACCOUNT_AUTHORIZED_ORIGIN", "WEFT_PASSWORD"] as const;
+  const keys = ["HOST", "CLERK_SECRET_KEY", "WEFT_ACCOUNT_SELF_SERVICE", "WEFT_ACCOUNT_AUTHORIZED_ORIGIN", "WEFT_ACCOUNT_PROVIDER_ISSUER", "WEFT_PASSWORD"] as const;
   const savedEnv = keys.map(key => process.env[key]);
   process.env.HOST = "127.0.0.1";
-  process.env.CLERK_SECRET_KEY = "sk_test_fixture";
+  process.env.CLERK_SECRET_KEY = fixtureSecret;
   process.env.WEFT_ACCOUNT_SELF_SERVICE = "1";
   process.env.WEFT_ACCOUNT_AUTHORIZED_ORIGIN = "https://synthetic.example";
+  process.env.WEFT_ACCOUNT_PROVIDER_ISSUER = issuer;
   delete process.env.WEFT_PASSWORD;
   const provider = new Set([owner, peer, "storage-only-fenced"]);
   const calls: string[] = [];
@@ -201,9 +208,23 @@ test("worker finishes explicit fenced deletion after a lost provider response wi
     expect((await erase(cloud.port)).status).toBe(202);
     expect(calls).toEqual([owner]);
     expect(provider.has(owner)).toBe(false); // provider accepted but lost ACK
-    expect(cloud.store.manualDeletionComplete(owner)).toBe(false);
+    expect(cloud.store.manualDeletionComplete(owner, providerTag)).toBe(false);
     expect(cloud.store.getDocuments(owner)).toBe('{"documents":[]}');
     cloud.stop();
+
+    // Even when the old job becomes due, a different configured provider
+    // must neither receive it nor mark a foreign 404 as completion.
+    process.env.WEFT_ACCOUNT_PROVIDER_ISSUER = "https://different-issuer.invalid";
+    const mismatched = start(jwtKey, 10);
+    try {
+      expect((await erase(mismatched.port)).status).toBe(410);
+      await Bun.sleep(450);
+      expect(calls).toEqual([owner]);
+      expect(mismatched.store.manualDeletionComplete(owner, providerTag)).toBe(false);
+    } finally {
+      mismatched.stop();
+      process.env.WEFT_ACCOUNT_PROVIDER_ISSUER = issuer;
+    }
 
     // Run a new relay process with a different public signer key. This
     // avoids Clerk SDK module-level JWKS caches in the old process.
@@ -223,7 +244,7 @@ test("worker finishes explicit fenced deletion after a lost provider response wi
     `;
     restarted = Bun.spawn([process.execPath, "-e", script], { stdout: "ignore", stderr: "inherit", env: {
       HOST: "127.0.0.1", CLERK_SECRET_KEY: "sk_test_fixture", WEFT_ACCOUNT_SELF_SERVICE: "1",
-      WEFT_ACCOUNT_AUTHORIZED_ORIGIN: "https://synthetic.example",
+      WEFT_ACCOUNT_AUTHORIZED_ORIGIN: "https://synthetic.example", WEFT_ACCOUNT_PROVIDER_ISSUER: issuer,
     } });
     await waitFor(() => existsSync(ready));
     expect((await erase(Number(readFileSync(ready, "utf8")))).status).toBe(401);
