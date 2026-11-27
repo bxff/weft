@@ -389,6 +389,7 @@ export class CloudStore {
       }
     }
     this.initUsageTracking();
+    this.reclaimOrphanSources();
   }
 
   // ----- per-user storage usage (two classes) -----
@@ -822,16 +823,6 @@ export class CloudStore {
         "SELECT doc, page, opened_at AS at FROM web_opens WHERE user_id=?",
       )
       .all(user);
-  }
-
-  /** On-disk path for a document's source file. The raw ids are hashed, so
-   *  the name is escape-proof (no path separators survive) and collision-free
-   *  (distinct tenants can never map onto the same file). */
-  private filePath(user: string, doc: string): string {
-    return join(
-      this.filesDir,
-      sha256hex(new TextEncoder().encode(`${user}\u0000${doc}`)),
-    );
   }
 
   /** Saved paths include the writer's absolute directory, which can change
@@ -1750,13 +1741,94 @@ export class CloudStore {
     doc: string,
     bytes: Uint8Array,
     mime = "application/pdf",
-  ): void {
-    const path = this.filePath(user, doc);
-    writeFileSync(path, bytes);
-    this.db.run(
-      "INSERT OR REPLACE INTO files (user_id, doc, path, size, mime, etag) VALUES (?, ?, ?, ?, ?, ?)",
-      [user, doc, path, bytes.length, mime, sha256hex(bytes)],
-    );
+    limit = 0,
+  ): boolean {
+    const etag = sha256hex(bytes);
+    let staged: string | undefined;
+    const retired: string[] = [];
+    try {
+      const published = this.commitSources(() => {
+        const old = this.sourceRow(user, doc);
+        const needed = this.usageBytes(user, "sources") - (old?.size ?? 0) + bytes.length - limit;
+        const victims = limit > 0 && needed > 0 ? this.colderSources(user, doc, needed) : [];
+        if (!victims) return false;
+
+        // Do not truncate the live source (including a pre-upgrade file).
+        // Put the replacement on durable storage before publishing its row.
+        const path = join(this.filesDir, sha256hex(new TextEncoder().encode(crypto.randomUUID())));
+        const fd = openSync(path, "wx", 0o600);
+        staged = path;
+        try {
+          writeFileSync(fd, bytes);
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+        this.syncRecoveryPath(this.filesDir);
+        this.syncRecoveryPath(dirname(this.filesDir));
+        this.db.run(
+          "INSERT OR REPLACE INTO files (user_id, doc, path, size, mime, etag) VALUES (?, ?, ?, ?, ?, ?)",
+          [user, doc, path, bytes.length, mime, etag],
+        );
+        if (old) retired.push(old.path);
+        for (const victim of victims) {
+          this.db.run("DELETE FROM files WHERE user_id=? AND doc=?", [user, victim.doc]);
+          retired.push(victim.path);
+        }
+        return true;
+      });
+      // A stale reader may still hold the old inode; unlink is safe for it.
+      for (const path of retired) this.unlinkSource(path);
+      return published;
+    } catch (error) {
+      // Never remove a possibly committed blob if checking the DB also fails.
+      // Startup reconciles either side of an interrupted publication.
+      if (staged) {
+        try {
+          if (this.sourceRow(user, doc)?.path !== staged) this.unlinkSource(staged);
+        } catch {}
+      }
+      throw error;
+    }
+  }
+
+  private sourceRow(user: string, doc: string) {
+    return this.db.query<{ path: string; size: number; mime: string; etag: string }, [string, string]>(
+      "SELECT path, size, mime, etag FROM files WHERE user_id=? AND doc=?",
+    ).get(user, doc);
+  }
+
+  private commitSources<T>(write: () => T): T {
+    // No autocommit ROW can be lost to a WAL reset after deleting its old
+    // files. BEGIN IMMEDIATE also serializes quota planning with other writers.
+    const previous = this.db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
+    this.db.run("PRAGMA synchronous = FULL");
+    try {
+      return this.db.transaction(write).immediate();
+    } finally {
+      this.db.run(`PRAGMA synchronous = ${previous}`);
+    }
+  }
+
+  private unlinkSource(stored: string): void {
+    const path = this.storedBlobPath(stored);
+    if (!path) return;
+    try { rmSync(path, { force: true }); }
+    catch (error) { console.error("weft-cloud: source cleanup deferred:", (error as NodeJS.ErrnoException).code); }
+  }
+
+  private reclaimOrphanSources(): void {
+    // Covers a crash before COMMIT (staged candidate) or after it (retired
+    // blobs). The writer lock prevents sweeping another process's candidate.
+    this.db.transaction(() => {
+      const live = new Set(this.db.query<{ path: string }, []>("SELECT path FROM files").all()
+        .map(({ path }) => this.storedBlobPath(path)));
+      for (const entry of readdirSync(this.filesDir, { withFileTypes: true })) {
+        if (entry.isFile() && /^[0-9a-f]{64}$/.test(entry.name) && !live.has(join(this.filesDir, entry.name))) {
+          this.unlinkSource(entry.name);
+        }
+      }
+    }).immediate();
   }
 
   /** Disk reference for a document's source file (for streaming + Range), or
@@ -1765,22 +1837,12 @@ export class CloudStore {
     user: string,
     doc: string,
   ): { path: string; size: number; mime: string; etag: string } | null {
-    const row = this.db
-      .query<
-        { path: string; size: number; mime: string; etag: string },
-        [string, string]
-      >("SELECT path, size, mime, etag FROM files WHERE user_id = ? AND doc = ?")
-      .get(user, doc);
+    const row = this.sourceRow(user, doc);
     if (!row) return null;
     const path = this.storedBlobPath(row.path);
-    if (!path || !existsSync(path)) return null;
-    // trust the on-disk size in case it was replaced out of band
-    return {
-      path,
-      size: statSync(path).size,
-      mime: row.mime,
-      etag: row.etag,
-    };
+    if (!path) return null;
+    const stat = statSync(path, { throwIfNoEntry: false });
+    return stat ? { path, size: stat.size, mime: row.mime, etag: row.etag } : null;
   }
 
   /** Full bytes of a document's source file (used by tests/back-compat). */
@@ -1805,17 +1867,16 @@ export class CloudStore {
    *  bytes. The source is NOT lost — it still lives on the tablet and re-pushes
    *  when it's hot enough to be resident again. */
   deleteFile(user: string, doc: string): number {
-    const ref = this.getFileRef(user, doc);
-    this.db.run("DELETE FROM files WHERE user_id=? AND doc=?", [user, doc]);
-    if (ref) {
-      try {
-        rmSync(ref.path, { force: true });
-      } catch {
-        // best-effort; the row is gone so usage no longer counts it
-      }
-      return ref.size;
-    }
-    return 0;
+    const ref = this.commitSources(() => {
+      const row = this.sourceRow(user, doc);
+      if (row) this.db.run("DELETE FROM files WHERE user_id=? AND doc=?", [user, doc]);
+      return row;
+    });
+    if (!ref) return 0;
+    const path = this.storedBlobPath(ref.path);
+    const size = path ? statSync(path, { throwIfNoEntry: false })?.size ?? 0 : 0;
+    this.unlinkSource(ref.path);
+    return size;
   }
 
   /** A doc's lastOpened (epoch ms) from the stored doc list, or 0 (never opened
@@ -1834,38 +1895,20 @@ export class CloudStore {
     }
   }
 
-  /** LRU eviction to make room for an incoming source (#81): free source bytes
-   *  by deleting the COLDEST resident sources (oldest lastOpened) that are
-   *  STRICTLY colder than `incomingDoc` — a source can only displace ones the
-   *  user opened less recently than the one being pushed. Never evicts the
-   *  incoming doc itself. Returns the total bytes freed (caller re-checks the
-   *  quota; if the incoming is the coldest of all, nothing is freed and it
-   *  stays tablet-only — correct). Evicted bytes remain on the tablet and
-   *  re-push when hot again. */
-  evictColderSources(user: string, needBytes: number, incomingDoc: string): number {
-    if (needBytes <= 0) return 0;
+  /** Plan enough strictly colder removals, or return null without taking any. */
+  private colderSources(user: string, incomingDoc: string, needed: number) {
     const incomingLastOpened = this.docLastOpened(user, incomingDoc);
-    // colder resident sources (recency + size), coldest first
-    const colder = this.residentSources(user)
-      .filter((doc) => doc !== incomingDoc)
-      .map((doc) => ({
-        doc,
-        lastOpened: this.docLastOpened(user, doc),
-        size: this.getFileRef(user, doc)?.size ?? 0,
-      }))
-      .filter((r) => r.lastOpened < incomingLastOpened)
+    const colder = this.db.query<{ doc: string; path: string; size: number }, [string, string]>(
+      "SELECT doc, path, size FROM files WHERE user_id=? AND doc!=? ORDER BY doc",
+    ).all(user, incomingDoc)
+      .map(row => ({ ...row, lastOpened: this.docLastOpened(user, row.doc) }))
+      .filter(row => row.lastOpened < incomingLastOpened)
       .sort((a, b) => a.lastOpened - b.lastOpened);
-    // ATOMIC: if the colder sources can't free `needBytes`, the incoming won't
-    // fit anyway — evict NOTHING rather than delete innocents for a PUT the
-    // server is about to 507 (which then churns those evicted sources back).
-    const evictable = colder.reduce((n, r) => n + r.size, 0);
-    if (evictable < needBytes) return 0;
-    let freed = 0;
-    for (const r of colder) {
-      if (freed >= needBytes) break;
-      freed += this.deleteFile(user, r.doc);
+    for (let i = 0; i < colder.length; i++) {
+      needed -= colder[i]!.size;
+      if (needed <= 0) return colder.slice(0, i + 1);
     }
-    return freed;
+    return null;
   }
 
   // Page templates (reMarkable's line/grid backgrounds), per user so one
