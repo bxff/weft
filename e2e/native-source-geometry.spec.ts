@@ -411,7 +411,7 @@ for (const rename of [false, true]) {
         if (rename) expect(refreshed.asset).not.toBe(initial.asset)
         else expect(refreshed.asset).toBe(initial.asset)
 
-        await page.evaluate(() => (window as unknown as { __weftEditor: Editor }).__weftEditor.undo())
+        await page.evaluate(() => { (window as unknown as { __weftEditor: Editor }).__weftEditor.undo() })
         expect(await photo()).toMatchObject({ id: initial.id, uuid, asset: refreshed.asset, x: initial.x })
         await expect.poll(async () => (await native()).image.vertices[0]! * RM_SCALE).toBeCloseTo(initial.x)
         expect(bytesToUuidLE((await native()).image.uuid.value)).toBe(uuid)
