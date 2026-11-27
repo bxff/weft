@@ -5,11 +5,13 @@
  * CLOUD_DEV_USER accepts `Bearer dev:<user>` for CI (only when no real auth set).
  */
 
-import { verifyToken } from '@clerk/backend'
+import { createClerkClient, verifyToken } from '@clerk/backend'
 import type { CloudStore } from './store'
 
 export interface AuthContext {
     userId: string
+    clerkAuthorizedParty?: string
+    clerkSession?: { issued: number; firstFactorAgeMinutes: number }
     // 'ticket' = browser WS authed by a single-use /api/ws-ticket nonce (resolved
     // in server.ts), keeping the session JWT out of the WS URL.
     via: 'clerk' | 'device' | 'dev' | 'apikey' | 'selfhost' | 'ticket'
@@ -80,7 +82,28 @@ export function jwtSigningSecret(store: CloudStore): string {
     return process.env.WEFT_JWT_SECRET || store.getOrCreateJwtSecret()
 }
 
-export async function authenticate(req: Request, store: CloudStore): Promise<AuthContext | null> {
+/** The gateway verifies the issuer's signature before these claims are used.
+ * Refreshing an old session token does not reset its first-factor age. */
+export function isRecentClerkSession(auth: AuthContext, now = Math.floor(Date.now() / 1000)): boolean {
+    const factor = auth.clerkSession
+    return auth.via === 'clerk' && !!factor && factor.issued <= now &&
+        // The factor age has minute precision. Reserve one minute for
+        // rounding and never treat a freshly reissued stale token as recent.
+        now - factor.issued + factor.firstFactorAgeMinutes * 60 < 4 * 60
+}
+
+export async function deleteHostedClerkUser(userId: string): Promise<void> {
+    const secretKey = process.env.CLERK_SECRET_KEY
+    if (!secretKey) throw new Error('Hosted account provider is unavailable')
+    try {
+        await createClerkClient({ secretKey }).users.deleteUser(userId)
+    } catch (error) {
+        // A retry after a lost response must converge if Clerk already deleted it.
+        if (!error || typeof error !== 'object' || !('status' in error) || error.status !== 404) throw error
+    }
+}
+
+export async function authenticate(req: Request, store: CloudStore, testClerkJwtKey?: string): Promise<AuthContext | null> {
     const deviceToken = req.headers.get('x-device-token')
     if (deviceToken) {
         const userId = store.userForDeviceToken(deviceToken)
@@ -125,8 +148,21 @@ export async function authenticate(req: Request, store: CloudStore): Promise<Aut
     const secretKey = process.env.CLERK_SECRET_KEY
     if (!secretKey) return null
     try {
-        const payload = await verifyToken(token, { secretKey })
-        return payload.sub ? { userId: payload.sub, via: 'clerk' } : null
+        const payload = await verifyToken(token, { secretKey, jwtKey: testClerkJwtKey })
+        if (!payload.sub) return null
+        const fva = payload.fva
+        const firstFactor = Array.isArray(fva) ? fva[0] : undefined
+        const clerkSession = typeof payload.sid === 'string' && payload.sid.length > 0 &&
+            Number.isSafeInteger(payload.iat) && typeof firstFactor === 'number' &&
+            Number.isSafeInteger(firstFactor) && firstFactor >= 0
+            ? { issued: payload.iat, firstFactorAgeMinutes: firstFactor } : undefined
+        const clerkAuthorizedParty = typeof payload.azp === 'string' ? payload.azp : undefined
+        return {
+            userId: payload.sub,
+            via: 'clerk',
+            ...(clerkSession && { clerkSession }),
+            ...(clerkAuthorizedParty && { clerkAuthorizedParty }),
+        }
     } catch {
         return null
     }

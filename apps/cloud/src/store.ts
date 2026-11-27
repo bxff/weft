@@ -1567,6 +1567,23 @@ export class CloudStore {
     })();
   }
 
+  accountExportPages(user: string): Array<{ doc: string; page: string }> {
+    return this.db.query<{ doc: string; page: string }, [string]>(`
+      SELECT doc, page FROM pages WHERE user_id=?1
+      UNION SELECT doc, page FROM page_snapshots WHERE user_id=?1
+      UNION SELECT doc, page FROM page_ops WHERE user_id=?1
+      UNION SELECT doc, page FROM overlays WHERE user_id=?1
+      UNION SELECT doc, page FROM assets WHERE user_id=?1
+      ORDER BY doc, page
+    `).all(user);
+  }
+
+  accountExportTemplates(user: string): Array<{ name: string; mime: string }> {
+    return this.db.query<{ name: string; mime: string }, [string]>(
+      "SELECT name, mime FROM templates WHERE user_id=? ORDER BY name",
+    ).all(user);
+  }
+
   /** Read all members of the recovery revision in the same SQLite snapshot.
    * Missing checkpoint files fail closed instead of replaying against empty ink. */
   readRecoveryPage(
