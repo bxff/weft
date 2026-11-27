@@ -1500,6 +1500,39 @@ export class CloudStore {
 
   /** An append receipt survives history truncation and suppresses a retry's
    * effects before even checking storage quota. */
+  /** A receipt may outlive the HTTP connection. Before SQLite certifies it,
+   * sync any new checkpoint files plus the current dependency and its
+   * directory entries. Do not change the normal publication path. */
+  private publishGuardedPage<T extends { kind: string }>(
+    user: string, doc: string, page: string, write: () => T,
+  ): T {
+    if (this.db.inTransaction) throw new Error("Guarded receipt requires an outer durable transaction");
+    const previous = this.db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
+    this.db.run("PRAGMA synchronous = FULL");
+    try {
+      return this.publishPage(user, doc, page, () => {
+        const result = write();
+        if (result.kind !== "accepted") return result;
+        const staged = new Set(this.stagedPageFiles);
+        const head = this.latestSnapshotRow(user, doc, page);
+        if (head) {
+          const path = this.existingSnapshotPath(head.path);
+          if (!path || statSync(path).size !== head.size) throw new SnapshotUnavailable();
+          staged.add(path);
+        }
+        if (staged.size) {
+          for (const path of staged) this.syncRecoveryPath(path);
+          this.syncRecoveryPath(join(this.filesDir, "snapshots"));
+          this.syncRecoveryPath(this.filesDir);
+          this.syncRecoveryPath(dirname(this.filesDir));
+        }
+        return result;
+      });
+    } finally {
+      this.db.run(`PRAGMA synchronous = ${previous}`);
+    }
+  }
+
   publishOpsOnce(
     user: string,
     doc: string,
@@ -1513,7 +1546,7 @@ export class CloudStore {
     | { kind: "reused" }
     | { kind: "stale"; currentSeq: number } {
     const hash = (baseSeq === undefined ? "" : `base:${baseSeq}:`) + sha256hex(bytes);
-    return this.publishPage(user, doc, page, () => {
+    return this.publishGuardedPage(user, doc, page, () => {
       const key: [string, string, string, string] = [user, doc, page, batchId];
       const prior = this.db.query<
         { request_hash: string; first_seq: number; last_seq: number },
@@ -1554,7 +1587,8 @@ export class CloudStore {
     batch?: SnapshotBatch,
   ): SnapshotPublicationResult<T> {
     const requestHash = publication ? (batch ? "batch:" : "") + sha256hex(bytes) : null;
-    return this.publishPage(user, doc, page, () => {
+    const publish = publication ? this.publishGuardedPage.bind(this) : this.publishPage.bind(this);
+    return publish(user, doc, page, () => {
       if (publication) {
         const receipt = this.db.query<
           { request_hash: string; base_seq: number; seq: number; merged: number },

@@ -260,3 +260,39 @@ test('reverting away an append target rejects its frozen batch without invisible
         cloud.close()
     }
 })
+
+test('a failed checkpoint flush rolls back guarded operations and their receipt', async () => {
+    const cloud = relay()
+    const id = crypto.randomUUID()
+    try {
+        const blank = RmDocument.empty(crypto.randomUUID()).serialize()
+        const seq = cloud.store.putSnapshot(...KEY, encodeSnapshot(blank, { shapes: [] }))
+        const raw = cloud.store as unknown as { syncRecoveryPath(path: string): void }
+        let faulted = false
+        raw.syncRecoveryPath = () => {
+            faulted = true
+            throw new Error('injected guarded ops durability failure')
+        }
+        let failed = false
+        try { failed = !(await cloud.request('ops-batch', guarded(body, seq), id)).ok }
+        catch { failed = true }
+        expect(faulted).toBe(true)
+        expect(failed).toBe(true)
+        using inspect = cloud.inspect()
+        expect(inspect.query('SELECT * FROM page_op_batch_receipts').all()).toEqual([])
+        expect(cloud.store.latestOpSeq(...KEY)).toBe(0)
+        expect(cloud.store.latestSnapshotSeq(...KEY)).toBe(seq)
+        cloud.restart()
+        const saved = await cloud.request('ops-batch', guarded(body, seq), id)
+        expect(saved.ok).toBe(true)
+        const receipt = await saved.json()
+        cloud.restart()
+        const retry = await cloud.request('ops-batch', guarded(body, seq), id)
+        expect(retry.ok).toBe(true)
+        expect(await retry.json()).toEqual(receipt)
+        expect(cloud.store.opsSince(...KEY, 0)).toHaveLength(2)
+        expect(inspect.query('SELECT * FROM page_op_batch_receipts').all()).toHaveLength(1)
+    } finally {
+        cloud.close()
+    }
+})

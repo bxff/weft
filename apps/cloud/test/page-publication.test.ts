@@ -762,3 +762,71 @@ test('a missing current checkpoint cannot re-seed an obsolete legacy page', () =
         rmSync(dir, { recursive: true, force: true })
     }
 })
+
+test.each(['checkpoint file', 'checkpoint directory'] as const)(
+    'a guarded snapshot never acknowledges before syncing its %s',
+    async fault => {
+        process.env.CLOUD_DEV_USER = '1'
+        const dir = mkdtempSync(join(tmpdir(), 'weft-guarded-receipt-sync-'))
+        const db = join(dir, 'relay.sqlite')
+        const files = join(db + '-files', 'snapshots')
+        let cloud = startCloud({ port: 0, db })
+        const baseSeq = cloud.store.putSnapshot(...PAGE_KEY, encodeSnapshot(blank, overlay))
+        const publication = crypto.randomUUID()
+        const bytes = encodeSnapshot(tabletFile(), overlay)
+        const publish = () => fetch(`http://localhost:${cloud.port}/api/documents/${DOC}/pages/${PAGE}/snapshot`, {
+            method: 'POST',
+            headers: {
+                authorization: `Bearer ${TOKEN}`,
+                'x-snapshot-publication-id': publication,
+                'x-snapshot-base-seq': String(baseSeq),
+            },
+            body: Buffer.from(bytes),
+        })
+        const store = cloud.store as unknown as { syncRecoveryPath(path: string): void }
+        const sync = store.syncRecoveryPath.bind(store)
+        const before = readdirSync(files)
+        let triggered = false
+        store.syncRecoveryPath = path => {
+            if ((fault === 'checkpoint directory' && path === files) ||
+                (fault === 'checkpoint file' && path.startsWith(files + '/'))) {
+                triggered = true
+                throw new Error('injected guarded receipt fsync failure')
+            }
+            sync(path)
+        }
+        const inspect = () => {
+            using dbInspect = new Database(db, { readonly: true })
+            return dbInspect.query<{ seq: number }, []>('SELECT seq FROM page_snapshot_receipts').all()
+        }
+        try {
+            let failed = false
+            try { failed = !(await publish()).ok } catch { failed = true }
+            expect(triggered).toBe(true)
+            expect(failed).toBe(true)
+            expect(inspect()).toEqual([])
+            expect(readdirSync(files)).toEqual(before)
+            expect(cloud.store.latestSnapshot(...PAGE_KEY)?.seq).toBe(baseSeq)
+
+            cloud.stop()
+            cloud = startCloud({ port: 0, db })
+            expect(inspect()).toEqual([])
+            // Simulate losing this successful response: retry the same wire
+            // bytes and ID after another independent store restart.
+            expect((await publish()).ok).toBe(true)
+            const saved = inspect()
+            expect(saved).toHaveLength(1)
+            expect(saved[0]!.seq).toBeGreaterThan(baseSeq)
+            cloud.stop()
+            cloud = startCloud({ port: 0, db })
+            const retry = await publish()
+            expect(retry.ok).toBe(true)
+            expect((await retry.json() as { seq: number }).seq).toBe(saved[0]!.seq)
+            expect(inspect()).toEqual(saved)
+            expect(cloud.store.latestSnapshot(...PAGE_KEY)?.seq).toBe(saved[0]!.seq)
+        } finally {
+            cloud.stop()
+            rmSync(dir, { recursive: true, force: true })
+        }
+    },
+)
