@@ -1,4 +1,5 @@
-//! Daemon self-update via GET /api/daemon/release.
+//! Test-only coverage for the old relay downloader and atomic update swap.
+//! No production caller: a relay-provided checksum does not authorize code.
 //!
 //! Sends If-None-Match = sha256 of the running binary. 304 = current, 404 = no
 //! release configured, 200 = new binary (sha verified before use). Swap is
@@ -7,40 +8,10 @@
 //! systemd's Restart=always relaunches the new binary at the same path.
 //! Never calls systemctl.
 //!
-//! First check is delayed so a boot-loop can't hammer the endpoint before
-//! startup reconcile finishes; later checks are hours apart.
 
 use std::path::Path;
-use std::time::Duration;
 
 use crate::cloud::CloudConfig;
-
-const FIRST_CHECK: Duration = Duration::from_secs(2 * 60);
-/// Matches the reconcile rhythm (~10 min): deploys reach every tablet within
-/// minutes; steady-state cost is one 304 header per check.
-const CHECK_EVERY: Duration = Duration::from_secs(10 * 60);
-
-pub fn spawn(config: CloudConfig) {
-    tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        tokio::time::sleep(FIRST_CHECK).await;
-        loop {
-            let result = match std::env::current_exe() {
-                Ok(exe) => check_once(&client, &config, &exe).await,
-                Err(e) => Err(format!("current_exe: {e}")),
-            };
-            match result {
-                Ok(true) => {
-                    eprintln!("update: binary swapped; exiting for systemd relaunch");
-                    std::process::exit(0);
-                }
-                Ok(false) => {}
-                Err(e) => eprintln!("update: check failed ({e}); will retry"),
-            }
-            tokio::time::sleep(CHECK_EVERY).await;
-        }
-    });
-}
 
 /// One update check. Ok(true) = a new binary is in place (caller exits).
 async fn check_once(

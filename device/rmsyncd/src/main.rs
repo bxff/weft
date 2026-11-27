@@ -8,6 +8,8 @@ mod dbus;
 mod recovery;
 mod server;
 mod store;
+// Keep the atomic-install regression tests, but ship no unsigned update path.
+#[cfg(test)]
 mod update;
 mod watch;
 
@@ -106,11 +108,7 @@ async fn main() {
     );
     if let Some(config) = cloud::load_config(&cloud_config_path) {
         let state_path = cloud_config_path.with_file_name("cloud-state.json");
-        cloud::spawn(state.clone(), config.clone(), state_path);
-        // self-update: polls the cloud's release binary; a swap exits(0) and
-        // systemd relaunches the new binary. Inert until the server sets
-        // WEFT_DAEMON_RELEASE (404 = nothing to do).
-        update::spawn(config);
+        cloud::spawn(state.clone(), config, state_path);
     }
 
     // A/B firmware-update survival (opt-in, off until device-verified on a real

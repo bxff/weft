@@ -28,8 +28,11 @@ Three screens answer "is everything working":
 3. **Usage counters** — `GET /api/admin/stats` (admin users only): request /
    429 / 507 counters, per-user storage, doc counts.
 
-To offer tablet updates from your own relay, set `WEFT_DAEMON_RELEASE` and,
-if needed, `WEFT_DAEMON_RELEASE_ARMV7` to the corresponding binaries.
+Update newer tablets by rerunning the desktop installer. They do not
+auto-install binaries from the relay: a checksum sent by the same server is
+not release authorization. Older installed builds are unchanged; migrate them
+by reinstalling from a trusted release or local build. The legacy relay
+release settings are not needed for newer builds.
 
 ## HTTPS: use your tunnel or Caddy
 
