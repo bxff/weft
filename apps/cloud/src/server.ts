@@ -220,10 +220,6 @@ export function startCloud(
       "Set only one of WEFT_PASSWORD (self-host) or CLERK_SECRET_KEY (hosted), not both.",
     );
   }
-  // Opt in only on weft.page’s hosted relay, not independently hosted Clerk installs.
-  // Keep this version aligned with the revision shown on /terms.
-  const hostedTermsVersion = process.env.WEFT_REQUIRE_HOSTED_TERMS === "1" && !selfHostEnabled()
-    ? "2026-11-27" : null;
   const store = new CloudStore(opts.db ?? ":memory:");
   // Drop pairing tokens unused for 30+ days (also pruned on device-list fetch)
   // so a leaked token can't live forever.
@@ -882,25 +878,13 @@ export function startCloud(
       // device-token caller must NOT mint (durable, revocation-proof) device
       // tokens. Same containment as /api/keys and /api/devices; without this an
       // api key silently upgrades to a device token that outlives its revocation.
-      if (path === "/api/pair" && (req.method === "GET" || req.method === "POST")) {
+      if (path === "/api/pair" && req.method === "POST") {
         if (auth.via === "apikey" || auth.via === "device") {
           return json({ error: "pairing requires sign-in" }, 403);
         }
-        const termsAccepted = !hostedTermsVersion || store.hasAcceptedHostedTerms(user, hostedTermsVersion);
-        const policy = { termsVersion: hostedTermsVersion, termsAccepted };
-        const privateResponse = { "cache-control": "private, no-store" };
-        if (req.method === "GET") return json(policy, 200, privateResponse);
-
-        const raw = await req.json().catch(() => null);
-        const body = (raw ?? {}) as { label?: unknown; acceptedTermsVersion?: unknown };
-        if (!termsAccepted && body.acceptedTermsVersion !== hostedTermsVersion) {
-          return json({ ...policy, error: "Accept the current Hosted Terms before pairing." }, 428, privateResponse);
-        }
-        const token = store.mintDeviceToken(
-          user, typeof body.label === "string" ? body.label : "tablet",
-          hostedTermsVersion ?? undefined,
-        );
-        return json({ token }, 200, privateResponse);
+        const body = (await req.json().catch(() => ({}))) as { label?: string };
+        const token = store.mintDeviceToken(user, body.label ?? "tablet");
+        return json({ token });
       }
 
       // API keys: third-party clients act on THIS user's notes. Key

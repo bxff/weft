@@ -24,44 +24,19 @@
     let token = $state<string | null>(null)
     let minting = $state(false)
     let mintError = $state<string | null>(null)
-    let termsVersion = $state<string | null>(null)
-    let termsAccepted = $state(true)
+    const hostedPairing = server === 'https://api.weft.page' || server === 'https://weft.page'
     let acceptTerms = $state(false)
-    let policyError = $state<string | null>(null)
-
-    async function loadPairingPolicy() {
-        policyError = null
-        try {
-            const t = await getAuthToken()
-            if (!t) throw new Error('Your session expired. Sign in again.')
-            const r = await fetch(`${server}/api/pair`, { headers: { authorization: `Bearer ${t}` } })
-            if (r.status === 404 || r.status === 405) return // relay predates pairing policy
-            if (!r.ok) throw new Error(`Couldn’t check pairing requirements (${r.status}).`)
-            const policy = (await r.json()) as { termsVersion: string | null; termsAccepted: boolean }
-            if (typeof policy.termsAccepted !== 'boolean' ||
-                (policy.termsVersion !== null && typeof policy.termsVersion !== 'string')) {
-                throw new Error('Invalid pairing requirements from the relay.')
-            }
-            termsVersion = policy.termsVersion
-            termsAccepted = policy.termsAccepted
-        } catch (e) {
-            policyError = e instanceof Error ? e.message : String(e)
-        }
-    }
 
     onMount(() => {
         // Don't auto-mint the token: it's a credential, so showing it on load
         // risks leaking it. Mint only on a deliberate click.
         void currentUserLabel()
-            .then(async (label) => {
-                userLabel = label
-                if (label) await loadPairingPolicy()
-            }, () => (userLabel = null))
+            .then((label) => (userLabel = label), () => (userLabel = null))
             .finally(() => (ready = true))
     })
 
     async function generate() {
-        if (policyError || (!termsAccepted && !acceptTerms)) return
+        if (hostedPairing && !acceptTerms) return
         minting = true
         mintError = null
         try {
@@ -72,21 +47,13 @@
                 r = await fetch(`${server}/api/pair`, {
                     method: 'POST',
                     headers: { authorization: `Bearer ${t}`, 'content-type': 'application/json' },
-                    body: JSON.stringify({
-                        label: 'tablet',
-                        ...(acceptTerms && termsVersion ? { acceptedTermsVersion: termsVersion } : {}),
-                    }),
+                    body: JSON.stringify({ label: 'tablet' }),
                 })
             } catch {
                 // fetch rejects (network error) when the server is unreachable
                 throw new Error(`Couldn't reach your weft server at ${server}. Is it running?`)
             }
             if (r.status === 401) throw new Error('Your session expired. Sign in again.')
-            if (r.status === 428) {
-                acceptTerms = false
-                await loadPairingPolicy()
-                throw new Error('Review the current Hosted Terms before pairing.')
-            }
             if (!r.ok) throw new Error(`Server error minting token (${r.status}).`)
             token = ((await r.json()) as { token: string }).token
         } catch (e) {
@@ -247,17 +214,8 @@
                     to your self-hosted server to fill in <code class="wf-icode">&lt;TOKEN&gt;</code>.
                 </span>
             </div>
-        {:else if policyError}
-            <p class="my-3 text-[13px]">
-                {policyError}
-                <button type="button" class="wf-link" onclick={async () => {
-                    ready = false
-                    await loadPairingPolicy()
-                    ready = true
-                }}>Try again</button>
-            </p>
         {:else if !token}
-            {#if !termsAccepted}
+            {#if hostedPairing}
                 <div class="my-3">
                     <input id="accept-hosted-terms" type="checkbox" bind:checked={acceptTerms} />
                     <label for="accept-hosted-terms">I agree to the Hosted Terms.</label>
@@ -267,7 +225,7 @@
                 </div>
             {/if}
             <div class="my-3 flex items-center gap-3">
-                <button type="button" class="wf-cta disabled:opacity-50" onclick={generate} disabled={minting || (!termsAccepted && !acceptTerms)} data-testid="generate-setup">
+                <button type="button" class="wf-cta disabled:opacity-50" onclick={generate} disabled={minting || (hostedPairing && !acceptTerms)} data-testid="generate-setup">
                     {minting ? 'Generating…' : 'Generate my token'}
                 </button>
                 <span class="text-[13px]" style="color: var(--gray-7)">
