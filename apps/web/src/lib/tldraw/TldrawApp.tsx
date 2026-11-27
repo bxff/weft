@@ -110,7 +110,8 @@ import { DeviceRichTextToolbar } from './DeviceTextToolbar'
 import { restorePageCamera } from './page-camera'
 import { weftRendererOptions } from './renderer-options'
 import { useInteracting } from './use-interacting'
-import { transport, clientId, authorUuid } from '../transport'
+import { transport, guardedPageTransport, clientId, authorUuid } from '../transport'
+import { guardedPageScope } from '../auth'
 import { apiBase } from '../settings'
 import { authHeaders, fetchBlobUrl } from '../authedAsset'
 import { idb } from '../idb'
@@ -821,11 +822,15 @@ export function TldrawApp({ docId, pageId, onController }: TldrawAppProps) {
     // captured here so the session-swap effect can (re)bind to it.
     const [editor, setEditor] = useState<Editor | null>(null)
 
-    const { controller, relay } = useMemo(
+    const { controller, relay, closeScopedTransport } = useMemo(
         () => {
-            const sessionTransport = transport()
+            const guarded = import.meta.env.PUBLIC_GUARDED_SAVES === '1'
+            const scope = guarded ? guardedPageScope() : null
+            const scopedTransport = scope ? guardedPageTransport(scope) : null
+            const sessionTransport = scopedTransport ?? transport()
             const controller = new StudioController({
                 transport: sessionTransport,
+                ...(guarded ? { guardedScope: scope?.key ?? null } : {}),
                 docId,
                 pageId,
                 clientId: clientId(),
@@ -847,7 +852,10 @@ export function TldrawApp({ docId, pageId, onController }: TldrawAppProps) {
                     )
                 },
             })
-            return { controller, relay: sessionTransport.baseUrl }
+            return {
+                controller, relay: sessionTransport.baseUrl,
+                closeScopedTransport: scopedTransport ? () => scopedTransport.close() : undefined,
+            }
         },
         [docId, pageId],
     )
@@ -941,8 +949,9 @@ export function TldrawApp({ docId, pageId, onController }: TldrawAppProps) {
                 delete live.__weftController
             }
             controller.dispose()
+            closeScopedTransport?.()
         }
-    }, [controller, docId, editor, onController, pageId, relay])
+    }, [closeScopedTransport, controller, docId, editor, onController, pageId, relay])
 
     // Stable main-menu component identity (depends only on controller+pageId),
     // so the geo/meta-driven `components` rebuild below doesn't remount the

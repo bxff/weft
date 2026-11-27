@@ -95,9 +95,9 @@ const STORE = 'pages'
 export class IdbStorage implements KeyValueStorage {
     private db: Promise<IDBDatabase>
 
-    constructor() {
+    constructor(databaseName = DB_NAME) {
         this.db = new Promise((resolve, reject) => {
-            const req = indexedDB.open(DB_NAME, 1)
+            const req = indexedDB.open(databaseName, 1)
             req.onupgradeneeded = () => req.result.createObjectStore(STORE)
             req.onsuccess = () => resolve(req.result)
             req.onerror = () => reject(req.error)

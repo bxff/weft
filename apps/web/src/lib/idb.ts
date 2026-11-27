@@ -7,3 +7,16 @@ import { IdbStorage, MemoryStorage, type KeyValueStorage } from '@weft/sync-engi
 
 export const idb: KeyValueStorage =
     typeof indexedDB !== 'undefined' ? new IdbStorage() : new MemoryStorage()
+
+
+const guardedReplicas = new Map<string, KeyValueStorage>()
+
+/** The legacy runtime cannot scan, evict or parse guarded frozen outboxes. */
+export function guardedReplicaStorage(scope: string): KeyValueStorage {
+    let storage = guardedReplicas.get(scope)
+    if (!storage) {
+        storage = new IdbStorage(`weft-guarded-v1/${scope}`)
+        guardedReplicas.set(scope, storage)
+    }
+    return storage
+}

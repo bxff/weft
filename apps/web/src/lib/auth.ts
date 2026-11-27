@@ -314,6 +314,28 @@ export function localPreferenceOwner(): string | null {
     return user ? `dev:${user}` : null
 }
 
+export type GuardedPageScope = { readonly relay: string; readonly owner: string; readonly key: string }
+
+/** No legacy or unattributed offline data is read into a guarded session. */
+export function guardedPageScope(): GuardedPageScope | null {
+    const owner = localPreferenceOwner()
+    if (!owner) return null
+    const relay = connection().cloudUrl
+    return { relay, owner, key: encodeURIComponent(JSON.stringify([relay, clerkPublishableKey(), owner])) }
+}
+
+export async function guardedBearer(scope: GuardedPageScope): Promise<string | null> {
+    if (guardedPageScope()?.key !== scope.key) return null
+    const token = await getAuthToken()
+    if (!token || guardedPageScope()?.key !== scope.key) return null
+    // Compare the bearer actually returned, not just the selected account
+    // before/after an asynchronous refresh.
+    const subject = tokenClaims(token)?.sub
+    const owner = clerkEnabled() ? (typeof subject === 'string' ? `clerk:${subject}` : null)
+        : token.startsWith('dev:') ? token : subject === 'self' ? 'self-hosted' : null
+    return owner === scope.owner ? token : null
+}
+
 /** Read the identity used for local selection. The relay still validates the token. */
 function clerkBearerAccount(token: string): string | null {
     const claims = tokenClaims(token)

@@ -89,7 +89,7 @@ import { adoptOrphanAuthor, cachedDocuments, ensureUniqueAuthorUuid, uuidv4 } fr
 import { fetchDataUrl, seedAssetBytes } from '../authedAsset'
 import { getPointsFromDrawSegments } from 'tldraw'
 import { decodeRmPointData } from '@weft/rm-ink'
-import { idb as storage } from '../idb'
+import { guardedReplicaStorage, idb as storage } from '../idb'
 import {
     clearReplicaInUse,
     primaryLockName,
@@ -128,6 +128,8 @@ function overlayShapeType(kind: OverlayShape['kind']): TLShape['type'] {
 
 export interface ControllerOptions {
     transport: Transport
+    // undefined = legacy build; null = guarded but the owner is not known.
+    guardedScope?: string | null
     docId: string
     pageId: string
     clientId: string
@@ -266,7 +268,8 @@ export class StudioController {
     private async electCachePrimary(): Promise<boolean> {
         const locks = (globalThis.navigator as Navigator | undefined)?.locks
         if (!locks) return true
-        const name = primaryLockName(`${this.opts.docId}/${this.opts.pageId}`)
+        const prefix = this.opts.guardedScope ? `guarded-v1/${this.opts.guardedScope}/` : ''
+        const name = primaryLockName(`${prefix}${this.opts.docId}/${this.opts.pageId}`)
         const immediate = await new Promise<boolean>((resolve) => {
             locks
                 .request(name, { ifAvailable: true }, (lock) => {
@@ -341,6 +344,9 @@ export class StudioController {
         )
         this.editor = editor
         this.photoOwner = libraryCacheScope()
+        const scope = this.opts.guardedScope
+        if (scope === null) throw new Error('Sign in to open a guarded notebook')
+        const pageStorage = scope === undefined ? storage : guardedReplicaStorage(scope)
         // Device + document metadata (geometry convention, template, pdf index).
         // Not awaited: the session opens from the local replica and needs no
         // network. The cached doclist is adopted synchronously (template/pdf rect
@@ -374,18 +380,18 @@ export class StudioController {
         }) ?? null
         // mark in-use synchronously so a concurrent app-start sweep can never
         // delete the replica we are about to open
-        try {
-            await useReplica(`${this.opts.docId}/${this.opts.pageId}`, this.replicaUse.signal)
-        } catch (error) {
+        if (scope === undefined) {
+            try {
+                await useReplica(`${this.opts.docId}/${this.opts.pageId}`, this.replicaUse.signal)
+            } catch (error) {
+                if (this.disposed) return
+                throw error
+            }
             if (this.disposed) return
-            throw error
+            markReplicaInUse(this.opts.docId, this.opts.pageId)
+            this.replicaMarkedInUse = true
+            void noteReplicaOpened(this.opts.docId, this.opts.pageId)
         }
-        if (this.disposed) return
-        markReplicaInUse(this.opts.docId, this.opts.pageId)
-        this.replicaMarkedInUse = true
-        // recency bookkeeping, off the open path: replica-sweep LRU index, and
-        // the cloud web-open record (flows into the tablet's lastOpened).
-        void noteReplicaOpened(this.opts.docId, this.opts.pageId)
         void this.recordWebOpen()
         // per-tab author (a duplicated tab mints a fresh identity) + cache-
         // primary election
@@ -396,7 +402,7 @@ export class StudioController {
         if (this.disposed) return
         const primaryAtOpen = cachePrimary || this.pageLockRelease !== null
         this.sessionOpening = OfflineSession.open(
-            storage,
+            pageStorage,
             this.opts.transport,
             this.opts.docId,
             this.opts.pageId,
@@ -405,7 +411,7 @@ export class StudioController {
                 authorUuid: author,
                 // history timeline label; CRDT identity stays authorUuid
                 historyAuthor: 'web',
-                guardedSaves: import.meta.env.PUBLIC_GUARDED_SAVES === '1',
+                guardedSaves: scope !== undefined,
                 cachePrimary: primaryAtOpen,
                 adoptOrphanAuthor,
                 onPatch: (patch) => this.onPatches([patch]),
