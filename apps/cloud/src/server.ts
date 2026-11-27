@@ -332,7 +332,7 @@ export function startCloud(
   const CORS = {
     "access-control-allow-origin": "*",
     "access-control-allow-headers":
-      "authorization, content-type, x-base-revision, x-client-id, x-device-token, x-api-key, range, if-none-match, x-if-snapshot-seq-gt",
+      "authorization, content-type, x-base-revision, x-client-id, x-device-token, x-api-key, range, if-none-match, x-if-snapshot-seq-gt, x-weft-recovery, x-weft-native-sha256",
     "access-control-allow-methods": "GET, PUT, POST, PATCH, DELETE, OPTIONS",
     // headers pdf.js + client caches read cross-origin (Range, revalidation etags)
     "access-control-expose-headers":
@@ -1225,14 +1225,22 @@ export function startCloud(
       // ZERO body — the tablet never re-downloads markers it already acted
       // on (owner requirement: the sweep must not weigh on the device).
       if (path === "/api/revisions" && req.method === "GET") {
-        const etag = `"${store.latestChangeSeq(user)}"`;
+        const recovery = auth.via === "device" && req.headers.get("x-weft-recovery") === "1";
+        const assets = recovery ? store.recoveryAssetRevisions(user) : undefined;
+        const pages = recovery ? store.pageRevisions(user) : undefined;
+        const etag = recovery
+          ? quoteEtag(new Bun.CryptoHasher("sha256").update(JSON.stringify([pages, assets])).digest("hex"))
+          : quoteEtag(String(store.latestChangeSeq(user)));
+        const headers = recovery
+          ? { etag, "cache-control": "private, no-store", vary: "X-Weft-Recovery" }
+          : { etag };
         if (req.headers.get("if-none-match") === etag) {
           return new Response(null, {
             status: 304,
-            headers: { etag, ...CORS },
+            headers: { ...headers, ...CORS },
           });
         }
-        return json({ pages: store.pageRevisions(user) }, 200, { etag });
+        return json({ pages: pages ?? store.pageRevisions(user), assets }, 200, headers);
       }
 
       // Current storage usage + quota per class (limit 0 = unlimited).
@@ -1999,6 +2007,28 @@ export function startCloud(
         const kind = pageMatch[3];
         if (kind === "rm") {
           if (req.method === "GET") {
+            if (req.headers.get("x-weft-recovery") === "1" && auth.via === "device") {
+              const recovery = store.readRecoveryPage(user, doc, page,
+                req.headers.get("x-weft-native-sha256"), req.headers.get("if-none-match"));
+              if (!recovery) return json({ error: "page not found" }, 404);
+              const headers = {
+                etag: recovery.etag, "cache-control": "private, no-store",
+                vary: "X-Weft-Recovery, X-Weft-Native-Sha256, Accept-Encoding",
+              };
+              if (!recovery.body) return new Response(null, {
+                status: 304, headers: { ...CORS, ...headers },
+              });
+              const [encoding] = acceptedEncodings(req, ["gzip", "identity"], ["gzip"]);
+              if (!encoding) return new Response(null, { status: 406, headers });
+              if (encoding === "gzip") {
+                const compressed = Readable.from([JSON.stringify(recovery.body)])
+                  .pipe(createGzip({ level: zlib.Z_BEST_SPEED }));
+                return new Response(Readable.toWeb(compressed) as unknown as ConstructorParameters<typeof Response>[0], {
+                  headers: { ...CORS, ...headers, "content-type": "application/json", "content-encoding": "gzip" },
+                });
+              }
+              return json(recovery.body, 200, headers);
+            }
             // op-mode page (#45): materialize .rm from the op log for
             // the codec-dumb daemon; legacy pages serve the blob.
             if (store.isOpModePage(user, doc, page)) {

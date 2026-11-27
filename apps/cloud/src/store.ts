@@ -200,7 +200,7 @@ export class CloudStore {
             );
             CREATE TABLE IF NOT EXISTS assets (
                 user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
-                file TEXT NOT NULL, bytes BLOB NOT NULL,
+                file TEXT NOT NULL, bytes BLOB NOT NULL, etag TEXT,
                 PRIMARY KEY (user_id, doc, page, file)
             );
             CREATE TABLE IF NOT EXISTS thumbnails (
@@ -355,6 +355,10 @@ export class CloudStore {
     this.db.run(
       "CREATE INDEX IF NOT EXISTS device_tokens_user ON device_tokens(user_id)",
     );
+    if (!(this.db.query<{ name: string }, []>("PRAGMA table_info(assets)").all())
+      .some((column) => column.name === "etag")) {
+      this.db.run("ALTER TABLE assets ADD COLUMN etag TEXT");
+    }
     this.initUsageTracking();
   }
 
@@ -1429,9 +1433,92 @@ export class CloudStore {
     bytes: Uint8Array,
   ): void {
     this.db.run(
-      "INSERT OR REPLACE INTO assets (user_id, doc, page, file, bytes) VALUES (?, ?, ?, ?, ?)",
-      [user, doc, page, file, bytes],
+      "INSERT OR REPLACE INTO assets (user_id, doc, page, file, bytes, etag) VALUES (?, ?, ?, ?, ?, ?)",
+      [user, doc, page, file, bytes, sha256hex(bytes)],
     );
+  }
+
+  /** Existing rows may lack a hash after upgrade. Their marker changes on
+   * the first subsequent PUT, and remains stable until the bytes are replaced. */
+  private assetMarker(rows: { file: string; etag: string | null }[]): string {
+    return sha256hex(Buffer.from(JSON.stringify(rows.map(({ file, etag }) => [file, etag]))));
+  }
+
+  /** A separate marker per page lets an asset-only overwrite wake the tablet
+   * even if the native revision and the retained change feed did not change. */
+  recoveryAssetRevisions(user: string): Record<string, string> {
+    const rows = this.db.query<
+      { doc: string; page: string; file: string; etag: string | null }, [string]
+    >("SELECT doc, page, file, etag FROM assets WHERE user_id=? ORDER BY doc, page, file").all(user);
+    const groups = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const key = `${row.doc}/${row.page}`;
+      const group = groups.get(key);
+      if (group) group.push(row);
+      else groups.set(key, [row]);
+    }
+    return Object.fromEntries([...groups].map(([key, group]) => [key, this.assetMarker(group)]));
+  }
+
+  /** Read all members of the recovery revision in the same SQLite snapshot.
+   * Missing checkpoint files fail closed instead of replaying against empty ink. */
+  readRecoveryPage(
+    user: string, doc: string, page: string,
+    knownNative: string | null, ifNoneMatch: string | null,
+  ) {
+    return this.db.transaction(() => {
+      const snapshot = this.latestSnapshotRow(user, doc, page);
+      const snapshotSeq = snapshot?.seq ?? 0;
+      const opSeq = this.latestOpSeq(user, doc, page);
+      const blob = snapshotSeq || opSeq ? null : this.getPage(user, doc, page);
+      if (!snapshotSeq && !opSeq && !blob) return null;
+      const revision = blob?.revision ?? opMarker(opSeq, snapshotSeq);
+      const legacyOverlay = blob ? this.getOverlay(user, doc, page) : null;
+      const rows = this.db.query<{ file: string; etag: string | null }, [string,string,string]>(
+        "SELECT file, etag FROM assets WHERE user_id=? AND doc=? AND page=? ORDER BY file",
+      ).all(user, doc, page);
+      const assetRevision = rows.length ? this.assetMarker(rows) : "";
+      const etagFor = (native: string) =>
+        `"${sha256hex(Buffer.from(JSON.stringify([revision, native, assetRevision, legacyOverlay])))}"`;
+      // The client must still hold the exact native bytes for a 304. Including
+      // their digest in the validator makes the common conditional check cheap.
+      if (knownNative && /^[a-f0-9]{64}$/.test(knownNative) && ifNoneMatch === etagFor(knownNative)) {
+        return { etag: ifNoneMatch, body: null };
+      }
+
+      if (this.truncationFloor(user, doc, page) > (snapshot?.op_seq ?? 0)) {
+        throw new Error("Recovery checkpoint is below the retained operation floor");
+      }
+      const checkpointPath = snapshot ? this.storedBlobPath(snapshot.path, "snapshots") : null;
+      if (snapshot && !checkpointPath) throw new Error("Invalid recovery checkpoint path");
+      const checkpoint = checkpointPath
+        ? decodeSnapshot(new Uint8Array(readFileSync(checkpointPath))) : null;
+      const ops = this.opsInRange(user, doc, page, snapshot?.op_seq ?? 0, opSeq);
+      const native = blob?.bytes ?? reconstructRm(checkpoint?.rm ?? null, ops, DEVICE_BRIDGE_AUTHOR);
+      const overlay: OverlayDocument = checkpoint?.overlay ?? (legacyOverlay ? JSON.parse(legacyOverlay) : { shapes: [] });
+      foldOverlayOps(overlay, ops);
+      const nativeSha256 = sha256hex(native);
+      const assets = rows.map(({ file, etag }) => {
+        const bytes = etag ? null : this.getAsset(user, doc, page, file);
+        if (!etag && !bytes) throw new Error("Recovery asset disappeared");
+        return { name: file, sha256: etag ?? sha256hex(bytes!) };
+      });
+      const names = new Set(assets.map(({ name }) => name));
+      const missingAssets = new Set<string>();
+      for (const [, item] of RmDocument.parse(native).tree().walk()) {
+        if (item.kind === "image" && (!item.filename || !names.has(item.filename))) {
+          missingAssets.add(item.filename ?? "<unresolved image>");
+        }
+      }
+      return {
+        etag: etagFor(nativeSha256),
+        body: {
+          revision, snapshotSeq, opSeq, nativeSha256, assetRevision,
+          nativeBase64: nativeSha256 === knownNative ? null : Buffer.from(native).toString("base64"),
+          overlay, assets, missingAssets: [...missingAssets],
+        },
+      };
+    })();
   }
 
   listAssets(user: string, doc: string, page: string): string[] {
