@@ -3204,6 +3204,11 @@ export class CloudStore {
     );
   }
 
+  /** Existing relay enrollment, without reading raw device credentials. */
+  hasPairedDevice(userId: string): boolean {
+    return !!this.db.query("SELECT 1 FROM device_tokens WHERE user_id=? LIMIT 1").get(userId);
+  }
+
   /** A user's paired devices. Returns the full token (owner-only session) so
    *  the UI can mask it but still offer copy; never rendered on screen raw. */
   listDeviceTokens(userId: string): {
