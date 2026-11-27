@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve, win32 } from "node:path";
 import { tmpdir } from "node:os";
+import type { RecoveryImport } from "./recovery-import";
 import { RmDocument, RootTextAuthorConflict } from "@weft/rm-format";
 import {
   reconstructRm,
@@ -205,6 +206,9 @@ export class CloudStore {
             );
             CREATE TABLE IF NOT EXISTS recovery_epochs (
                 user_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recovery_imports (
+                user_id TEXT PRIMARY KEY, digest TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS thumbnails (
                 user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
@@ -935,6 +939,51 @@ export class CloudStore {
       this.latestOpSeq(user, doc, page),
       this.latestSnapshotSeq(user, doc, page),
     );
+  }
+
+  /** Publish a validated restore to an empty account under one writer lock.
+   * New checkpoint files are retired on rollback by the normal publisher. */
+  restoreRecoveryNotebook(
+    user: string, data: RecoveryImport, digest: string,
+    storageCheck: (stage: "before" | "after") => void,
+  ): "created" | "replay" | "not-empty" {
+    const { notebook, pages } = data;
+    return this.publishPage(user, notebook.id, pages[0]!.id, () => {
+      const receipt = this.db.query<{ digest: string }, [string]>(
+        "SELECT digest FROM recovery_imports WHERE user_id=?",
+      ).get(user);
+      const list = JSON.parse(this.getDocuments(user)) as { documents?: { id?: unknown; deleted?: unknown }[] };
+      if (!Array.isArray(list.documents)) return "not-empty";
+      if (receipt?.digest === digest && list.documents.some(d => d.id === notebook.id && d.deleted !== true)) {
+        return "replay";
+      }
+      const hasRows = USAGE_TABLES.some(([table]) =>
+        !!this.db.query(`SELECT 1 FROM ${table} WHERE user_id=? LIMIT 1`).get(user));
+      if (receipt || list.documents.length || hasRows ||
+          this.db.query("SELECT 1 FROM device_tokens WHERE user_id=? LIMIT 1").get(user)) {
+        return "not-empty";
+      }
+      storageCheck("before");
+      const timestamp = Date.now();
+      this.putDocuments(user, JSON.stringify({
+        documents: [{ ...notebook, type: "notebook", parent: "", createdTime: timestamp, lastModified: timestamp }],
+      }));
+      for (const page of pages) {
+        for (const { name, bytes } of page.assets) {
+          this.putAsset(user, notebook.id, page.id, name, bytes);
+        }
+        this.putSnapshot(user, notebook.id, page.id, encodeSnapshot(page.native, page.overlay), false, 0);
+        if (page.currentNative) {
+          const base = this.deviceRevision(user, notebook.id, page.id);
+          const { changed } = this.applyDevicePut(user, notebook.id, page.id, page.currentNative, base, "recovery");
+          if (changed) continue; // the existing merge already recorded the head
+        }
+        this.recordOpChange(user, notebook.id, page.id, "recovery");
+      }
+      storageCheck("after");
+      this.db.run("INSERT INTO recovery_imports (user_id, digest) VALUES (?,?)", [user, digest]);
+      return "created";
+    });
   }
 
   /** Run a synchronous page write under SQLite's write lock. New snapshot
