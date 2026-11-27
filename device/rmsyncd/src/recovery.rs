@@ -305,6 +305,31 @@ pub(crate) fn discard_staged_assets(
     };
 }
 
+// A previous commit may have renamed the manifest but failed this barrier.
+// A conditional relay revalidation must repair it before claiming protection.
+pub(crate) fn sync_manifest_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let mut failures = MANIFEST_SYNC_FAILURES.lock().unwrap();
+        if let Some(index) = failures.iter().position(|path| path == dir) {
+            failures.swap_remove(index);
+            return Err(io::Error::other("injected manifest directory sync failure"));
+        }
+    }
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(test)]
+static MANIFEST_SYNC_FAILURES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn fail_next_manifest_sync(dir: &Path) {
+    MANIFEST_SYNC_FAILURES
+        .lock()
+        .unwrap()
+        .push(dir.to_path_buf());
+}
+
 pub(crate) fn commit(
     dir: &Path,
     checkpoint: Checkpoint,
@@ -340,7 +365,7 @@ pub(crate) fn commit(
             }
             write_recovery_file(dir, "checkpoint.json", &manifest)?;
             manifest_renamed = true;
-            std::fs::File::open(dir)?.sync_all()?;
+            sync_manifest_directory(dir)?;
             remove_obsolete(dir, &checkpoint, &base);
             Ok(())
         })();

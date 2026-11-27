@@ -1622,7 +1622,9 @@ async fn pull_page_inner(
         return false;
     };
     if r.status().as_u16() == 304 {
-        let Some(saved) = verified else { return false };
+        let (Some(saved), Some(dir)) = (verified, dir.as_deref()) else {
+            return false;
+        };
         if cloud.revisions.get(&key) != Some(&saved.head.revision)
             || state
                 .store
@@ -1630,10 +1632,12 @@ async fn pull_page_inner(
                 .as_ref()
                 .map(|(_, rev)| rev)
                 != Some(&local_rev)
-            || !dir
-                .as_deref()
-                .is_some_and(|dir| recovery::verify_files(dir, saved))
+            || !recovery::verify_files(dir, saved)
         {
+            return false;
+        }
+        if let Err(error) = recovery::sync_manifest_directory(dir) {
+            eprintln!("cloud: recovery durability check for {doc}/{page} failed: {error}");
             return false;
         }
         cloud
@@ -2497,6 +2501,8 @@ mod tests {
         let advertised_native = native_sha.clone();
         let page_hits = Arc::new(AtomicUsize::new(0));
         let pages_seen = page_hits.clone();
+        let page_not_modified = Arc::new(AtomicUsize::new(0));
+        let page_not_modified_seen = page_not_modified.clone();
         let key = format!("{STAMP_DOC}/{STAMP_PAGE}");
         let revision_key = key.clone();
         let relay = Router::new()
@@ -2523,6 +2529,7 @@ mod tests {
             .route("/api/documents/{doc}/pages/{page}/rm", get(move |headers: HeaderMap| {
                 let v = page_variant.load(Ordering::Relaxed);
                 let sha = advertised_native.clone();
+                let page_not_modified_seen = page_not_modified_seen.clone();
                 pages_seen.fetch_add(1, Ordering::Relaxed);
                 async move {
                     if !headers.contains_key("x-weft-recovery") {
@@ -2533,6 +2540,7 @@ mod tests {
                     let digest = crate::store::sha256_hex(if v == 1 { old } else { new });
                     let tag = format!(r#""checkpoint-{v}""#);
                     if headers.get("if-none-match").is_some_and(|h| h == &tag) {
+                        page_not_modified_seen.fetch_add(1, Ordering::Relaxed);
                         return (StatusCode::NOT_MODIFIED, "").into_response();
                     }
                     ([("etag", tag)], axum::Json(serde_json::json!({
@@ -2700,9 +2708,32 @@ mod tests {
         );
 
         std::fs::remove_dir(blocked).unwrap();
+        // Fail after the new manifest is visible, but before its directory
+        // entry is confirmed durable. Until repair, only generation 1 is protected.
+        recovery::fail_next_manifest_sync(&path);
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
         assert_eq!(recovery::load(&path).unwrap().etag, "\"checkpoint-2\"");
-        assert!(!fallback.exists());
+        assert_eq!(cloud.protected[&key].1, "assets-1");
+        assert_eq!(cloud.pulled_asset_revisions[&key], "assets-1");
+        assert!(fallback.exists());
+        let not_modified_before = page_not_modified.load(Ordering::Relaxed);
+        // A real 304 must not acknowledge the renamed manifest if the
+        // repairing fsync also fails. On the next 304 repair and acknowledge.
+        recovery::fail_next_manifest_sync(&path);
+        reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
+        assert_eq!(
+            page_not_modified.load(Ordering::Relaxed),
+            not_modified_before + 1
+        );
+        assert_eq!(cloud.protected[&key].1, "assets-1");
+        assert_eq!(cloud.pulled_asset_revisions[&key], "assets-1");
+        reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
+        assert_eq!(
+            page_not_modified.load(Ordering::Relaxed),
+            not_modified_before + 2
+        );
+        assert_eq!(cloud.protected[&key].1, "assets-2");
+        assert_eq!(cloud.pulled_asset_revisions[&key], "assets-2");
         let replacement = path.join(format!("{}.asset", crate::store::sha256_hex(new)));
         assert_eq!(std::fs::read(replacement).unwrap(), new);
         assert!(!native_asset.exists());
