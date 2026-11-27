@@ -171,3 +171,61 @@ test("a device-authorized source upload waiting on its body cannot write after t
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+const receiptTables = {
+  page_op_batch_receipts: "batch_id TEXT NOT NULL, request_hash TEXT NOT NULL, first_seq INTEGER NOT NULL, last_seq INTEGER NOT NULL, PRIMARY KEY (user_id, doc, page, batch_id)",
+  page_snapshot_receipts: "publication_id TEXT NOT NULL, request_hash TEXT NOT NULL, base_seq INTEGER NOT NULL, seq INTEGER NOT NULL, merged INTEGER NOT NULL, PRIMARY KEY (user_id, doc, page, publication_id)",
+} as const;
+
+test("purge handles guarded-save migration, including orphan receipts and a peer with colliding IDs", () => {
+  const root = mkdtempSync(join(tmpdir(), "weft-account-receipts-"));
+  const path = join(root, "relay.db");
+  const original = new CloudStore(path);
+  const db = new Database(path);
+  try {
+    for (const [table, definition] of Object.entries(receiptTables)) {
+      db.run(`CREATE TABLE IF NOT EXISTS ${table} (
+        user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL, ${definition}
+      ) WITHOUT ROWID`);
+      for (const user of [target, other]) {
+        const values = [user, doc, page, "id", "hash", 1, 1, ...(table === "page_snapshot_receipts" ? [0] : [])];
+        db.run(`INSERT INTO ${table} VALUES (${values.map(() => "?").join(",")})`, values);
+      }
+    }
+    // Run against the already-open relay rather than relying on restart.
+    const names = Object.keys(receiptTables);
+    expect(planRelayAccountPurge(db, target).rows.filter(row => names.includes(row.table)))
+      .toEqual(names.map(table => ({ table, count: 1 })));
+    original.stageAccountPurge(target);
+    for (const table of names) {
+      expect(db.query(`SELECT user_id FROM ${table}`).all()).toEqual([{ user_id: other }]);
+      expect(() => db.run(`UPDATE ${table} SET user_id=? WHERE user_id=?`, [target, other]))
+        .toThrow("Account is fenced");
+      expect(() => db.run(`INSERT INTO ${table} SELECT ?,doc,page,${table === "page_snapshot_receipts"
+        ? "publication_id,request_hash,base_seq,seq,merged" : "batch_id,request_hash,first_seq,last_seq"}
+        FROM ${table} WHERE user_id=?`, [target, other])).toThrow("Account is fenced");
+    }
+  } finally {
+    db.close();
+    close(original);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("refuses to erase against a receipt table with an unreviewed schema", () => {
+  const root = mkdtempSync(join(tmpdir(), "weft-account-receipt-schema-"));
+  const store = new CloudStore(join(root, "relay.db"));
+  const db = connection(store);
+  try {
+    db.run(`CREATE TABLE IF NOT EXISTS page_op_batch_receipts (
+      user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
+      ${receiptTables.page_op_batch_receipts}
+    ) WITHOUT ROWID`);
+    db.run("ALTER TABLE page_op_batch_receipts ADD COLUMN unexpected TEXT");
+    expect(() => store.stageAccountPurge(target)).toThrow("Relay receipt schema changed");
+    expect(store.isAccountFenced(target)).toBe(false);
+  } finally {
+    close(store);
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -1,9 +1,18 @@
 import type { Database } from "bun:sqlite";
 import { closeSync, fsyncSync, lstatSync, openSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { ACCOUNT_PURGE_ORDER, planRelayAccountPurge } from "./account-purge-plan";
+import { ACCOUNT_PURGE_ORDER, accountReceiptTables, planRelayAccountPurge } from "./account-purge-plan";
 
 type BlobKey = { folder: "" | "snapshots"; name: string };
+
+function installAccountWriteFence(db: Database, table: string): void {
+  for (const event of ["INSERT", "UPDATE"] as const) {
+    db.run(`CREATE TRIGGER IF NOT EXISTS account_fence_${table}_${event}
+      BEFORE ${event} ON ${table}
+      WHEN EXISTS(SELECT 1 FROM account_purge_fences WHERE user_id=NEW.user_id)
+      BEGIN SELECT RAISE(ABORT, 'Account is fenced'); END`);
+  }
+}
 
 export function initAccountPurge(db: Database): void {
   db.transaction(() => {
@@ -16,13 +25,8 @@ export function initAccountPurge(db: Database): void {
     ) WITHOUT ROWID`);
     // Authoritative admission even for body reads that started before the
     // fence was written. Device tokens/configuration alone cannot recreate it.
-    for (const table of ACCOUNT_PURGE_ORDER) {
-      for (const event of ["INSERT", "UPDATE"] as const) {
-        db.run(`CREATE TRIGGER IF NOT EXISTS account_fence_${table}_${event}
-          BEFORE ${event} ON ${table}
-          WHEN EXISTS(SELECT 1 FROM account_purge_fences WHERE user_id=NEW.user_id)
-          BEGIN SELECT RAISE(ABORT, 'Account is fenced'); END`);
-      }
+    for (const table of [...ACCOUNT_PURGE_ORDER, ...accountReceiptTables(db)]) {
+      installAccountWriteFence(db, table);
     }
   }).immediate();
 }
@@ -55,11 +59,14 @@ export function stageAccountPurge(db: Database, userId: string): void {
       const plan = planRelayAccountPurge(db, userId);
       const record = db.query("INSERT OR IGNORE INTO account_purge_files VALUES (?,?,?)");
       for (const { folder, name } of plan.blobs) record.run(userId, folder, name);
-      for (const table of ACCOUNT_PURGE_ORDER) {
+      for (const { table } of plan.rows) {
+        // A compatible migration may have run since this connection opened.
+        // Install all expected triggers under the same lock before fencing.
+        installAccountWriteFence(db, table);
         db.run(`DELETE FROM ${table} WHERE user_id=?`, [userId]);
       }
       // DELETE triggers above can derive account rows until their turn in
-      // ACCOUNT_PURGE_ORDER. Publish the fence last under the same writer lock.
+      // the purge order. Publish the fence last under the same writer lock.
       db.run("INSERT INTO account_purge_fences VALUES (?,?)", [userId, Date.now()]);
     }).immediate();
   } finally {
