@@ -148,6 +148,10 @@ struct CloudState {
     /// In-memory install path, derived from the configured relay identity.
     #[serde(skip)]
     recovery_root: Option<PathBuf>,
+    #[serde(skip)]
+    recovery_budget: Option<recovery::Budget>,
+    #[serde(skip)]
+    recovery_after: Option<String>,
     /// Last asset generation applied independently of native page revisions.
     #[serde(default)]
     pulled_asset_revisions: HashMap<String, String>,
@@ -274,7 +278,9 @@ pub fn spawn(state: AppState, config: CloudConfig, state_path: PathBuf) {
                     // x-base-revision, so back up the file and start fresh. The
                     // server's empty-base fail-safe (no absence-deletions without
                     // a causal claim) makes the fresh start safe.
-                    eprintln!("cloud: cloud-state.json CORRUPT ({e}); backing up and starting fresh");
+                    eprintln!(
+                        "cloud: cloud-state.json CORRUPT ({e}); backing up and starting fresh"
+                    );
                     let _ = std::fs::copy(&state_path, state_path.with_extension("json.corrupt"));
                     CloudState::default()
                 }
@@ -282,7 +288,18 @@ pub fn spawn(state: AppState, config: CloudConfig, state_path: PathBuf) {
             Err(_) => CloudState::default(), // genuinely absent: fresh install
         };
         cloud = reconcile_state_identity(cloud, &identity);
-        cloud.recovery_root = Some(state_path.with_file_name("recovery-v1").join(identity));
+        if std::env::var("WEFT_TABLET_RECOVERY").as_deref() == Ok("1") {
+            let root = state_path.with_file_name("recovery-v1");
+            match recovery::Budget::open(&root) {
+                Ok(budget) => {
+                    cloud.recovery_budget = Some(budget);
+                    cloud.recovery_root = Some(root.join(identity));
+                    // Audit saved files before reusing their generation after restart.
+                    cloud.pulled_asset_revisions.clear();
+                }
+                Err(e) => eprintln!("cloud: tablet recovery disabled: {e}"),
+            }
+        }
         let mut events = state.events.subscribe();
         // The WebSocket wake (below) is the primary web->tablet path (~300ms).
         // The periodic tick is a low-frequency fallback plus the routine
@@ -312,7 +329,15 @@ pub fn spawn(state: AppState, config: CloudConfig, state_path: PathBuf) {
         let exclusions = refresh_exclusions(&state, &client, &config, &mut cloud).await;
         push_documents(&state, &client, &config, exclusions.as_ref()).await;
         let mut sweep_etag: Option<String> = None;
-        reconcile_all(&state, &client, &config, &mut cloud, exclusions.as_ref(), &mut sweep_etag).await;
+        reconcile_all(
+            &state,
+            &client,
+            &config,
+            &mut cloud,
+            exclusions.as_ref(),
+            &mut sweep_etag,
+        )
+        .await;
         save(&state_path, &cloud);
 
         let mut ticks: u64 = 0;
@@ -390,6 +415,10 @@ pub fn spawn(state: AppState, config: CloudConfig, state_path: PathBuf) {
                     // event left behind. Cheap when in sync.
                     if ticks % 40 == 0 {
                         reconcile_all(&state, &client, &config, &mut cloud, exclusions.as_ref(), &mut sweep_etag).await;
+                    } else if cloud.recovery_after.is_some() {
+                        // Continue bounded recovery backfill only after the
+                        // ordinary sync work for this tick has completed.
+                        reconcile_current_pulls(&state, &client, &config, &mut cloud, &mut sweep_etag).await;
                     }
                     save(&state_path, &cloud);
                 }
@@ -494,7 +523,6 @@ fn save(path: &PathBuf, cloud: &CloudState) {
     }
 }
 
-
 /// Send a request honoring ONE 429 Retry-After pause. The initial reconcile
 /// of a large library issues hundreds of sequential PUTs and can trip the
 /// server's per-user rate bucket; sleeping the advertised interval and
@@ -508,7 +536,9 @@ async fn send_paced(req: reqwest::RequestBuilder) -> Result<reqwest::Response, r
     if resp.status().as_u16() != 429 {
         return Ok(resp);
     }
-    let Some(retry_req) = retry else { return Ok(resp) };
+    let Some(retry_req) = retry else {
+        return Ok(resp);
+    };
     let wait = resp
         .headers()
         .get("retry-after")
@@ -663,7 +693,10 @@ async fn push_assets(
         let Ok(bytes) = std::fs::read(entry.path()) else {
             continue;
         };
-        let url = format!("{}/api/documents/{doc}/pages/{page}/assets/{name}", config.url);
+        let url = format!(
+            "{}/api/documents/{doc}/pages/{page}/assets/{name}",
+            config.url
+        );
         match send_paced(
             client
                 .put(&url)
@@ -729,7 +762,10 @@ async fn push_thumbnail(
         Ok(r) if r.status().is_success() => {
             cloud.thumbnails.insert(key, mtime);
         }
-        Ok(r) => eprintln!("cloud: thumbnail push {doc}/{page} failed: HTTP {}", r.status()),
+        Ok(r) => eprintln!(
+            "cloud: thumbnail push {doc}/{page} failed: HTTP {}",
+            r.status()
+        ),
         Err(e) => eprintln!("cloud: thumbnail push {doc}/{page} unreachable ({e})"),
     }
 }
@@ -952,11 +988,15 @@ async fn push_templates(
         }
     }
     for (name, (_, path, mime)) in best {
-        let Some(mtime) = mtime_ms(&path) else { continue };
+        let Some(mtime) = mtime_ms(&path) else {
+            continue;
+        };
         if cloud.templates.get(&name) == Some(&mtime) {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         let url = format!("{}/api/templates/{}", config.url, pct(&name));
         match send_paced(
             client
@@ -1008,35 +1048,29 @@ async fn reconcile_pulls(
     docs: &[crate::store::DocEntry],
     etag: &mut Option<String>,
 ) {
-    let mut req = client
-        .get(format!("{}/api/revisions", config.url))
-        .header("x-device-token", &config.token)
-        .header("x-weft-recovery", "1");
-    if let Some(tag) = etag.as_deref() {
-        req = req.header("if-none-match", tag);
-    }
-    let Ok(r) = req.send().await else {
-        return;
-    };
-    if r.status().as_u16() == 304 {
-        return; // nothing changed cloud-side since the last sweep
-    }
-    if !r.status().is_success() {
-        return; // an old cloud without the route: the change feed still works
-    }
-    let fresh_etag = r
-        .headers()
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    let Ok(body) = r.json::<serde_json::Value>().await else {
-        return;
+    let recovery_enabled = cloud.recovery_root.is_some();
+    let inventory = read_revisions(client, config, etag.as_deref(), recovery_enabled).await;
+    let (fresh_etag, body) = match inventory {
+        Some((tag, Some(body))) => (tag, body),
+        Some((_, None)) => return, // unchanged
+        None if recovery_enabled => {
+            // Recovery index limits or faults must not disable the ordinary
+            // divergence repair. Do not memoize this fallback for recovery.
+            let Some((_, Some(body))) = read_revisions(client, config, None, false).await else {
+                return;
+            };
+            (None, body)
+        }
+        None => return, // old relay without an inventory: change feed still works
     };
     let Some(pages) = body.get("pages").and_then(|v| v.as_object()) else {
         return;
     };
-    let asset_markers = body.get("assets").and_then(|v| v.as_object());
+    let asset_markers = recovery_enabled
+        .then(|| body.get("assets").and_then(|v| v.as_object()))
+        .flatten();
     let mut all_ok = true;
+    let mut capture = Vec::new();
     for doc in docs {
         for page in &doc.pages {
             let key = format!("{}/{}", doc.id, page.id);
@@ -1049,32 +1083,48 @@ async fn reconcile_pulls(
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
             });
-            // Load once per process so steady-state sweeps don't parse every
-            // checkpoint overlay. The stored generation is separate from sync.
-            if asset_marker.is_some() && !cloud.protected.contains_key(&key) {
-                if let Some(saved) = recovery_dir(cloud, &doc.id, &page.id)
-                    .as_deref()
-                    .and_then(recovery::load)
-                {
-                    cloud
-                        .protected
-                        .insert(key.clone(), (saved.head.revision, saved.asset_revision));
-                }
-            }
-            let recovery_needed = needs_recovery(cloud, &key, cloud_rev, asset_marker);
-            if recovery_needed
-                || needs_pull(cloud.revisions.get(&key).map(String::as_str), cloud_rev)
+            if needs_pull(cloud.revisions.get(&key).map(String::as_str), cloud_rev)
+                && !pull_page(state, client, config, cloud, &doc.id, &page.id).await
             {
-                eprintln!("cloud: reconcile sweep pulling {key} (cloud at {cloud_rev})");
-                if !pull_page(state, client, config, cloud, &doc.id, &page.id).await
-                    || needs_recovery(cloud, &key, cloud_rev, asset_marker)
-                {
-                    // Native feed progress stays independent of protection.
-                    // Don't cache a 304 validator over an incomplete capture.
-                    all_ok = false;
-                }
+                all_ok = false;
+            }
+            if needs_recovery(cloud, &key, cloud_rev, asset_marker) {
+                capture.push((
+                    key,
+                    doc.id.as_str(),
+                    page.id.as_str(),
+                    cloud_rev,
+                    asset_marker,
+                ));
             }
         }
+    }
+    capture.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let start = cloud.recovery_after.as_ref().map_or(0, |after| {
+        capture.partition_point(|(key, ..)| key <= after) % capture.len().max(1)
+    });
+    let deadline = tokio::time::Instant::now() + RECOVERY_TIMEOUT;
+    cloud.recovery_after = None;
+    for (i, (key, doc, page, cloud_rev, asset_marker)) in capture
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(capture.len())
+        .enumerate()
+    {
+        if i >= 8 || tokio::time::Instant::now() >= deadline {
+            all_ok = false;
+            break;
+        }
+        if !pull_page_inner(state, client, config, cloud, doc, page, Some(deadline)).await
+            || needs_recovery(cloud, key, cloud_rev, *asset_marker)
+        {
+            all_ok = false;
+        }
+        cloud.recovery_after = Some(key.clone());
+    }
+    if all_ok {
+        cloud.recovery_after = None;
     }
     // Commit the validator only after a fully-successful sweep: a partial
     // sweep behind a cached 304 would leave the failed pages unhealed until
@@ -1082,6 +1132,40 @@ async fn reconcile_pulls(
     if all_ok {
         *etag = fresh_etag;
     }
+}
+
+async fn read_revisions(
+    client: &reqwest::Client,
+    config: &CloudConfig,
+    etag: Option<&str>,
+    capture: bool,
+) -> Option<(Option<String>, Option<serde_json::Value>)> {
+    let mut req = client
+        .get(format!("{}/api/revisions", config.url))
+        .header("x-device-token", &config.token);
+    if capture {
+        req = req.header("x-weft-recovery", "1").timeout(RECOVERY_TIMEOUT);
+    }
+    if let Some(tag) = etag {
+        req = req.header("if-none-match", tag);
+    }
+    let response = req.send().await.ok()?;
+    if response.status().as_u16() == 304 {
+        return Some((None, None));
+    }
+    let response = response.error_for_status().ok()?;
+    let tag = response
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let body: serde_json::Value = if capture {
+        bounded_json(response, RECOVERY_RESPONSE_LIMIT).await?
+    } else {
+        response.json().await.ok()?
+    };
+    body.get("pages")?.as_object()?;
+    Some((tag, Some(body)))
 }
 
 fn needs_recovery(
@@ -1092,8 +1176,12 @@ fn needs_recovery(
 ) -> bool {
     asset_rev.is_some_and(|asset| {
         cloud.pulled_asset_revisions.get(key).map(String::as_str) != Some(asset)
-            || (cloud.recovery_root.is_some() && cloud.protected.get(key)
-                .map(|(rev, assets)| (rev.as_str(), assets.as_str())) != Some((native_rev, asset)))
+            || (cloud.recovery_root.is_some()
+                && cloud
+                    .protected
+                    .get(key)
+                    .map(|(rev, assets)| (rev.as_str(), assets.as_str()))
+                    != Some((native_rev, asset)))
     })
 }
 
@@ -1267,7 +1355,8 @@ async fn pull_asset(
     name: &str,
     expected: Option<&str>,
     prev: Option<(&std::path::Path, &str)>,
-    synced_mtime: Option<u64>,
+    budget: Option<&mut recovery::Budget>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Option<(bool, Option<u64>)> {
     if !crate::store::valid_asset_filename(name) {
         return None;
@@ -1277,15 +1366,15 @@ async fn pull_asset(
     if expected.is_some() && expected == before.as_deref() {
         return Some((false, mtime_ms(&local)));
     }
-    if let (Some(expected), Some((_, previous)), Some(existing)) =
-        (expected, prev, before.as_deref())
-    {
-        if existing != previous
-            && existing != expected
-            && !synced_mtime.is_some_and(|mtime| mtime_ms(&local) == Some(mtime))
-        {
-            // Divergent local bytes deserve the ordinary upload/reconciliation
-            // path, not an overwrite by a stale installed checkpoint.
+    if expected.is_none() && before.is_some() {
+        // Ordinary sync retains its original filename-immutable behavior.
+        return Some((false, mtime_ms(&local)));
+    }
+    if let Some(existing) = before.as_deref() {
+        // A first backfill or an unsent local edit cannot be overwritten on
+        // the strength of an mtime or a matching filename. Only replace
+        // bytes known to belong to the previous protected generation.
+        if !prev.is_some_and(|(_, previous)| existing == previous) {
             return None;
         }
     }
@@ -1296,6 +1385,9 @@ async fn pull_asset(
     let mut request = client.get(url).header("x-device-token", &config.token);
     if let Some(hash) = before.as_deref() {
         request = request.header("if-none-match", format!(r#""{hash}""#));
+    }
+    if let Some(deadline) = deadline {
+        request = request.timeout(deadline.checked_duration_since(tokio::time::Instant::now())?);
     }
     let response = request.send().await.ok()?;
     if response.status().as_u16() == 304 {
@@ -1339,7 +1431,7 @@ async fn pull_asset(
         return Some((false, mtime_ms(&local)));
     }
     if let Some((dir, previous)) = prev.filter(|(_, old)| before.as_deref() == Some(*old)) {
-        recovery::preserve_asset(dir, previous, &local).ok()?;
+        recovery::preserve_asset(dir, previous, &local, budget).ok()?;
     }
     store.write_asset(doc, page, name, &bytes).ok()?;
     if expected.is_some() {
@@ -1360,6 +1452,7 @@ async fn pull_assets(
     manifest: Option<&[AssetDigest]>,
     previous: Option<(&std::path::Path, &Checkpoint)>,
     changed: &mut Vec<String>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Option<()> {
     let legacy;
     let entries = match manifest {
@@ -1401,6 +1494,9 @@ async fn pull_assets(
     };
     let mut complete = true;
     for asset in entries {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return None;
+        }
         let digest = (!asset.sha256.is_empty()).then_some(asset.sha256.as_str());
         let previous = previous.and_then(|(dir, saved)| {
             let old = saved
@@ -1420,14 +1516,16 @@ async fn pull_assets(
             &asset.name,
             digest,
             previous,
-            cloud.assets.get(&key).copied(),
+            cloud.recovery_budget.as_mut(),
+            deadline,
         )
-        .await else {
+        .await
+        else {
             complete = false;
             continue;
         };
-        if let Some(mtime) = mtime {
-            // Do not echo the freshly downloaded bytes back upstream.
+        if let Some(mtime) = mtime.filter(|_| replaced || digest.is_some()) {
+            // Do not echo fetched or exact hash-verified bytes upstream.
             cloud.assets.insert(key, mtime);
         }
         if replaced {
@@ -1462,21 +1560,67 @@ async fn pull_page(
     doc: &str,
     page: &str,
 ) -> bool {
+    pull_page_inner(state, client, config, cloud, doc, page, None).await
+}
+
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const RECOVERY_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+
+async fn bounded_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Option<T> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > limit as u64)
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+async fn pull_page_inner(
+    state: &AppState,
+    client: &reqwest::Client,
+    config: &CloudConfig,
+    cloud: &mut CloudState,
+    doc: &str,
+    page: &str,
+    deadline: Option<tokio::time::Instant>,
+) -> bool {
+    let capture = deadline.is_some();
     if !crate::store::safe_id(doc) || !crate::store::safe_id(page) {
         return false;
     }
     let key = format!("{doc}/{page}");
-    let dir = recovery_dir(cloud, doc, page);
+    let dir = capture.then(|| recovery_dir(cloud, doc, page)).flatten();
     let saved = dir.as_deref().and_then(recovery::load);
     let (local_bytes, local_rev) = state.store.read_page(doc, page).unwrap_or_default();
+    let assets_dir = state.store.xochitl_dir.join(doc).join(page);
+    let verified = saved.as_ref().filter(|saved| {
+        saved.head.native_sha256 == local_rev
+            && dir
+                .as_deref()
+                .is_some_and(|dir| recovery::verify_files(dir, &assets_dir, saved))
+    });
     let url = format!("{}/api/documents/{doc}/pages/{page}/rm", config.url);
-    let mut request = client
-        .get(&url)
-        .header("x-device-token", &config.token)
-        .header("x-weft-recovery", "1");
-    if !local_rev.is_empty() {
-        request = request.header("x-weft-native-sha256", &local_rev);
-        if let Some(saved) = saved.as_ref().filter(|s| s.head.native_sha256 == local_rev) {
+    let mut request = client.get(&url).header("x-device-token", &config.token);
+    if let Some(deadline) = deadline {
+        let Some(timeout) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+            return false;
+        };
+        request = request.header("x-weft-recovery", "1").timeout(timeout);
+        if !local_rev.is_empty() {
+            request = request.header("x-weft-native-sha256", &local_rev);
+        }
+        if let Some(saved) = verified {
             request = request.header("if-none-match", &saved.etag);
         }
     }
@@ -1484,19 +1628,27 @@ async fn pull_page(
         return false;
     };
     if r.status().as_u16() == 304 {
-        let Some(saved) = saved.filter(|s| s.head.native_sha256 == local_rev) else {
+        let Some(saved) = verified else { return false };
+        if cloud.revisions.get(&key) != Some(&saved.head.revision)
+            || state
+                .store
+                .read_page(doc, page)
+                .as_ref()
+                .map(|(_, rev)| rev)
+                != Some(&local_rev)
+            || !dir
+                .as_deref()
+                .is_some_and(|dir| recovery::verify_files(dir, &assets_dir, saved))
+        {
             return false;
-        };
-        cloud
-            .revisions
-            .insert(key.clone(), saved.head.revision.clone());
-        cloud.pushed.insert(key.clone(), local_rev);
+        }
         cloud
             .pulled_asset_revisions
             .insert(key.clone(), saved.asset_revision.clone());
-        cloud
-            .protected
-            .insert(key, (saved.head.revision, saved.asset_revision));
+        cloud.protected.insert(
+            key,
+            (saved.head.revision.clone(), saved.asset_revision.clone()),
+        );
         return true;
     }
     if r.status().as_u16() != 200 {
@@ -1507,6 +1659,9 @@ async fn pull_page(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.split(';').next() == Some("application/json"));
+    if capture != has_recovery {
+        return false;
+    }
     let (cloud_rev, fetched_rev, bytes, checkpoint, missing_assets) = if has_recovery {
         let Some(etag) = r
             .headers()
@@ -1516,7 +1671,8 @@ async fn pull_page(
         else {
             return false;
         };
-        let Ok(payload) = r.json::<recovery::Response>().await else {
+        let Some(payload) = bounded_json::<recovery::Response>(r, RECOVERY_RESPONSE_LIMIT).await
+        else {
             return false;
         };
         if !payload.head.valid() {
@@ -1566,6 +1722,17 @@ async fn pull_page(
         )
     };
     let native_changed = fetched_rev != local_rev;
+    if capture && (native_changed || cloud.revisions.get(&key) != Some(&cloud_rev)) {
+        // Recovery is a sidecar of the accepted native revision, never a
+        // second writer of page data or of the normal change cursor.
+        return false;
+    }
+    if !capture && !native_changed {
+        cloud.revisions.insert(key.clone(), cloud_rev);
+        cloud.pushed.insert(key, fetched_rev);
+        return true;
+    }
+
     // A differing page that the tablet has not pushed cannot be overwritten.
     // Push it using the existing causal base and let the relay merge first.
     if native_changed && has_unpushed_local(&local_rev, cloud.pushed.get(&key).map(String::as_str))
@@ -1578,8 +1745,21 @@ async fn pull_page(
     let manifest = checkpoint.as_ref().map(|c| c.head.assets.as_slice());
     let previous = dir.as_deref().zip(saved.as_ref());
     let mut changed = Vec::new();
-    let assets_verified = pull_assets(state, client, config, cloud, doc, page, manifest, previous,
-        &mut changed).await.is_some() && !missing_assets;
+    let assets_verified = pull_assets(
+        state,
+        client,
+        config,
+        cloud,
+        doc,
+        page,
+        manifest,
+        previous,
+        &mut changed,
+        deadline,
+    )
+    .await
+    .is_some()
+        && !missing_assets;
     if native_changed {
         match state.store.write_page(doc, page, &local_rev, &bytes).await {
             Ok(_) => changed.push(format!("{doc}/{page}.rm")),
@@ -1606,8 +1786,10 @@ async fn pull_page(
         // accepted base can be used later to interpret native undo/deletion.
         return false;
     }
-    cloud.revisions.insert(key.clone(), cloud_rev);
-    cloud.pushed.insert(key.clone(), fetched_rev);
+    if !capture {
+        cloud.revisions.insert(key.clone(), cloud_rev);
+        cloud.pushed.insert(key.clone(), fetched_rev);
+    }
     if !changed.is_empty() {
         if !native_changed {
             // An asset-only replacement must refresh an already open page.
@@ -1626,7 +1808,10 @@ async fn pull_page(
             .pulled_asset_revisions
             .insert(key.clone(), checkpoint.asset_revision.clone());
         if let Some(dir) = dir {
-            match recovery::commit(&dir, checkpoint, &bytes) {
+            if !recovery::verify_assets(&dir, &assets_dir, &checkpoint) {
+                return false;
+            }
+            match recovery::commit(&dir, checkpoint, &bytes, cloud.recovery_budget.as_mut()) {
                 Ok(()) => {
                     cloud.protected.insert(key, marker);
                 }
@@ -1664,13 +1849,22 @@ async fn pull_changes(
     let mut failed_pages = std::collections::HashSet::new();
     for change in changes {
         let seq = change.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
-        let doc = change.get("doc").and_then(|v| v.as_str()).unwrap_or_default();
-        let page = change.get("page").and_then(|v| v.as_str()).unwrap_or_default();
+        let doc = change
+            .get("doc")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let page = change
+            .get("page")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let key = format!("{doc}/{page}");
         if failed_pages.contains(&key) {
             continue;
         }
-        let revision = change.get("revision").and_then(|v| v.as_str()).unwrap_or_default();
+        let revision = change
+            .get("revision")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if cloud.revisions.get(&key).map(String::as_str) == Some(revision)
             || pull_page(state, client, config, cloud, doc, page).await
         {
@@ -1730,7 +1924,12 @@ async fn push_documents(
     // idempotent), which also covers a repointed cloud.
     let payload = body.to_string();
     let digest = crate::store::sha256_hex(payload.as_bytes());
-    if LAST_DOC_PUSH.lock().expect("doc-push digest lock").as_deref() == Some(digest.as_str()) {
+    if LAST_DOC_PUSH
+        .lock()
+        .expect("doc-push digest lock")
+        .as_deref()
+        == Some(digest.as_str())
+    {
         return;
     }
     let ok = matches!(
@@ -1829,14 +2028,20 @@ fn apply_stamped_metadata(
     let name_key = format!("{id}:name");
     let parent_key = format!("{id}:parent");
     let pending = |field: &str, key: &str| {
-        stamps.get(field).and_then(|stamp| stamp.as_u64())
+        stamps
+            .get(field)
+            .and_then(|stamp| stamp.as_u64())
             .filter(|stamp| *stamp > *cloud.applied_meta.get(key).unwrap_or(&0))
     };
     let name_stamp = pending("name", &name_key);
     let parent_stamp = pending("parent", &parent_key);
     let mut meta_changed = false;
     if name_stamp.is_some() || parent_stamp.is_some() {
-        match store.apply_doc_fields_stamped(id, name_stamp.map(|_| name), parent_stamp.map(|_| parent)) {
+        match store.apply_doc_fields_stamped(
+            id,
+            name_stamp.map(|_| name),
+            parent_stamp.map(|_| parent),
+        ) {
             Ok(changed) => {
                 if let Some(stamp) = name_stamp {
                     cloud.applied_meta.insert(name_key, stamp);
@@ -1855,8 +2060,12 @@ fn apply_stamped_metadata(
 
     let mut content_changed = false;
     for (field, value) in stamps {
-        let Some(page) = field.strip_prefix("t:") else { continue };
-        let Some(stamp) = value.as_u64() else { continue };
+        let Some(page) = field.strip_prefix("t:") else {
+            continue;
+        };
+        let Some(stamp) = value.as_u64() else {
+            continue;
+        };
         let key = format!("{id}:t:{page}");
         if stamp <= *cloud.applied_meta.get(&key).unwrap_or(&0) {
             continue;
@@ -1864,7 +2073,11 @@ fn apply_stamped_metadata(
         let template = document
             .get("pages")
             .and_then(|v| v.as_array())
-            .and_then(|pages| pages.iter().find(|p| p.get("id").and_then(|v| v.as_str()) == Some(page)))
+            .and_then(|pages| {
+                pages
+                    .iter()
+                    .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(page))
+            })
             .and_then(|p| p.get("template"))
             .and_then(|v| v.as_str())
             .filter(|template| !template.is_empty());
@@ -1915,7 +2128,10 @@ async fn pull_documents(
         // lastModified may arrive as a JSON number (daemon push) or string (web)
         let lm = d
             .get("lastModified")
-            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
             .unwrap_or(0);
         // empty name = almost certainly a malformed record, not an intentional
         // rename to "" — never blank a local doc's title.
@@ -1955,8 +2171,14 @@ async fn pull_documents(
             let created = if kind == "folder" {
                 state.store.create_folder(id, name, parent)
             } else {
-                let page = d.pointer("/pages/0/id").and_then(|v| v.as_str()).unwrap_or_default();
-                let tpl = d.pointer("/pages/0/template").and_then(|v| v.as_str()).unwrap_or("");
+                let page = d
+                    .pointer("/pages/0/id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let tpl = d
+                    .pointer("/pages/0/template")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 !page.is_empty() && state.store.create_notebook(id, name, parent, page, tpl)
             };
             if created {
@@ -1975,7 +2197,10 @@ async fn pull_documents(
         if let Some(pages) = d.get("pages").and_then(|v| v.as_array()) {
             for p in pages {
                 let pid = p.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-                let tpl = p.get("template").and_then(|v| v.as_str()).unwrap_or_default();
+                let tpl = p
+                    .get("template")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 if pid.is_empty() || tpl.is_empty() {
                     continue;
                 }
@@ -2060,7 +2285,10 @@ mod tests {
         assert_eq!(apply(&mut cloud), (true, true));
         assert_eq!(cloud.applied_meta[&format!("{STAMP_DOC}:name")], 1);
         assert_eq!(cloud.applied_meta[&format!("{STAMP_DOC}:parent")], 2);
-        assert_eq!(cloud.applied_meta[&format!("{STAMP_DOC}:t:{STAMP_PAGE}")], 3);
+        assert_eq!(
+            cloud.applied_meta[&format!("{STAMP_DOC}:t:{STAMP_PAGE}")],
+            3
+        );
         let metadata = dir.path().join(format!("{STAMP_DOC}.metadata"));
         let published = std::fs::read(&metadata).unwrap();
         let fields: serde_json::Value = serde_json::from_slice(&published).unwrap();
@@ -2097,22 +2325,25 @@ mod tests {
         let uploads = captures.clone();
         let relay = Router::new().route(
             "/api/documents/{doc}/pages/{page}/rm",
-            put(
-                move |request: Request| {
-                    let uploads = uploads.clone();
-                    async move {
-                        let base = request.headers()["x-base-revision"].to_str().unwrap().to_owned();
-                        let body = axum::body::to_bytes(request.into_body(), 1024).await.unwrap();
-                        let mut received = uploads.lock().unwrap();
-                        received.push((base, body.to_vec()));
-                        if received.len() == 1 {
-                            return r#"{"revision":"#.into_response();
-                        }
-                        axum::Json(serde_json::json!({ "revision": "ops:3+4", "merged": false }))
-                            .into_response()
+            put(move |request: Request| {
+                let uploads = uploads.clone();
+                async move {
+                    let base = request.headers()["x-base-revision"]
+                        .to_str()
+                        .unwrap()
+                        .to_owned();
+                    let body = axum::body::to_bytes(request.into_body(), 1024)
+                        .await
+                        .unwrap();
+                    let mut received = uploads.lock().unwrap();
+                    received.push((base, body.to_vec()));
+                    if received.len() == 1 {
+                        return r#"{"revision":"#.into_response();
                     }
-                },
-            ),
+                    axum::Json(serde_json::json!({ "revision": "ops:3+4", "merged": false }))
+                        .into_response()
+                }
+            }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = CloudConfig {
@@ -2155,8 +2386,8 @@ mod tests {
     async fn failed_feed_page_does_not_block_an_unrelated_page_or_advance_the_cursor() {
         use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
         use std::sync::{
-            Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
         };
 
         let doc = "11111111-1111-4111-a111-111111111111";
@@ -2169,31 +2400,40 @@ mod tests {
         let second_hits = second_requests.clone();
         let fail = fail_first.clone();
         let relay = Router::new()
-            .route("/api/changes", get(move || async move {
-                axum::Json(serde_json::json!({ "changes": [
+            .route(
+                "/api/changes",
+                get(move || async move {
+                    axum::Json(serde_json::json!({ "changes": [
                     { "seq": 1, "doc": doc, "page": first, "revision": "ops:1+1" },
                     { "seq": 2, "doc": doc, "page": first, "revision": "ops:1+1" },
                     { "seq": 3, "doc": doc, "page": second, "revision": "ops:2+2" }
                 ] }))
-            }))
-            .route(&format!("/api/documents/{doc}/pages/{first}/rm"), get(move || {
-                let fail = fail.clone();
-                let hits = first_hits.clone();
-                async move {
-                    hits.fetch_add(1, Ordering::Relaxed);
-                    if fail.load(Ordering::Relaxed) {
-                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }),
+            )
+            .route(
+                &format!("/api/documents/{doc}/pages/{first}/rm"),
+                get(move || {
+                    let fail = fail.clone();
+                    let hits = first_hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                        if fail.load(Ordering::Relaxed) {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        ([("x-rm-revision", "ops:1+1")], "first drawing").into_response()
                     }
-                    ([("x-rm-revision", "ops:1+1")], "first drawing").into_response()
-                }
-            }))
-            .route(&format!("/api/documents/{doc}/pages/{second}/rm"), get(move || {
-                let requests = second_hits.clone();
-                async move {
-                    requests.fetch_add(1, Ordering::Relaxed);
-                    ([("x-rm-revision", "ops:2+2")], "second drawing")
-                }
-            }));
+                }),
+            )
+            .route(
+                &format!("/api/documents/{doc}/pages/{second}/rm"),
+                get(move || {
+                    let requests = second_hits.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        ([("x-rm-revision", "ops:2+2")], "second drawing")
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = CloudConfig {
             url: format!("http://{}", listener.local_addr().unwrap()),
@@ -2215,7 +2455,11 @@ mod tests {
         pull_changes(&state, &client, &config, &mut cloud).await;
         assert!(state.store.read_page(doc, first).is_none());
         assert_eq!(
-            state.store.read_page(doc, second).expect("later page must sync").0,
+            state
+                .store
+                .read_page(doc, second)
+                .expect("later page must sync")
+                .0,
             b"second drawing"
         );
         assert_eq!(cloud.since, 0);
@@ -2223,7 +2467,10 @@ mod tests {
 
         fail_first.store(false, Ordering::Relaxed);
         pull_changes(&state, &client, &config, &mut cloud).await;
-        assert_eq!(state.store.read_page(doc, first).unwrap().0, b"first drawing");
+        assert_eq!(
+            state.store.read_page(doc, first).unwrap().0,
+            b"first drawing"
+        );
         assert_eq!(cloud.since, 3);
         assert_eq!(first_requests.load(Ordering::Relaxed), 2);
         assert_eq!(second_requests.load(Ordering::Relaxed), 1);
@@ -2231,8 +2478,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_sweep_replaces_same_name_without_new_native_bytes_and_preserves_previous_on_failure() {
-        use axum::{http::{HeaderMap, StatusCode}, response::IntoResponse, routing::get, Router};
+    async fn recovery_sweep_replaces_same_name_without_new_native_bytes_and_preserves_previous_on_failure(
+    ) {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::get,
+            Router,
+        };
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         let native = b"native page already on tablet";
@@ -2277,6 +2530,9 @@ mod tests {
                 let sha = advertised_native.clone();
                 pages_seen.fetch_add(1, Ordering::Relaxed);
                 async move {
+                    if !headers.contains_key("x-weft-recovery") {
+                        return ([("x-rm-revision", "ops:3+5")], native.as_slice()).into_response();
+                    }
                     assert_eq!(headers["x-weft-recovery"], "1");
                     assert_eq!(headers["x-weft-native-sha256"].to_str().unwrap(), sha);
                     let digest = crate::store::sha256_hex(if v == 1 { old } else { new });
@@ -2319,8 +2575,14 @@ mod tests {
             model: String::new(),
             templates_dir: disk.path().to_path_buf(),
         };
-        assert!(state.store.create_notebook(STAMP_DOC, "Recovery", "", STAMP_PAGE, ""));
-        state.store.write_page(STAMP_DOC, STAMP_PAGE, "", native).await.unwrap();
+        assert!(state
+            .store
+            .create_notebook(STAMP_DOC, "Recovery", "", STAMP_PAGE, ""));
+        state
+            .store
+            .write_page(STAMP_DOC, STAMP_PAGE, "", native)
+            .await
+            .unwrap();
         let root = disk.path().join("recovery").join(cloud_identity(&config));
         let path = recovery::page_dir(&root, STAMP_DOC, STAMP_PAGE).unwrap();
         let native_asset = disk.path().join(STAMP_DOC).join(STAMP_PAGE).join(fname);
@@ -2332,17 +2594,71 @@ mod tests {
         };
         let mut etag = None;
         let docs = state.store.list_documents();
+        // First backfill has no trustworthy old generation. A pending
+        // same-name local resource must survive a differing remote digest.
+        state
+            .store
+            .write_asset(STAMP_DOC, STAMP_PAGE, fname, b"unsent local")
+            .unwrap();
+        reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
+        assert_eq!(std::fs::read(&native_asset).unwrap(), b"unsent local");
+        assert!(recovery::load(&path).is_none());
+        assert!(etag.is_none());
+        std::fs::remove_file(&native_asset).unwrap();
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
         let protected = recovery::load(&path).unwrap();
         assert_eq!(protected.etag, "\"checkpoint-1\"");
-        assert_eq!(protected.head.overlay["shapes"][0]["props"]["weftArrowLinks"][0]["toId"], "shape:target");
-        assert_eq!(std::fs::read(path.join(format!("{native_sha}.rm"))).unwrap(), native);
+        assert_eq!(
+            protected.head.overlay["shapes"][0]["props"]["weftArrowLinks"][0]["toId"],
+            "shape:target"
+        );
+        assert_eq!(
+            std::fs::read(path.join(format!("{native_sha}.rm"))).unwrap(),
+            native
+        );
         assert_eq!(std::fs::read(&native_asset).unwrap(), old);
-        assert_eq!(cloud.assets[&format!("{key}/{fname}")], mtime_ms(&native_asset).unwrap());
+        assert_eq!(
+            cloud.assets[&format!("{key}/{fname}")],
+            mtime_ms(&native_asset).unwrap()
+        );
 
         // No new page fetch when only the sweep request revalidates.
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
-        assert_eq!(page_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(page_hits.load(Ordering::Relaxed), 2);
+
+        // Valid JSON can silently lose overlay data without affecting the
+        // native/asset hashes or stored validator. Simulate a restart and
+        // prove that the exact manifest checksum forces a full refetch.
+        let manifest_path = path.join("checkpoint.json");
+        let original = std::fs::read_to_string(&manifest_path).unwrap();
+        let corrupt = original.replace("shape:target", "shape:changed");
+        assert_ne!(original, corrupt);
+        let parsed = serde_json::from_str::<serde_json::Value>(&corrupt).unwrap();
+        assert_eq!(parsed["etag"], "\"checkpoint-1\"");
+        std::fs::write(&manifest_path, corrupt).unwrap();
+        assert!(recovery::load(&path).is_none());
+        cloud.protected.clear();
+        cloud.pulled_asset_revisions.clear();
+        etag = None;
+        reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
+        assert_eq!(page_hits.load(Ordering::Relaxed), 3);
+        assert_eq!(std::fs::read_to_string(&manifest_path).unwrap(), original);
+
+        // Simulate recovery storage loss across a restart. A stale ETag cannot
+        // mask a missing asset or a base file with the correct name but bad bytes.
+        std::fs::remove_file(&native_asset).unwrap();
+        std::fs::write(path.join(format!("{native_sha}.rm")), b"corrupt").unwrap();
+        cloud.protected.clear();
+        cloud.pulled_asset_revisions.clear();
+        etag = None;
+        reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
+        assert_eq!(page_hits.load(Ordering::Relaxed), 4);
+        assert_eq!(std::fs::read(&native_asset).unwrap(), old);
+        assert_eq!(
+            std::fs::read(path.join(format!("{native_sha}.rm"))).unwrap(),
+            native
+        );
+        assert_eq!(cloud.protected[&key].0, "ops:3+4");
 
         // Same native and semantic revisions, but independently changed asset.
         variant.store(2, Ordering::Relaxed);
@@ -2366,7 +2682,10 @@ mod tests {
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
         assert_eq!(recovery::load(&path).unwrap().etag, "\"checkpoint-2\"");
         assert!(!fallback.exists());
-        assert_eq!(state.store.read_page(STAMP_DOC, STAMP_PAGE).unwrap().0, native);
+        assert_eq!(
+            state.store.read_page(STAMP_DOC, STAMP_PAGE).unwrap().0,
+            native
+        );
         // A snapshot with a permanently missing dependency is not protected,
         // but it must not strand the device's native change-feed cursor.
         variant.store(3, Ordering::Relaxed);
@@ -2377,7 +2696,10 @@ mod tests {
         assert_eq!(cloud.protected[&key].0, "ops:3+4");
 
         // The restored asset mtime is acknowledged to prevent a stale echo.
-        assert_eq!(cloud.assets[&format!("{key}/{fname}")], mtime_ms(&native_asset).unwrap());
+        assert_eq!(
+            cloud.assets[&format!("{key}/{fname}")],
+            mtime_ms(&native_asset).unwrap()
+        );
         server.abort();
     }
 
@@ -2662,7 +2984,10 @@ mod exclusion_tests {
             doc("shelf", "", "folder"),
             opened("warm", Some(5_000)),
         ];
-        assert_eq!(source_push_order(&docs), vec!["hot", "warm", "cold", "never"]);
+        assert_eq!(
+            source_push_order(&docs),
+            vec!["hot", "warm", "cold", "never"]
+        );
     }
 
     #[test]

@@ -344,6 +344,7 @@ export function startCloud(
   // on Content-Length, then re-checked on the materialized body (the header is
   // advisory: absent or lying on chunked uploads).
   const MAX_RM = 32 * 1024 * 1024;
+  const MAX_RECOVERY_JSON = 16 * 1024 * 1024;
   const MAX_JSON = 16 * 1024 * 1024;
 
   // Per-user storage quotas, one per data class. Enforced as
@@ -1274,7 +1275,13 @@ export function startCloud(
           if (!recovery.body) return new Response(null, {
             status: 304, headers: { ...CORS, ...headers },
           });
-          return json(recovery.body, 200, headers);
+          const body = JSON.stringify(recovery.body);
+          if (Buffer.byteLength(body) > MAX_RECOVERY_JSON) {
+            return json({ error: "Recovery inventory exceeds size limit" }, 413, headers);
+          }
+          return new Response(body, {
+            headers: { ...CORS, ...headers, "content-type": "application/json" },
+          });
         }
         const etag = quoteEtag(String(store.latestChangeSeq(user)));
         if (ifNoneMatch === etag) return new Response(null, {
@@ -2058,16 +2065,22 @@ export function startCloud(
               if (!recovery.body) return new Response(null, {
                 status: 304, headers: { ...CORS, ...headers },
               });
+              const body = JSON.stringify(recovery.body);
+              if (Buffer.byteLength(body) > MAX_RECOVERY_JSON) {
+                return json({ error: "Recovery page exceeds size limit" }, 413, headers);
+              }
               const [encoding] = acceptedEncodings(req, ["gzip", "identity"], ["gzip"]);
               if (!encoding) return new Response(null, { status: 406, headers });
               if (encoding === "gzip") {
-                const compressed = Readable.from([JSON.stringify(recovery.body)])
+                const compressed = Readable.from([body])
                   .pipe(createGzip({ level: zlib.Z_BEST_SPEED }));
                 return new Response(Readable.toWeb(compressed) as unknown as ConstructorParameters<typeof Response>[0], {
                   headers: { ...CORS, ...headers, "content-type": "application/json", "content-encoding": "gzip" },
                 });
               }
-              return json(recovery.body, 200, headers);
+              return new Response(body, {
+                headers: { ...CORS, ...headers, "content-type": "application/json" },
+              });
             }
             // op-mode page (#45): materialize .rm from the op log for
             // the codec-dumb daemon; legacy pages serve the blob.

@@ -138,6 +138,14 @@ test('tablet recovery pins overlay, native content and mutable asset versions', 
         expect(legacyData.assets[doc + '/' + legacyPage]).toBeString()
         expect(await (await get(root + '/documents/' + doc + '/pages/' + legacyPage + '/rm', recovery)).json())
             .toMatchObject({ assetRevision: legacyData.assets[doc + '/' + legacyPage], overlay: { shapes: [], tombstones: {} } })
+        const legacyRm = root + '/documents/' + doc + '/pages/' + legacyPage + '/rm'
+        cloud.store.putOverlay(user, doc, legacyPage, JSON.stringify({
+            shapes: [{ props: { caption: 'x'.repeat(16 * 1024 * 1024) } }],
+        }))
+        const oversized = await get(legacyRm, recovery)
+        expect(oversized.status).toBe(413)
+        expect(await oversized.json()).toEqual({ error: 'Recovery page exceeds size limit' })
+        expect(new Uint8Array(await (await get(legacyRm)).arrayBuffer())).toEqual(native)
     } finally {
         cloud.stop()
         if (previous === undefined) delete process.env.HOST
