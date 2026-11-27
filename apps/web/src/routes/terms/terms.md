@@ -3,6 +3,8 @@ title: Hosted Terms
 description: Terms for using Weft’s hosted editor and notebook sync service.
 ---
 
+Version: 27 November 2026.
+
 ## What these terms cover
 
 I’m Musaab Khan, and I run hosted Weft at [weft.page](https://weft.page). These terms cover the hosted editor and sync service. They do not change the [MIT license for Weft’s source code](https://github.com/bxff/weft/blob/main/LICENSE) or apply to someone else’s self-hosted installation.
