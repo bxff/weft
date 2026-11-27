@@ -25,6 +25,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.3"
+      - name: Smoke test the packed npm installer
+        run: npm run test:package --workspace @bxff/weft
       - run: bun install --frozen-lockfile
       - name: Reject deployment-local font data in Git
         run: |

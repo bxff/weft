@@ -5,6 +5,9 @@
   "bin": {
     "weft": "./src/cli.ts"
   },
+  "scripts": {
+    "test:package": "node test/package-smoke.mjs"
+  },
   "files": [
     "src"
   ],
