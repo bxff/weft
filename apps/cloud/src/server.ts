@@ -154,7 +154,7 @@ function acceptedEncodings(req: Request, available?: string[], preferred?: strin
 // shells. Keep request classification in sync with the Vercel routing rules.
 const clientPage = /^\/(?:install|join|library|login|settings(?:\/keys)?)\/?$/;
 const notebookPage = /^\/app\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\/?$/;
-const docsPage = /^\/docs(?:\/[a-zA-Z0-9_-]+)*\/?$/;
+const prerenderedPage = /^\/(?:docs(?:\/[a-zA-Z0-9_-]+)*|privacy|terms)\/?$/;
 const acceptsHtml = /^(?:[^,]*,)*\s*text\/html\s*(?=[;,]|$)(?![^,]*;\s*q\s*=\s*0(?:\.0*)?\s*(?:[;,]|$))[^,]*(?:,.*)?$/i;
 
 async function serveStatic(dir: string, pathname: string, req: Request): Promise<Response> {
@@ -180,7 +180,7 @@ async function serveStatic(dir: string, pathname: string, req: Request): Promise
       path = await Bun.file(shell).exists() ? shell : dir + "/index.html";
     } else if (clientPage.test(rel)) {
       path = dir + "/index.html";
-    } else if (docsPage.test(rel)) {
+    } else if (prerenderedPage.test(rel)) {
       path = dir + rel.replace(/\/$/, "") + ".html";
     } else {
       return new Response(null, { status: 404, headers });

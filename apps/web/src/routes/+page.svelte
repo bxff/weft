@@ -1,6 +1,6 @@
 <script lang="ts">
     import { onMount } from 'svelte'
-    import { docsUrl, connection } from '$lib/settings'
+    import { docsUrl } from '$lib/settings'
     import { currentUserLabel, clerkEnabled, joinWaitlist } from '$lib/auth'
     import SiteHeader from '$lib/components/SiteHeader.svelte'
     import SiteFooter from '$lib/components/SiteFooter.svelte'
@@ -14,9 +14,9 @@
     let ready = $state(false)
 
     onMount(() => {
-        if (connection().mode === 'cloud') {
+        if (clerkEnabled()) {
             void currentUserLabel()
-                .then((l) => (userLabel = l))
+                .then((l) => (userLabel = l), () => (userLabel = null))
                 .finally(() => (ready = true))
         } else {
             ready = true
@@ -31,7 +31,7 @@
 >
     <SiteHeader />
 
-    <!-- Main: single dense column, terminal-doc style -->
+    <!-- Full-width artwork; prose uses the same reading measure as docs. -->
     <main>
         <div>
             <p class="my-4 first:mt-0 last:mb-0" style="color: var(--gray-e)">
@@ -57,8 +57,8 @@
                         Waitlist invites arrive by email. The domain is new, so check spam.
                     </span>
                 {:else}
-                    <a href="/library" class="wf-cta">Open your notes</a>
-                    <a href={docsUrl()} class="wf-link" style="margin-left: 1rem; display: inline-block; white-space: nowrap">Read the docs &rarr;</a>
+                    {#if ready}<a href="/library" class="wf-cta">Open your notes</a>{/if}
+                    <a href={docsUrl()} class="wf-link" style:margin-left={ready ? '1rem' : undefined} style="display: inline-block; white-space: nowrap">Read the docs &rarr;</a>
                 {/if}
             </p>
 
@@ -118,3 +118,10 @@
 
     <SiteFooter />
 </div>
+
+<style>
+    main p {
+        max-width: var(--wf-reading-width);
+        margin-inline: auto;
+    }
+</style>

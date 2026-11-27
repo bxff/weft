@@ -24,16 +24,19 @@
     let token = $state<string | null>(null)
     let minting = $state(false)
     let mintError = $state<string | null>(null)
+    const hostedPairing = server === 'https://api.weft.page' || server === 'https://weft.page'
+    let acceptTerms = $state(false)
 
     onMount(() => {
         // Don't auto-mint the token: it's a credential, so showing it on load
         // risks leaking it. Mint only on a deliberate click.
         void currentUserLabel()
-            .then((l) => (userLabel = l))
+            .then((label) => (userLabel = label), () => (userLabel = null))
             .finally(() => (ready = true))
     })
 
     async function generate() {
+        if (hostedPairing && !acceptTerms) return
         minting = true
         mintError = null
         try {
@@ -212,8 +215,17 @@
                 </span>
             </div>
         {:else if !token}
+            {#if hostedPairing}
+                <div class="my-3">
+                    <input id="accept-hosted-terms" type="checkbox" bind:checked={acceptTerms} />
+                    <label for="accept-hosted-terms">I agree to the Hosted Terms.</label>
+                    <a href="/terms" target="_blank" rel="noopener" class="wf-link">Read the Hosted Terms</a>
+                    ·
+                    <a href="/privacy" class="wf-link">Privacy Notice</a>
+                </div>
+            {/if}
             <div class="my-3 flex items-center gap-3">
-                <button type="button" class="wf-cta disabled:opacity-50" onclick={generate} disabled={minting} data-testid="generate-setup">
+                <button type="button" class="wf-cta disabled:opacity-50" onclick={generate} disabled={minting || (hostedPairing && !acceptTerms)} data-testid="generate-setup">
                     {minting ? 'Generating…' : 'Generate my token'}
                 </button>
                 <span class="text-[13px]" style="color: var(--gray-7)">
