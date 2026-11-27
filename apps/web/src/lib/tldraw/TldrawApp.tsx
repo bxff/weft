@@ -866,7 +866,11 @@ export function TldrawApp({ docId, pageId, onController }: TldrawAppProps) {
         const live = window as unknown as { __weftEditor?: Editor; __weftController?: StudioController }
         live.__weftEditor = editor
         live.__weftController = controller
-        setDeviceTextCommit(editor, (richText) => void controller.commitDeviceText(richText).catch(() => {}))
+        setDeviceTextCommit(
+            editor,
+            (richText) => void controller.commitDeviceText(richText).catch(() => {}),
+            () => controller.canStartDeviceTextEdit(),
+        )
         // clear the prior page off the shared editor (no old listener records
         // these deletes: the previous controller was disposed in cleanup first).
         // history:'ignore' so the wipe is never undoable.

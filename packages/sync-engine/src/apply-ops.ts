@@ -10,6 +10,7 @@ import {
     Pen,
     crdtId,
     crdtIdKey,
+    isEndMarker,
     lww,
     uuidToBytesLE,
     createRootText,
@@ -111,6 +112,8 @@ export type LocalOp =
            *  form — snapshot fallback, like layer ops. Char ids travel as
            *  "part1:part2" keys. */
           type: 'edit-root-text'
+          /** Portable, journal-scoped identity of IDs minted by this edit. */
+          textIntentId?: string
           /** Create the column first (pages with no text; device defaults). */
           create?: { posX?: number; posY?: number; width?: number }
           /** Either a text run or a chain of inline format codes (1/2 bold
@@ -121,6 +124,104 @@ export type LocalOp =
            *  indent property pairs) or undefined] LWW sets. */
           styles?: [string, number, number[] | undefined][]
       }
+
+export class NativeTextReferenceConflict extends Error {}
+
+export type RootTextEdit = Extract<LocalOp, { type: 'edit-root-text' }>
+
+export function mapRootTextReferences(
+    edit: RootTextEdit,
+    convert: (key: string) => string,
+): RootTextEdit {
+    return {
+        ...edit,
+        ...(edit.inserts && { inserts: edit.inserts.map(ins => ({
+            ...ins, afterKey: ins.afterKey === null ? null : convert(ins.afterKey),
+        })) }),
+        ...(edit.deleteKeys && { deleteKeys: edit.deleteKeys.map(convert) }),
+        ...(edit.styles && { styles: edit.styles.map(([key, style, extra]): [string, number, number[] | undefined] =>
+            [convert(key), style, extra]) }),
+    }
+}
+
+function portableTextId(authors: ReadonlyMap<number, string>, id: CrdtId): string {
+    if (id.part1 === 0) return `0@${id.part2}`
+    const uuid = authors.get(id.part1)
+    if (!uuid) throw new Error('Unknown native text author')
+    return `${uuid.toLowerCase()}@${id.part2}`
+}
+
+export function captureTextReferences(
+    doc: RmDocument, edit: RootTextEdit, intent: string, minted: ReadonlyMap<string, CrdtId>,
+): RootTextEdit {
+    const authors = doc.authorTable()
+    const fromView = new Map([...minted].map(([key, id]) => [crdtIdKey(id), key]))
+    return { ...mapRootTextReferences(edit, key => {
+        const [slot, clock] = key.split(':').map(Number)
+        if (!Number.isSafeInteger(slot) || !Number.isSafeInteger(clock)) throw new Error('Invalid native text reference')
+        return fromView.get(key) ?? portableTextId(authors, crdtId(slot!, clock!))
+    }), textIntentId: intent }
+}
+
+function indexTextReferences(
+    doc: RmDocument, minted: ReadonlyMap<string, CrdtId>,
+): (key: string, style?: boolean) => CrdtId {
+    const slots = new Map<string, number[]>()
+    for (const [slot, uuid] of doc.authorTable()) {
+        if (slot === 0) continue
+        const key = uuid.toLowerCase()
+        const assigned = slots.get(key)
+        if (assigned) assigned.push(slot)
+        else slots.set(key, [slot])
+    }
+    const current = doc.rootTextBlock
+    const ranges = new Map<number, { start: number; end: number }[]>()
+    for (const item of current?.textItems ?? []) {
+        const count = item.deletedLength || (typeof item.value === 'string' ? [...item.value].length : 1)
+        const { part1: slot, part2: start } = item.itemId
+        let spans = ranges.get(slot)
+        if (!spans) ranges.set(slot, spans = [])
+        spans.push({ start, end: start + count })
+    }
+    for (const spans of ranges.values()) {
+        spans.sort((a, b) => a.start - b.start)
+        for (let i = 1; i < spans.length; i++) spans[i]!.end = Math.max(spans[i]!.end, spans[i - 1]!.end)
+    }
+    const exists = (id: CrdtId, style: boolean) => {
+        const spans = ranges.get(id.part1)
+        let lo = 0, hi = spans?.length ?? 0
+        while (lo < hi) {
+            const middle = (lo + hi) >>> 1
+            if (spans![middle]!.start <= id.part2) lo = middle + 1
+            else hi = middle
+        }
+        return (lo > 0 && id.part2 < spans![lo - 1]!.end) ||
+            (style && (isEndMarker(id) || current?.text.styles.has(crdtIdKey(id)) === true))
+    }
+    return (key, style = false) => {
+        const provisional = minted.get(key)
+        if (provisional && exists(provisional, style)) return provisional
+        const [author, rawClock] = key.split('@')
+        const clock = Number(rawClock)
+        if (Number.isSafeInteger(clock) && clock >= 0) {
+            const matching = author === '0' ? [0] : (slots.get(author!) ?? [])
+            const candidates = matching.map(slot => crdtId(slot, clock)).filter(id => exists(id, style))
+            if (candidates.length === 1) return candidates[0]!
+            if (candidates.length > 1) throw new NativeTextReferenceConflict('Ambiguous native text identity')
+        }
+        throw new NativeTextReferenceConflict('Target native text identity is missing from the current checkpoint')
+    }
+}
+
+export function publicationTextReferences(doc: RmDocument, minted: ReadonlyMap<string, CrdtId>): Record<string, string> {
+    const authors = doc.authorTable()
+    return Object.fromEntries([...minted].map(([key, id]) => [key, portableTextId(authors, id)]))
+}
+
+export function acceptedTextEdit(edit: LocalOp, accepted: Readonly<Record<string, string>>): LocalOp {
+    if (edit.type !== 'edit-root-text' || !edit.textIntentId) return edit
+    return mapRootTextReferences(edit, key => Object.hasOwn(accepted, key) ? accepted[key]! : key)
+}
 
 export interface ApplyOptions {
     authorUuid: string
@@ -150,6 +251,7 @@ export function applyOps(
     overlay: OverlayDocument,
     ops: LocalOp[],
     opts: ApplyOptions,
+    mintedText = new Map<string, CrdtId>(),
 ): ApplyResult {
     if (ops.length > 1) {
         const existing = new Set(overlay.shapes.map((shape) => shape.shapeId))
@@ -161,10 +263,10 @@ export function applyOps(
         const parent = freshShapes ? doc.defaultLayerId() : null
         if (parent) {
             return doc.withLineAppender(opts.authorUuid, (_append, appendBatch) =>
-                applyLocalOps(doc, overlay, ops, opts, (lines) => appendBatch(lines, parent)))
+                applyLocalOps(doc, overlay, ops, opts, mintedText, (lines) => appendBatch(lines, parent)))
         }
     }
-    return applyLocalOps(doc, overlay, ops, opts)
+    return applyLocalOps(doc, overlay, ops, opts, mintedText)
 }
 
 function applyLocalOps(
@@ -172,6 +274,7 @@ function applyLocalOps(
     overlay: OverlayDocument,
     ops: LocalOp[],
     opts: ApplyOptions,
+    mintedText: Map<string, CrdtId>,
     appendFresh?: (lines: Line[]) => SceneLineItemBlock[],
 ): ApplyResult {
     const deltas: Op[] = []
@@ -509,26 +612,42 @@ function applyLocalOps(
             }
             case 'edit-root-text': {
                 complete = false // text ops have no op form yet (snapshot fallback)
-                if (op.create && !doc.tree().rootText) createRootText(doc, op.create)
-                const parseKey = (k: string) => {
-                    const [a, b] = k.split(':').map(Number)
-                    return crdtId(a!, b!)
+                const parseKey = op.textIntentId
+                    ? indexTextReferences(doc, mintedText)
+                    : (key: string): CrdtId => {
+                        const [a, b] = key.split(':').map(Number)
+                        return crdtId(a!, b!)
+                    }
+                // Resolve every input against the starting view, before any
+                // writes. Internally chained format codes mint their own ids.
+                const anchors = op.inserts?.map(ins => ins.afterKey ? parseKey(ins.afterKey) : null)
+                const deleted = op.deleteKeys?.map(key => parseKey(key))
+                const styles = op.styles?.map(([key, style, extra]) => [parseKey(key, true), style, extra] as const)
+                if (op.create && !doc.rootTextBlock) createRootText(doc, op.create)
+                let ordinal = 0
+                const record = (id: CrdtId, count: number) => {
+                    if (!op.textIntentId) return
+                    for (let i = 0; i < count; i++) {
+                        mintedText.set(`${op.textIntentId}:${ordinal++}`, crdtId(id.part1, id.part2 + i))
+                    }
                 }
-                for (const ins of op.inserts ?? []) {
-                    let after = ins.afterKey ? parseKey(ins.afterKey) : null
+                for (const [i, ins] of (op.inserts ?? []).entries()) {
+                    let after = anchors![i]!
                     if (ins.text !== undefined) {
-                        insertText(doc, after, ins.text, { authorUuid: opts.authorUuid })
+                        const id = insertText(doc, after, ins.text, { authorUuid: opts.authorUuid })
+                        record(id, [...ins.text].length)
                     }
                     for (const code of ins.codes ?? []) {
                         // chain: each code lands right after the previous one
                         after = insertFormatCode(doc, after, code, {
                             authorUuid: opts.authorUuid,
                         })
+                        record(after, 1)
                     }
                 }
-                if (op.deleteKeys?.length) deleteText(doc, op.deleteKeys.map(parseKey))
-                for (const [key, style, extra] of op.styles ?? []) {
-                    setParagraphStyle(doc, parseKey(key), style, {
+                if (deleted?.length) deleteText(doc, deleted)
+                for (const [key, style, extra] of styles ?? []) {
+                    setParagraphStyle(doc, key, style, {
                         authorUuid: opts.authorUuid,
                         ...(extra?.length ? { extra: new Uint8Array(extra) } : {}),
                     })

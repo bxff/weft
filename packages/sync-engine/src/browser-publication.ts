@@ -7,6 +7,8 @@ export interface BrowserPublication {
     count: number
     kind: 'ops' | 'snapshot'
     payload: string
+    /** Local journal only: publish-time resolution of provisional native text items. */
+    textRefs?: Record<string, string>
 }
 
 export type BrowserReceipt =

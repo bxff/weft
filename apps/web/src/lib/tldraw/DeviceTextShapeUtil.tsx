@@ -53,14 +53,15 @@ export const DEVICE_TEXT_FONT = BODY_FAMILY
 export const DEVICE_TEXT_SIZE = BODY_PX
 export const DEVICE_TEXT_LINE_HEIGHT = (45.546875 * RM_SCALE) / DEVICE_TEXT_SIZE
 
-const commitHandlers = new WeakMap<Editor, (richText: TLRichText) => void>()
+const commitHandlers = new WeakMap<Editor, { commit: (richText: TLRichText) => void; canEdit: () => boolean }>()
 
 /** The controller registers what happens when a device-text edit ends. */
 export function setDeviceTextCommit(
     editor: Editor,
     handler: (richText: TLRichText) => void,
+    canEdit = () => true,
 ): void {
-    commitHandlers.set(editor, handler)
+    commitHandlers.set(editor, { commit: handler, canEdit })
 }
 
 /** Empty column geometry: full bounds for culling/indicator/outline but
@@ -88,7 +89,7 @@ export class DeviceTextShapeUtil extends ShapeUtil<DeviceTextShape> {
     }
 
     override canEdit(): boolean {
-        return true
+        return commitHandlers.get(this.editor)?.canEdit() ?? true
     }
     override canResize(): boolean {
         return false
@@ -148,7 +149,7 @@ export class DeviceTextShapeUtil extends ShapeUtil<DeviceTextShape> {
     }
 
     override onEditEnd(shape: DeviceTextShape): void {
-        commitHandlers.get(this.editor)?.(shape.props.richText)
+        commitHandlers.get(this.editor)?.commit(shape.props.richText)
     }
 
     override component(shape: DeviceTextShape) {

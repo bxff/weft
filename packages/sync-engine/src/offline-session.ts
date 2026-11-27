@@ -5,8 +5,8 @@
  */
 
 import { encodePublicationBytes, newPublicationId, type BrowserPublication } from './browser-publication'
-import { RmDocument } from '@weft/rm-format'
-import { applyOps, type ApplyOptions, type LocalOp } from './apply-ops'
+import { RmDocument, type CrdtId } from '@weft/rm-format'
+import { NativeTextReferenceConflict, acceptedTextEdit, applyOps, captureTextReferences, mapRootTextReferences, publicationTextReferences, type ApplyOptions, type LocalOp, type RootTextEdit } from './apply-ops'
 import { diffPage, snapshotKnownState } from './differ'
 import {
     applyInkDeltas,
@@ -359,7 +359,7 @@ export class OfflineSession {
      */
     private pendingVersion = 0
     private overlayVersion = 0
-    private viewCache: { key: string; doc: RmDocument; overlay: OverlayDocument } | null = null
+    private viewCache: { key: string; doc: RmDocument; overlay: OverlayDocument; mintedText?: Map<string, CrdtId> } | null = null
     /** Working copy for the pending slow path: base+overlay identity it was
      *  built from, plus the exact pending ops already applied to it. */
     private viewIncr: {
@@ -368,6 +368,7 @@ export class OfflineSession {
         base: RmDocument
         overlayVersion: number
         applied: LocalOp[]
+        mintedText: Map<string, CrdtId>
     } | null = null
 
     /** Cheap change-detection key: any content-affecting mutation moves it.
@@ -376,8 +377,26 @@ export class OfflineSession {
         return `${this.baseRevision}|${this.pendingVersion}|${this.overlayVersion}`
     }
 
-    private buildView(): { doc: RmDocument; overlay: OverlayDocument } {
-        const pending = this.confirmedPrefix ? this.pendingOps.slice(this.confirmedPrefix) : this.pendingOps
+    private buildView(): { doc: RmDocument; overlay: OverlayDocument; mintedText?: Map<string, CrdtId> } {
+        try {
+            return this.buildPendingView()
+        } catch (error) {
+            if (!(error instanceof NativeTextReferenceConflict)) throw error
+            // Pending replay can fail after changing its private working copy.
+            // Never paint that partial result or remove the durable queue.
+            this.viewIncr = null
+            this.viewCache = {
+                key: this.viewKey, doc: this.baseDoc, overlay: structuredClone(this.overlay),
+            }
+            return this.viewCache
+        }
+    }
+
+    private buildPendingView(): { doc: RmDocument; overlay: OverlayDocument; mintedText?: Map<string, CrdtId> } {
+        const pending = this.confirmedPrefix
+            ? this.pendingOps.slice(this.confirmedPrefix).map(op => this.publication?.textRefs
+                ? acceptedTextEdit(op, this.publication.textRefs) : op)
+            : this.pendingOps
         const key = this.viewKey
         if (this.viewCache && this.viewCache.key === key) return this.viewCache
         // Fast path: with no pending local ops, the view IS the base — return
@@ -411,22 +430,24 @@ export class OfflineSession {
             incr.applied.length <= pending.length &&
             incr.applied.every((op, i) => op === pending[i])
         ) {
-            applyOps(incr.doc, incr.overlay, pending.slice(incr.applied.length), this.opts)
+            applyOps(incr.doc, incr.overlay, pending.slice(incr.applied.length), this.opts, incr.mintedText)
             incr.applied = [...pending]
-            this.viewCache = { key, doc: incr.doc, overlay: incr.overlay }
+            this.viewCache = { key, doc: incr.doc, overlay: incr.overlay, mintedText: incr.mintedText }
             return this.viewCache
         }
         const doc = RmDocument.parse(this.baseDoc.serialize())
         const overlay = structuredClone(this.overlay)
-        applyOps(doc, overlay, pending, this.opts)
+        const mintedText = new Map<string, CrdtId>()
+        applyOps(doc, overlay, pending, this.opts, mintedText)
         this.viewIncr = {
             doc,
             overlay,
             base: this.baseDoc,
             overlayVersion: this.overlayVersion,
             applied: [...pending],
+            mintedText,
         }
-        this.viewCache = { key, doc, overlay }
+        this.viewCache = { key, doc, overlay, mintedText }
         return this.viewCache
     }
 
@@ -449,13 +470,59 @@ export class OfflineSession {
         if (this.pendingOps.length > 0) void this.reconcile()
     }
 
+    // The controller may hold a captured edit while flushing ink. Keep that
+    // edit addressable if a dependency is acknowledged before it gets queued.
+    private capturedRootText = new Map<string, RootTextEdit>()
+
+    /** Capture before any controller awaits: numeric slots belong to the current edited view. */
+    captureRootTextEdit(edit: RootTextEdit, basis?: RootTextEdit): RootTextEdit {
+        if (!this.opts.guardedSaves || edit.textIntentId) return edit
+        const intent = newPublicationId()
+        let captured: RootTextEdit
+        if (basis?.textIntentId) {
+            const held = this.capturedRootText.get(basis.textIntentId)
+            if (!held) throw new NativeTextReferenceConflict('Rendered native text basis is unavailable')
+            const references = new Map(basis.deleteKeys?.map((key, i) => [key, held.deleteKeys![i]!]))
+            captured = {
+                ...mapRootTextReferences(edit, key => {
+                    const ref = references.get(key)
+                    if (ref === undefined) throw new NativeTextReferenceConflict('Rendered native character is unavailable')
+                    return ref
+                }),
+                textIntentId: intent,
+            }
+        } else {
+            const view = this.buildView()
+            captured = captureTextReferences(view.doc, edit, intent, view.mintedText ?? new Map())
+        }
+        this.capturedRootText.set(captured.textIntentId!, captured)
+        return captured
+    }
+
+    captureRootTextBasis(keys: string[]): RootTextEdit {
+        const source: RootTextEdit = { type: 'edit-root-text', deleteKeys: keys }
+        const captured = this.captureRootTextEdit(source)
+        return captured.textIntentId ? { ...source, textIntentId: captured.textIntentId } : source
+    }
+
+    releaseCapturedRootText(edit: RootTextEdit): void {
+        if (edit.textIntentId) this.capturedRootText.delete(edit.textIntentId)
+    }
+
     /** Apply local edits: instant and durable, tablet not required. */
-    async apply(ops: LocalOp[]): Promise<void> {
-        await this.writePending(async () => {
-            this.pendingOps.push(...ops)
-            this.pendingVersion++
-            await this.persistPending()
-        })
+    async apply(ops: LocalOp[], beforeEnqueue?: () => void): Promise<void> {
+        const captured = ops.map(op => op.type === 'edit-root-text' ? this.captureRootTextEdit(op) : op)
+        try {
+            await this.writePending(async () => {
+                beforeEnqueue?.()
+                this.pendingOps.push(...captured.map(op => op.type === 'edit-root-text' && op.textIntentId
+                    ? this.capturedRootText.get(op.textIntentId) ?? op : op))
+                this.pendingVersion++
+                await this.persistPending()
+            })
+        } finally {
+            for (const op of captured) if (op.type === 'edit-root-text') this.releaseCapturedRootText(op)
+        }
         this.status({ state: 'pending', ops: this.pendingOps.length })
         void this.reconcile()
     }
@@ -623,9 +690,13 @@ export class OfflineSession {
     private async preparePublication(gen: number): Promise<void> {
         await this.writePending(async () => {
             if (this.disposed || gen !== this.generation || !this.pendingOps.length || this.publication) return
+            if (this.pendingOps.some(op => op.type === 'edit-root-text' && !op.textIntentId && (
+                op.inserts?.some(insert => insert.afterKey !== null) || op.deleteKeys?.length || op.styles?.length
+            ))) throw new Error('Legacy native text references need recovery before publishing')
             const doc = RmDocument.parse(this.baseDoc.serialize())
             const overlay = structuredClone(this.overlay)
-            const { deltas, complete } = applyOps(doc, overlay, this.pendingOps, this.opts)
+            const mintedText = new Map<string, CrdtId>()
+            const { deltas, complete } = applyOps(doc, overlay, this.pendingOps, this.opts, mintedText)
             const blobs = deltas.map(encodeOp)
             const baseSeq = this.lastSnapshotSeq
             const author = this.opts.historyAuthor ?? this.opts.authorUuid
@@ -633,6 +704,7 @@ export class OfflineSession {
             const publication: BrowserPublication = {
                 id: newPublicationId(), baseSeq, count: this.pendingOps.length,
                 kind: isOps ? 'ops' : 'snapshot',
+                ...(mintedText.size ? { textRefs: publicationTextReferences(doc, mintedText) } : {}),
                 payload: isOps ? JSON.stringify({ baseSeq, batch: { ops: blobs.map(encodePublicationBytes), author } })
                     : encodePublicationBytes(encodeSnapshotBatch({ snapshot: encodeSnapshot(doc.serialize(), overlay), deltas: blobs, author })),
             }
@@ -650,7 +722,7 @@ export class OfflineSession {
         const receipt = await this.transport.publishBrowserSave!(this.docId, this.pageId, publication)
         if (!active()) return false
         if (receipt.kind === 'stale' && this.pendingOps.some(op =>
-            op.type === 'edit-root-text' && (
+            op.type === 'edit-root-text' && !op.textIntentId && (
                 op.inserts?.some(insert => insert.afterKey !== null) ||
                 op.deleteKeys?.length || op.styles?.length
             )
@@ -672,6 +744,7 @@ export class OfflineSession {
         await this.writePending(async () => {
             if (!active()) return
             const rest = receipt.kind === 'stale' ? this.pendingOps : this.pendingOps.slice(publication.count)
+                .map(op => publication.textRefs ? acceptedTextEdit(op, publication.textRefs) : op)
             const queue = rest.length ? encodePending(rest) : null
             if (receipt.kind === 'stale') {
                 if (queue) await this.storage.set(this.pendingKey(), queue)
@@ -681,6 +754,11 @@ export class OfflineSession {
                 const checkpoint = this.cachePrimary ? this.checkpointEntries() : []
                 if (!await commit(checkpoint, this.pendingKey(), queue, active)) return
                 if (this.cachePrimary && checkpoint.length) this.checkpointDirty = false
+                if (publication.textRefs) {
+                    for (const [id, edit] of this.capturedRootText) {
+                        this.capturedRootText.set(id, acceptedTextEdit(edit, publication.textRefs) as RootTextEdit)
+                    }
+                }
             }
             this.pendingOps = rest
             this.publication = undefined

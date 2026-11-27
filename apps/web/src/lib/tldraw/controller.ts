@@ -234,6 +234,10 @@ export class StudioController {
     private renderAfterRetry = new Set<() => void>()
     private deviceTextWork: Promise<void> | null = null
     private deviceTextDraft: unknown = undefined
+    private renderedDeviceText: {
+        richText: ReturnType<typeof paragraphsToRichText>
+        anchorBasis: Extract<LocalOp, { type: 'edit-root-text' }>
+    } | null = null
     /** Editor store listener unsubscribe. The editor outlives the controller,
      *  so this must be removed on dispose or dead controllers keep reacting to
      *  the next page's edits. */
@@ -1612,10 +1616,10 @@ export class StudioController {
         return work
     }
 
-    private async applyLocal(ops: LocalOp[], render?: () => void): Promise<void> {
+    private async applyLocal(ops: LocalOp[], render?: () => void, beforeEnqueue?: () => void): Promise<void> {
         if (this.disposed) return
         try {
-            await this.session.apply(ops)
+            await this.session.apply(ops, beforeEnqueue)
         } catch (error) {
             if (!this.disposed) {
                 this.saveFailure = Symbol()
@@ -1888,20 +1892,29 @@ export class StudioController {
         return this.trackCommand(this.applyRootText(edit))
     }
 
-    private async applyRootText(edit: Omit<Extract<LocalOp, { type: 'edit-root-text' }>, 'type'>): Promise<void> {
+    private async applyRootText(
+        edit: Omit<Extract<LocalOp, { type: 'edit-root-text' }>, 'type'>,
+        basis?: Extract<LocalOp, { type: 'edit-root-text' }>,
+        beforeEnqueue?: () => void,
+    ): Promise<void> {
         if (this.disposed) return
-        // Project edits against their original anchor offsets before
-        // applying the text change that will reflow the scene.
-        if (this.debounce) clearTimeout(this.debounce)
-        await this.ensureFont()
-        if (this.disposed) return
-        this.editor.store._flushHistory()
-        await this.flush()
-        if (this.disposed) return
-        await this.applyLocal([{ type: 'edit-root-text', ...edit }], () => {
-            this.requestSceneRebuild()
-            this.onMetaChanged?.()
-        })
+        const op = this.session.captureRootTextEdit({ type: 'edit-root-text', ...edit }, basis)
+        try {
+            // Project edits against their original anchor offsets before
+            // applying the text change that will reflow the scene.
+            if (this.debounce) clearTimeout(this.debounce)
+            await this.ensureFont()
+            if (this.disposed) return
+            this.editor.store._flushHistory()
+            await this.flush()
+            if (this.disposed) return
+            await this.applyLocal([op], () => {
+                this.requestSceneRebuild()
+                this.onMetaChanged?.()
+            }, beforeEnqueue)
+        } finally {
+            this.session.releaseCapturedRootText(op)
+        }
     }
 
     /** Ordered live char id keys of the root text — the positional map the
@@ -1926,15 +1939,24 @@ export class StudioController {
         // next characters landed at position 0 (" EDITEDHello device...").
         // The commit diff aligns against the live char ids at commit time, so
         // skipping here just defers convergence to the commit/blur.
-        if (this.editor.getEditingShapeId() === id) return
+        if (this.editor.getEditingShapeId() === id || (this.renderedDeviceText && this.deviceTextDraft !== undefined)) return
         const text = this.session.document.tree().rootText
         const existing = this.editor.getShape(id)
+        if (this.renderedDeviceText) this.session.releaseCapturedRootText(this.renderedDeviceText.anchorBasis)
+        this.renderedDeviceText = null
         if (!text) {
             if (existing) this.remote(() => this.editor.deleteShapes([id]))
             return
         }
         const paragraphs = linearizeRootText(text)
         const richText = paragraphsToRichText(paragraphs)
+        if (import.meta.env.PUBLIC_GUARDED_SAVES === '1') {
+            this.renderedDeviceText = {
+                richText,
+                anchorBasis: this.session.captureRootTextBasis(rootTextCharPositions(text)
+                    .filter(char => !char.deleted).map(char => crdtIdKey(char.id))),
+            }
+        }
         const measure = canvasMeasure()
         const layout = layoutText(paragraphs, text.width, measure)
         // per-LINE hit boxes (shape-space px): the shape is clickable on its
@@ -1988,14 +2010,41 @@ export class StudioController {
         })
     }
 
+    /** The old editor stays visible while a draft is waiting for storage.
+     * A second editing session must not start from that same stale baseline. */
+    canStartDeviceTextEdit(): boolean {
+        return import.meta.env.PUBLIC_GUARDED_SAVES !== '1' || this.deviceTextDraft === undefined
+    }
+
+    private nativeTextSignature(): string {
+        const text = this.session.document.tree().rootText
+        return JSON.stringify(text ? richTextToLines(paragraphsToRichText(linearizeRootText(text))) : [])
+    }
+
+    private nativeTextFence(): () => void {
+        const expected = this.nativeTextSignature()
+        return () => {
+            if (this.nativeTextSignature() !== expected) {
+                throw new Error('This text changed while you were editing. The local draft is still open.')
+            }
+        }
+    }
+
     /** Commit a finished device-text edit (tldraw's TipTap doc): flatten to
      *  lines, diff the text (one insert + one delete range), then align
      *  paragraph styles where the user changed a node KIND. */
     commitDeviceText(richText: unknown): Promise<void> {
+        if (import.meta.env.PUBLIC_GUARDED_SAVES === '1' && this.deviceTextWork) {
+            if (this.deviceTextDraft === richText) return this.deviceTextWork
+            return Promise.reject(new Error('Finish saving the current text before editing it again'))
+        }
         this.deviceTextDraft = richText
         const work = (this.deviceTextWork ?? Promise.resolve()).catch(() => {}).then(async () => {
             await this.commitDeviceTextNow(richText)
-            if (this.deviceTextDraft === richText) this.deviceTextDraft = undefined
+            if (this.deviceTextDraft === richText) {
+                this.deviceTextDraft = undefined
+                if (!this.disposed) this.syncDeviceTextShape()
+            }
         })
         this.deviceTextWork = work
         void work.finally(() => {
@@ -2009,15 +2058,26 @@ export class StudioController {
             const lines = richTextToLines(richText as never)
             const draft = lines.map((l) => l.text).join('\n')
             const text = this.session.document.tree().rootText
-            const current = text
-                ? linearizeRootText(text)
-                      .map((p) => p.spans.map((sp) => sp.text).join(''))
-                      .join('\n')
-                : ''
+            const paragraphs = text ? linearizeRootText(text) : []
+            const basis = this.renderedDeviceText
+            const before = basis ? richTextToLines(basis.richText) : []
+            const current = basis ? before.map(line => line.text).join('\n')
+                : paragraphs.map(p => p.spans.map(span => span.text).join('')).join('\n')
+            const concurrent = !!basis && JSON.stringify(before) !==
+                JSON.stringify(text ? richTextToLines(paragraphsToRichText(paragraphs)) : [])
+            const plain = (lines: RichLine[]) => lines.every(line => line.kind === 'paragraph' &&
+                (line.deviceStyle === null || line.deviceStyle === 0 || line.deviceStyle === 1) &&
+                line.indentLevel === undefined && line.segments.every(segment => !segment.bold && !segment.italic))
+            const compatible = plain(before) && plain(lines) && before.length === lines.length
+            const fence = basis && !compatible ? this.nativeTextFence() : undefined
+            if (concurrent && JSON.stringify(before) === JSON.stringify(lines)) return
+            if (concurrent && !compatible) {
+                throw new Error('This text changed on the tablet while you were editing. The local draft was kept.')
+            }
             if (draft !== current || !text) {
-                const positions = text
-                    ? this.rootTextPositions()
-                    : ([] as { key: string }[])
+                const positions = basis
+                    ? basis.anchorBasis.deleteKeys!.map(key => ({ key }))
+                    : text ? this.rootTextPositions() : []
                 // positions has one entry per VISIBLE code point of `current`
                 // (including the '\n' separators). Compare in code points, not
                 // UTF-16 units, so an emoji/astral char doesn't desync the map
@@ -2037,12 +2097,15 @@ export class StudioController {
                     afterKey: ins.after >= 0 ? positions[ins.after]!.key : null,
                     text: ins.text,
                 }))
-                await this.editRootText({
+                await this.applyRootText({
                     ...(text ? {} : { create: {} }),
                     ...(inserts.length ? { inserts } : {}),
                     ...(deleteKeys.length ? { deleteKeys } : {}),
-                })
+                }, basis?.anchorBasis, fence)
             }
+            // A concurrent insertion is not in the editor draft. Never use that
+            // draft as the full paragraph or mark model for the merged text.
+            if (basis && compatible) return
             // style pass: apply only where the node KIND differs from the
             // stored style's kind. The deviceStyle attr (the style the node
             // was BUILT from, carried through TipTap edits) breaks ties so
@@ -2090,20 +2153,22 @@ export class StudioController {
                     if (differs) styles.push([key, write.value, extra])
                 }
             }
-            if (styles.length) await this.editRootText({ styles })
+            if (styles.length) {
+                if (basis) await this.applyRootText({ styles }, undefined, this.nativeTextFence())
+                else await this.editRootText({ styles })
+            }
             // marks pass: reconcile inline bold/italic (rm format codes 1-4)
-            await this.commitDeviceTextMarks(lines)
+            await this.commitDeviceTextMarks(lines, !!basis)
         } catch (err) {
+            if (!this.disposed) this.opts.onStatus?.({ state: 'error', detail: String(err) })
             console.error('weft: device-text commit failed:', err)
             throw err
         }
-        // Replay the render that was skipped while the caret was active.
-        if (!this.disposed) this.syncDeviceTextShape()
     }
 
     /** Make the stored format codes produce the editor's bold/italic runs.
      *  No-op when they already match (planFormatEdits is idempotent). */
-    private async commitDeviceTextMarks(lines: RichLine[]): Promise<void> {
+    private async commitDeviceTextMarks(lines: RichLine[], guard = false): Promise<void> {
         const text = this.session.document.tree().rootText
         if (!text) return
         const target: { bold: boolean; italic: boolean }[] = []
@@ -2123,7 +2188,7 @@ export class StudioController {
             return
         }
         if (plan.deleteIds.length === 0 && plan.inserts.length === 0) return
-        await this.editRootText({
+        const edits = {
             ...(plan.deleteIds.length
                 ? { deleteKeys: plan.deleteIds.map((id) => crdtIdKey(id)) }
                 : {}),
@@ -2135,7 +2200,9 @@ export class StudioController {
                       })),
                   }
                 : {}),
-        })
+        }
+        if (guard) await this.applyRootText(edits, undefined, this.nativeTextFence())
+        else await this.editRootText(edits)
     }
 
     // ----- layers -----
