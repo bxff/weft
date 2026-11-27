@@ -5,7 +5,7 @@
  * CLOUD_DEV_USER accepts `Bearer dev:<user>` for CI (only when no real auth set).
  */
 
-import { createClerkClient, verifyToken } from '@clerk/backend'
+import { verifyToken } from '@clerk/backend'
 import type { CloudStore } from './store'
 
 export interface AuthContext {
@@ -95,12 +95,15 @@ export function isRecentClerkSession(auth: AuthContext, now = Math.floor(Date.no
 export async function deleteHostedClerkUser(userId: string): Promise<void> {
     const secretKey = process.env.CLERK_SECRET_KEY
     if (!secretKey) throw new Error('Hosted account provider is unavailable')
-    try {
-        await createClerkClient({ secretKey }).users.deleteUser(userId)
-    } catch (error) {
-        // A retry after a lost response must converge if Clerk already deleted it.
-        if (!error || typeof error !== 'object' || !('status' in error) || error.status !== 404) throw error
-    }
+    const response = await fetch(`https://api.clerk.com/v1/users/${encodeURIComponent(userId)}`, {
+        method: 'DELETE',
+        headers: { authorization: 'Bearer ' + secretKey },
+        redirect: 'error',
+        signal: AbortSignal.timeout(10_000),
+    })
+    await response.body?.cancel()
+    // After a lost response the idempotent retry can find no provider user.
+    if (!response.ok && response.status !== 404) throw new Error('Account provider deletion failed')
 }
 
 export async function authenticate(req: Request, store: CloudStore, testClerkJwtKey?: string): Promise<AuthContext | null> {

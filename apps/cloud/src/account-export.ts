@@ -3,7 +3,7 @@
 import type { CloudStore } from "./store";
 
 async function* tarEntry(
-  path: string, bytes: Uint8Array | Blob, open: () => void,
+  path: string, bytes: Uint8Array | Blob, open: () => void, expectedHash?: string,
 ): AsyncGenerator<Uint8Array> {
   open();
   const size = bytes instanceof Uint8Array ? bytes.length : bytes.size;
@@ -25,6 +25,7 @@ async function* tarEntry(
     open();
     yield bytes;
   } else {
+    const hash = expectedHash ? new Bun.CryptoHasher("sha256") : null;
     let emitted = 0;
     const reader = bytes.stream().getReader();
     try {
@@ -32,6 +33,7 @@ async function* tarEntry(
         const { done, value } = await reader.read();
         if (done) break;
         open();
+        hash?.update(value);
         emitted += value.byteLength;
         if (emitted > size) throw new Error("Archived file grew during download");
         yield value;
@@ -40,7 +42,9 @@ async function* tarEntry(
       await reader.cancel();
       reader.releaseLock();
     }
-    if (emitted !== size) throw new Error("Archived file disappeared during download");
+    if (emitted !== size || (hash && hash.digest("hex") !== expectedHash)) {
+      throw new Error("Archived file changed during download");
+    }
   }
   if (size % 512) yield new Uint8Array(512 - size % 512);
 }
@@ -67,9 +71,13 @@ export function streamNotebookExport(store: CloudStore, user: string, finish: ()
         overlay: recovery?.overlay ?? JSON.parse(store.getOverlay(user, doc, page) ?? '{"shapes":[]}'),
       }), open);
       if (nativeBase64) yield* tarEntry(path + "/native.rm", Buffer.from(nativeBase64, "base64"), open);
+      const referenced = new Map(recovery?.assets.map(({ name, sha256 }) => [name, sha256]));
       for (const [index, name] of assets.entries()) {
         const bytes = store.getAsset(user, doc, page, name);
-        if (!bytes) throw new Error("A notebook asset changed during export");
+        const expected = referenced.get(name);
+        if (!bytes || (expected && new Bun.CryptoHasher("sha256").update(bytes).digest("hex") !== expected)) {
+          throw new Error("A notebook asset changed during export");
+        }
         yield* tarEntry(path + "/assets/" + index, bytes, open);
       }
     }
@@ -79,7 +87,7 @@ export function streamNotebookExport(store: CloudStore, user: string, finish: ()
       if (!ref) throw new Error("A source file changed during export");
       const path = "sources/" + i;
       yield* tarEntry(path + "/source.json", json({ doc, mime: ref.mime }), open);
-      yield* tarEntry(path + "/content", Bun.file(ref.path), open);
+      yield* tarEntry(path + "/content", Bun.file(ref.path), open, ref.etag.replace(/^"|"$/g, ""));
     }
     for (const [i, template] of store.accountExportTemplates(user).entries()) {
       open();

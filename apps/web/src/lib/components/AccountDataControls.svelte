@@ -40,17 +40,24 @@
             if (kind === 'export' && response.ok) {
                 const { ticket } = await response.json()
                 if (!auth.stillCurrent() || typeof ticket !== 'string') return
-                const link = document.createElement('a')
-                link.href = auth.relay + '/api/account/export?ticket=' + encodeURIComponent(ticket)
-                link.rel = 'noreferrer'
-                link.download = 'weft-notebooks.tar'
-                link.click()
+                const form = document.createElement('form')
+                form.action = auth.relay + '/api/account/export/download'
+                form.method = 'POST'
+                form.rel = 'noreferrer'
+                form.hidden = true
+                const grant = document.createElement('input')
+                grant.type = 'hidden'
+                grant.name = 'ticket'
+                grant.value = ticket
+                form.append(grant)
+                document.body.append(form)
+                try { form.submit() } finally { form.remove() }
                 status = 'Export requested. Check your downloads.'
             } else if (kind === 'delete' && response.status === 204) {
                 await signOut().catch(() => {})
                 onDeleted()
             } else if (kind === 'delete' && response.status === 202) {
-                status = 'Deletion is in progress. Click Delete account again to finish.'
+                status = 'Deletion is in progress. You can close this page; Weft will finish it automatically.'
             } else if (response.status === 403 && kind === 'delete') {
                 error = 'Sign out and sign in again, then return here to confirm deletion.'
             } else {

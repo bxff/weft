@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RmDocument } from "@weft/rm-format";
@@ -17,6 +18,12 @@ function jwt(sub: string, age: number | null, issuedAgo = 0, azp = "https://synt
     iat: now - issuedAgo, exp: now + 60, ...(age === null ? {} : { fva: [age, -1] }),
   });
   return data + "." + sign("RSA-SHA256", Buffer.from(data), privateKey).toString("base64url");
+}
+
+async function waitFor(ready: () => boolean) {
+  const limit = Date.now() + 2000;
+  while (!ready() && Date.now() < limit) await Bun.sleep(10);
+  expect(ready()).toBe(true);
 }
 
 function tarEntries(archive: Uint8Array) {
@@ -52,7 +59,7 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
   let providerDown = true;
   let cloud = startCloud({
     port: 0, db: join(root, "relay.sqlite"),
-    testClerk: { jwtKey, deleteUser: async user => {
+    testClerk: { jwtKey, retryMs: 10, deleteUser: async user => {
       if (providerDown) throw new Error("fixture provider unavailable");
       deleted.push(user);
     }},
@@ -93,11 +100,13 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
       expect(response.status).toBe(200);
       return (await response.json() as { ticket: string }).ticket;
     };
-    const exportPath = (ticket: string) => base + "/api/account/export?ticket=" + ticket;
+    const downloadWith = (ticket: string) => fetch(base + "/api/account/export/download", {
+      method: "POST", body: new URLSearchParams({ ticket }),
+    });
     const replaced = await exportTicket();
     const ticket = await exportTicket();
-    expect((await fetch(exportPath(replaced))).status).toBe(404);
-    const download = await fetch(exportPath(ticket));
+    expect((await downloadWith(replaced)).status).toBe(404);
+    const download = await downloadWith(ticket);
     expect(download.status).toBe(200);
     expect(download.headers.get("Cache-Control")).toBe("private, no-store");
     expect(download.headers.get("Content-Disposition")).toContain("weft-notebooks.tar");
@@ -109,7 +118,7 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
     expect(files.get("sources/0/content")).toEqual(Buffer.from([0, 17, 255]));
     expect(files.has("pages/1/native.rm")).toBe(false);
     expect(files.has("sources/1/content")).toBe(false);
-    expect((await fetch(exportPath(ticket))).status).toBe(404);
+    expect((await downloadWith(ticket)).status).toBe(404);
     const revokedExport = await exportTicket();
     const makeTicket = async () => {
       const r = await call("/api/ws-ticket", recent, { method: "POST" });
@@ -128,7 +137,7 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
     await closed;
     expect(cloud.store.isAccountFenced(owner)).toBe(true);
     expect(cloud.store.getFile(owner, "own")).toBeNull();
-    expect((await fetch(exportPath(revokedExport))).status).toBe(404);
+    expect((await downloadWith(revokedExport)).status).toBe(404);
     expect((await startExport()).status).toBe(410);
     expect((await call("/api/documents", recent)).status).toBe(410);
     expect((await call("/ws?ticket=" + stale, recent)).status).toBe(410);
@@ -140,9 +149,10 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
     providerDown = false;
     cloud = startCloud({
       port: 0, db: join(root, "relay.sqlite"),
-      testClerk: { jwtKey, deleteUser: async user => { deleted.push(user); } },
+      testClerk: { jwtKey, retryMs: 10, deleteUser: async user => { deleted.push(user); } },
     });
     ({ call, erase } = calls());
+    await waitFor(() => cloud.store.manualDeletionComplete(owner));
     expect((await erase(jwt(owner, 0))).status).toBe(204);
     expect(deleted).toEqual([owner]);
     expect((await call("/api/documents", jwt(owner, 0))).status).toBe(410);
@@ -151,6 +161,87 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
     cloud.stop();
     env.forEach((key, index) => {
       const value = oldEnv[index];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("worker finishes explicit fenced deletion after a lost provider response without a usable session", async () => {
+  const root = mkdtempSync(join(tmpdir(), "weft-manual-deletion-restart-"));
+  const keys = ["HOST", "CLERK_SECRET_KEY", "WEFT_ACCOUNT_SELF_SERVICE", "WEFT_ACCOUNT_AUTHORIZED_ORIGIN", "WEFT_PASSWORD"] as const;
+  const savedEnv = keys.map(key => process.env[key]);
+  process.env.HOST = "127.0.0.1";
+  process.env.CLERK_SECRET_KEY = "sk_test_fixture";
+  process.env.WEFT_ACCOUNT_SELF_SERVICE = "1";
+  process.env.WEFT_ACCOUNT_AUTHORIZED_ORIGIN = "https://synthetic.example";
+  delete process.env.WEFT_PASSWORD;
+  const provider = new Set([owner, peer, "storage-only-fenced"]);
+  const calls: string[] = [];
+  const deleteUser = async (user: string) => {
+    calls.push(user);
+    if (!provider.delete(user)) throw Object.assign(new Error("already absent"), { status: 404 });
+    throw new Error("transport disconnected after provider accepted deletion");
+  };
+  const db = join(root, "relay.sqlite");
+  const start = (key: string, retryMs: number) => startCloud({
+    port: 0, db, testClerk: { jwtKey: key, deleteUser, retryMs },
+  });
+  const cloud = start(jwtKey, 400);
+  const oldSession = jwt(owner, 0);
+  let restarted: ReturnType<typeof Bun.spawn> | undefined;
+  const erase = (port: number) => fetch("http://127.0.0.1:" + port + "/api/account", {
+    method: "DELETE", headers: { authorization: "Bearer " + oldSession },
+    body: JSON.stringify({ confirm: "DELETE" }),
+  });
+  try {
+    cloud.store.putDocuments(owner, '{"documents":[{"id":"owner"}]}');
+    cloud.store.stageAccountPurge("storage-only-fenced");  // no manual intent
+    expect((await erase(cloud.port)).status).toBe(202);
+    expect(calls).toEqual([owner]);
+    expect(provider.has(owner)).toBe(false); // provider accepted but lost ACK
+    expect(cloud.store.manualDeletionComplete(owner)).toBe(false);
+    expect(cloud.store.getDocuments(owner)).toBe('{"documents":[]}');
+    cloud.stop();
+
+    // Run a new relay process with a different public signer key. This
+    // avoids Clerk SDK module-level JWKS caches in the old process.
+    const rotated = generateKeyPairSync("rsa", { modulusLength: 2048 }).publicKey
+      .export({ type: "spki", format: "pem" }).toString();
+    const ready = join(root, "ready"), retries = join(root, "retries");
+    const script = `
+      import { startCloud } from ${JSON.stringify(new URL("../src/server.ts", import.meta.url).pathname)};
+      import { appendFileSync, writeFileSync } from "node:fs";
+      const cloud = startCloud({ port: 0, db: ${JSON.stringify(db)}, testClerk: {
+        jwtKey: ${JSON.stringify(rotated)}, retryMs: 10, deleteUser: async user => {
+          appendFileSync(${JSON.stringify(retries)}, user + String.fromCharCode(10));
+          throw Object.assign(new Error("already absent"), { status: 404 });
+        }
+      }});
+      writeFileSync(${JSON.stringify(ready)}, String(cloud.port));
+    `;
+    restarted = Bun.spawn([process.execPath, "-e", script], { stdout: "ignore", stderr: "inherit", env: {
+      HOST: "127.0.0.1", CLERK_SECRET_KEY: "sk_test_fixture", WEFT_ACCOUNT_SELF_SERVICE: "1",
+      WEFT_ACCOUNT_AUTHORIZED_ORIGIN: "https://synthetic.example",
+    } });
+    await waitFor(() => existsSync(ready));
+    expect((await erase(Number(readFileSync(ready, "utf8")))).status).toBe(401);
+    const reopened = new Database(db, { readonly: true });
+    try {
+      await waitFor(() => !!reopened.query("SELECT 1 FROM account_manual_deletions WHERE user_id=? AND completed_at IS NOT NULL").get(owner));
+      expect(readFileSync(retries, "utf8").trim().split("\n")).toEqual([owner]);
+      expect(provider).toEqual(new Set([peer, "storage-only-fenced"]));
+      await Bun.sleep(35);
+      expect(readFileSync(retries, "utf8").trim().split("\n")).toEqual([owner]);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    cloud.stop();
+    if (restarted) { restarted.kill(); await restarted.exited; }
+    keys.forEach((key, index) => {
+      const value = savedEnv[index];
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     });

@@ -217,7 +217,11 @@ export function startCloud(
   opts: {
     port?: number; db?: string; staticDir?: string;
     /** Constructor-only fixtures; never sourced from a request or CLI. */
-    testClerk?: { jwtKey: string; deleteUser: (userId: string) => Promise<void> };
+    testClerk?: {
+      jwtKey: string;
+      deleteUser: (userId: string) => Promise<void>;
+      retryMs?: number;
+    };
   } = {},
 ): CloudServer {
   const staticDir = opts.staticDir;
@@ -240,6 +244,45 @@ export function startCloud(
   // Drop pairing tokens unused for 30+ days (also pruned on device-list fetch)
   // so a leaked token can't live forever.
   store.pruneStaleDeviceTokens();
+
+  const deletionRetryMs = opts.testClerk?.retryMs ?? 15_000;
+  const advanceManualDeletion = async (user: string): Promise<boolean> => {
+    if (store.manualDeletionComplete(user)) return true;
+    if (accountDeletes.has(user) || !store.claimManualDeletion(user, Date.now(), deletionRetryMs)) return false;
+    accountDeletes.add(user);
+    try {
+      const work = store.drainAccountPurge(user);
+      if (work.remaining > 0) {
+        if (work.removed > 0) store.continueManualDeletion(user);
+        return false;
+      }
+      try {
+        await (opts.testClerk?.deleteUser ?? deleteHostedClerkUser)(user);
+      } catch (error) {
+        if (!error || typeof error !== "object" || !("status" in error) || error.status !== 404) return false;
+      }
+      store.completeManualDeletion(user);
+      return true;
+    } finally {
+      accountDeletes.delete(user);
+    }
+  };
+  let manualPollRunning = false;
+  const pollManualDeletions = async () => {
+    if (manualPollRunning) return;
+    manualPollRunning = true;
+    try {
+      await Promise.allSettled(store.dueManualDeletions(Date.now()).map(advanceManualDeletion));
+    } finally {
+      manualPollRunning = false;
+    }
+  };
+  // Only resumes explicit fenced manual requests. No age/user discovery or
+  // inactivity deletion is enabled by this worker.
+  const deletionTimer = accountSelfService ? setInterval(() => void pollManualDeletions().catch(
+    () => console.error("weft-cloud: unable to poll pending manual deletions"),
+  ), deletionRetryMs) : null;
+  deletionTimer?.unref?.();
 
   // Opt-in periodic backups: WEFT_BACKUP_DIR enables a VACUUM-INTO DB snapshot
   // plus blob-tree copy every WEFT_BACKUP_INTERVAL_MIN (60), keeping
@@ -753,9 +796,14 @@ export function startCloud(
         return serveStatic(staticDir, path, req);
       }
 
-      if (path === "/api/account/export" && req.method === "GET") {
+      if (path === "/api/account/export/download" && req.method === "POST") {
         const headers = { "cache-control": "private, no-store", "referrer-policy": "no-referrer" };
-        const ticket = url.searchParams.get("ticket") ?? "";
+        if (!accountSelfService || req.headers.get("content-type")?.split(";")[0] !==
+            "application/x-www-form-urlencoded") return json({ error: "not found" }, 404, headers);
+        const body = await readBytes(req, 128);
+        if ("error" in body) return body.error;
+        // Put the bearer grant in the form body, never a URL/access-log query.
+        const ticket = new URLSearchParams(new TextDecoder().decode(body.bytes)).get("ticket") ?? "";
         const grant = accountExports.get(ticket);
         accountExports.delete(ticket);
         if (!accountSelfService || !grant || grant.expires <= Date.now() ||
@@ -849,10 +897,8 @@ export function startCloud(
         if (body?.confirm !== "DELETE") return json({ error: "confirmation-required" }, 400, noStore);
         // Check at the irreversible step, not before an asynchronous body read.
         if (!isRecentClerkSession(auth)) return json({ error: "recent-sign-in-required" }, 403, noStore);
-        if (accountDeletes.has(user)) return json({ status: "pending" }, 202, noStore);
-        accountDeletes.add(user);
         try {
-          store.stageAccountPurge(user);
+          store.stageAccountPurge(user, true);
           closeSockets(user, () => true);
           syncHeartbeats.delete(user);
           for (const [ticket, identity] of wsTickets) {
@@ -861,17 +907,13 @@ export function startCloud(
           for (const [ticket, grant] of accountExports) {
             if (grant.userId === user) accountExports.delete(ticket);
           }
-          const work = store.drainAccountPurge(user);
-          if (work.remaining > 0) return json({ status: "pending" }, 202, noStore);
-          await (opts.testClerk?.deleteUser ?? deleteHostedClerkUser)(user);
+          if (!await advanceManualDeletion(user)) return json({ status: "pending" }, 202, noStore);
           return new Response(null, { status: 204, headers: { ...CORS, ...noStore } });
         } catch {
           // If already fenced, never reopen the account or claim completion.
           return store.isAccountFenced(user)
             ? json({ status: "pending" }, 202, noStore)
             : json({ error: "account-deletion-unavailable" }, 503, noStore);
-        } finally {
-          accountDeletes.delete(user);
         }
       }
 
@@ -2383,6 +2425,7 @@ export function startCloud(
     stop: () => {
       if (backupTimer) clearInterval(backupTimer);
       if (changesPruneTimer) clearInterval(changesPruneTimer);
+      if (deletionTimer) clearInterval(deletionTimer);
       server.stop(true);
     },
   };
