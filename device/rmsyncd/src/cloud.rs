@@ -3,14 +3,17 @@
 //! xochitl CRDT-merge them; the merged file pushes back on its own change event.
 //! Pairing config lives in cloud.json ({url, token}); no config = loop disabled.
 
+use base64::Engine;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+use crate::recovery::{self, AssetDigest, Checkpoint};
 use crate::server::AppState;
 use crate::store::{Store, WriteError};
 
@@ -29,7 +32,12 @@ const MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 /// was down, and as the outbound direction (no server event drives pushes).
 /// Auth rides the x-device-token handshake header. Reconnects with capped
 /// backoff; a WS failure never affects the poll path.
-async fn ws_wake_loop(config: CloudConfig, wake_pages: Arc<Notify>, wake_docs: Arc<Notify>) {
+async fn ws_wake_loop(
+    config: CloudConfig,
+    wake_pages: Arc<Notify>,
+    wake_docs: Arc<Notify>,
+    wake_assets: Arc<Notify>,
+) {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -87,6 +95,7 @@ async fn ws_wake_loop(config: CloudConfig, wake_pages: Arc<Notify>, wake_docs: A
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
                                     match v.get("type").and_then(|x| x.as_str()) {
                                         Some("doc.list.changed") => wake_docs.notify_one(),
+                                        Some("page.asset.changed") => wake_assets.notify_one(),
                                         Some("page.changed") | Some("ops.appended") => {
                                             wake_pages.notify_one()
                                         }
@@ -136,6 +145,15 @@ struct CloudState {
     cloud_identity: String,
     /// "doc/page" -> last cloud revision we are based on
     revisions: HashMap<String, String>,
+    /// In-memory install path, derived from the configured relay identity.
+    #[serde(skip)]
+    recovery_root: Option<PathBuf>,
+    /// Last asset generation applied independently of native page revisions.
+    #[serde(default)]
+    pulled_asset_revisions: HashMap<String, String>,
+    /// Durable recovery/asset generations observed this run; populated lazily.
+    #[serde(skip)]
+    protected: HashMap<String, (String, String)>,
     /// "doc/page" -> sha256 of the .rm content last successfully PUT. Op-mode
     /// dedup: an op-mode page's revision is an op-head marker ("ops:N") that
     /// never equals the local sha, so `base == local_rev` always misses and the
@@ -264,6 +282,7 @@ pub fn spawn(state: AppState, config: CloudConfig, state_path: PathBuf) {
             Err(_) => CloudState::default(), // genuinely absent: fresh install
         };
         cloud = reconcile_state_identity(cloud, &identity);
+        cloud.recovery_root = Some(state_path.with_file_name("recovery-v1").join(identity));
         let mut events = state.events.subscribe();
         // The WebSocket wake (below) is the primary web->tablet path (~300ms).
         // The periodic tick is a low-frequency fallback plus the routine
@@ -279,10 +298,12 @@ pub fn spawn(state: AppState, config: CloudConfig, state_path: PathBuf) {
         // instead of waiting for the fallback tick.
         let wake_pages = Arc::new(Notify::new()); // page edits
         let wake_docs = Arc::new(Notify::new()); // renames/moves/templates/opens
+        let wake_assets = Arc::new(Notify::new());
         tokio::spawn(ws_wake_loop(
             config.clone(),
             wake_pages.clone(),
             wake_docs.clone(),
+            wake_assets.clone(),
         ));
 
         // Initial full sync: push the doc list, then every page/thumbnail the
@@ -335,8 +356,14 @@ pub fn spawn(state: AppState, config: CloudConfig, state_path: PathBuf) {
                             break;
                         }
                         pull_changes(&state, &client, &config, &mut cloud).await;
-                        save(&state_path, &cloud);
+                            save(&state_path, &cloud);
                     }
+                }
+                _ = wake_assets.notified() => {
+                    // Assets can change without an .rm revision. Sweep their
+                    // lightweight validators, never hash every local image.
+                    reconcile_current_pulls(&state, &client, &config, &mut cloud, &mut sweep_etag).await;
+                    save(&state_path, &cloud);
                 }
                 // Remote doc-list change (rename/move/template/open): apply it to
                 // xochitl immediately instead of on the fallback tick.
@@ -983,7 +1010,8 @@ async fn reconcile_pulls(
 ) {
     let mut req = client
         .get(format!("{}/api/revisions", config.url))
-        .header("x-device-token", &config.token);
+        .header("x-device-token", &config.token)
+        .header("x-weft-recovery", "1");
     if let Some(tag) = etag.as_deref() {
         req = req.header("if-none-match", tag);
     }
@@ -1007,6 +1035,7 @@ async fn reconcile_pulls(
     let Some(pages) = body.get("pages").and_then(|v| v.as_object()) else {
         return;
     };
+    let asset_markers = body.get("assets").and_then(|v| v.as_object());
     let mut all_ok = true;
     for doc in docs {
         for page in &doc.pages {
@@ -1014,7 +1043,36 @@ async fn reconcile_pulls(
             let Some(cloud_rev) = pages.get(&key).and_then(|v| v.as_str()) else {
                 continue; // cloud has never seen this page: push-only territory
             };
-            if needs_pull(cloud.revisions.get(&key).map(String::as_str), cloud_rev) {
+            let asset_marker = asset_markers.map(|markers| {
+                markers
+                    .get(&key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+            });
+            // Load once per process so steady-state sweeps don't parse every
+            // checkpoint overlay. The stored generation is separate from sync.
+            if asset_marker.is_some() && !cloud.protected.contains_key(&key) {
+                if let Some(saved) = recovery_dir(cloud, &doc.id, &page.id)
+                    .as_deref()
+                    .and_then(recovery::load)
+                {
+                    cloud
+                        .protected
+                        .insert(key.clone(), (saved.head.revision, saved.asset_revision));
+                }
+            }
+            let recovery_needed = asset_marker.is_some_and(|asset| {
+                cloud.pulled_asset_revisions.get(&key).map(String::as_str) != Some(asset)
+                    || (cloud.recovery_root.is_some()
+                        && cloud
+                            .protected
+                            .get(&key)
+                            .map(|(rev, assets)| (rev.as_str(), assets.as_str()))
+                            != Some((cloud_rev, asset)))
+            });
+            if recovery_needed
+                || needs_pull(cloud.revisions.get(&key).map(String::as_str), cloud_rev)
+            {
                 eprintln!("cloud: reconcile sweep pulling {key} (cloud at {cloud_rev})");
                 if !pull_page(state, client, config, cloud, &doc.id, &page.id).await {
                     all_ok = false; // transient failure: retry on the next sweep
@@ -1028,6 +1086,19 @@ async fn reconcile_pulls(
     if all_ok {
         *etag = fresh_etag;
     }
+}
+
+async fn reconcile_current_pulls(
+    state: &AppState,
+    client: &reqwest::Client,
+    config: &CloudConfig,
+    cloud: &mut CloudState,
+    etag: &mut Option<String>,
+) {
+    let mut docs = state.store.list_documents();
+    let excluded = expand_exclusions(&docs, &cloud.exclusions.iter().cloned().collect());
+    docs.retain(|d| !excluded.contains(&d.id));
+    reconcile_pulls(state, client, config, cloud, &docs, etag).await;
 }
 
 /// Full reconcile: walk every local document/page and push anything the cloud
@@ -1155,68 +1226,198 @@ fn source_push_order(docs: &[crate::store::DocEntry]) -> Vec<&str> {
 
 /// Pull the page's assets BEFORE its bytes so xochitl never sees a .rm
 /// referencing a missing resource.
-async fn pull_assets(
-    state: &AppState,
+const MAX_ASSET_BYTES: usize = 20 * 1024 * 1024;
+
+fn recovery_dir(cloud: &CloudState, doc: &str, page: &str) -> Option<PathBuf> {
+    recovery::page_dir(cloud.recovery_root.as_deref()?, doc, page)
+}
+
+fn asset_hash(path: &std::path::Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn read_asset_hash(path: &std::path::Path) -> Option<Option<String>> {
+    match asset_hash(path) {
+        Ok(hash) => Some(Some(hash)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+/// Verify the exact manifest version before installing a replacement. The
+/// expected digest is optional only for a legacy relay's name-only listing.
+async fn pull_asset(
+    store: &Store,
     client: &reqwest::Client,
     config: &CloudConfig,
     doc: &str,
     page: &str,
-) {
-    // Guard the cloud-supplied ids before they build a local probe path: the
-    // write path is already safe_id-checked, but the `local.exists()` probe
-    // below would otherwise let a hostile `doc=../..` test for files OUTSIDE the
-    // store (a read-only existence oracle). Defense in depth (#75d).
-    if !crate::store::safe_id(doc) || !crate::store::safe_id(page) {
-        return;
+    name: &str,
+    expected: Option<&str>,
+    prev: Option<(&std::path::Path, &str)>,
+    synced_mtime: Option<u64>,
+) -> Option<(bool, Option<u64>)> {
+    if !crate::store::valid_asset_filename(name) {
+        return None;
     }
-    let url = format!("{}/api/documents/{doc}/pages/{page}/assets", config.url);
-    let Ok(r) = client
-        .get(&url)
-        .header("x-device-token", &config.token)
-        .send()
-        .await
-    else {
-        return;
-    };
-    if !r.status().is_success() {
-        return;
+    let local = store.xochitl_dir.join(doc).join(page).join(name);
+    let before = read_asset_hash(&local)?;
+    if expected.is_some() && expected == before.as_deref() {
+        return Some((false, mtime_ms(&local)));
     }
-    let Ok(body) = r.json::<serde_json::Value>().await else {
-        return;
-    };
-    let files: Vec<String> = body
-        .get("files")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|f| f.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    for name in files {
-        if !crate::store::valid_asset_filename(&name) {
-            continue;
-        }
-        // skip if already present (assets are immutable per filename)
-        let local = state.store.xochitl_dir.join(doc).join(page).join(&name);
-        if local.exists() {
-            continue;
-        }
-        let url = format!("{}/api/documents/{doc}/pages/{page}/assets/{name}", config.url);
-        let Ok(resp) = client
-            .get(&url)
-            .header("x-device-token", &config.token)
-            .send()
-            .await
-        else {
-            continue;
-        };
-        if !resp.status().is_success() {
-            continue;
-        }
-        let Ok(bytes) = resp.bytes().await else { continue };
-        if let Err(e) = state.store.write_asset(doc, page, &name, &bytes) {
-            eprintln!("cloud: asset pull {name} write failed: {e}");
+    if let (Some(expected), Some((_, previous)), Some(existing)) =
+        (expected, prev, before.as_deref())
+    {
+        if existing != previous
+            && existing != expected
+            && !synced_mtime.is_some_and(|mtime| mtime_ms(&local) == Some(mtime))
+        {
+            // Divergent local bytes deserve the ordinary upload/reconciliation
+            // path, not an overwrite by a stale installed checkpoint.
+            return None;
         }
     }
+    let url = format!(
+        "{}/api/documents/{doc}/pages/{page}/assets/{name}",
+        config.url
+    );
+    let mut request = client.get(url).header("x-device-token", &config.token);
+    if let Some(hash) = before.as_deref() {
+        request = request.header("if-none-match", format!(r#""{hash}""#));
+    }
+    let response = request.send().await.ok()?;
+    if response.status().as_u16() == 304 {
+        return (before.is_some()
+            && (expected.is_none() || expected == before.as_deref())
+            && read_asset_hash(&local)? == before)
+            .then(|| (false, mtime_ms(&local)));
+    }
+    if response.status().as_u16() != 200
+        || response
+            .content_length()
+            .is_some_and(|n| n > MAX_ASSET_BYTES as u64)
+    {
+        return None;
+    }
+    let advertised = response
+        .headers()
+        .get("etag")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix('"')?.strip_suffix('"'))
+        .filter(|digest| recovery::is_digest(digest))
+        .map(String::from);
+    let mut body = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.chunk().await.ok()? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_ASSET_BYTES {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let digest = crate::store::sha256_hex(&bytes);
+    if expected.is_some_and(|hash| hash != digest)
+        || advertised.as_deref().is_some_and(|hash| hash != digest)
+        || read_asset_hash(&local)? != before
+    {
+        // Relay changed this name after issuing the manifest, or the
+        // tablet wrote a newer resource while the request was in flight.
+        return None;
+    }
+    if before.as_deref() == Some(&digest) {
+        return Some((false, mtime_ms(&local)));
+    }
+    if let Some((dir, previous)) = prev.filter(|(_, old)| before.as_deref() == Some(*old)) {
+        recovery::preserve_asset(dir, previous, &local).ok()?;
+    }
+    store.write_asset(doc, page, name, &bytes).ok()?;
+    Some((true, mtime_ms(&local)))
 }
 
+async fn pull_assets(
+    state: &AppState,
+    client: &reqwest::Client,
+    config: &CloudConfig,
+    cloud: &mut CloudState,
+    doc: &str,
+    page: &str,
+    manifest: Option<&[AssetDigest]>,
+    previous: Option<(&std::path::Path, &Checkpoint)>,
+) -> Option<Vec<String>> {
+    let legacy;
+    let entries = match manifest {
+        Some(assets) => assets,
+        None => {
+            #[derive(Deserialize)]
+            struct Names {
+                files: Vec<String>,
+            }
+            let response = client
+                .get(format!(
+                    "{}/api/documents/{doc}/pages/{page}/assets",
+                    config.url
+                ))
+                .header("x-device-token", &config.token)
+                .send()
+                .await
+                .ok()?;
+            if response.status().as_u16() == 404 {
+                // Very old relay with no assets route.
+                return Some(Vec::new());
+            }
+            legacy = response
+                .error_for_status()
+                .ok()?
+                .json::<Names>()
+                .await
+                .ok()?
+                .files
+                .into_iter()
+                .filter(|name| crate::store::valid_asset_filename(name))
+                .map(|name| AssetDigest {
+                    name,
+                    sha256: String::new(),
+                })
+                .collect::<Vec<_>>();
+            &legacy
+        }
+    };
+    let mut changed = Vec::new();
+    for asset in entries {
+        let digest = (!asset.sha256.is_empty()).then_some(asset.sha256.as_str());
+        let previous = previous.and_then(|(dir, saved)| {
+            let old = saved
+                .head
+                .assets
+                .iter()
+                .find(|old| old.name == asset.name)?;
+            Some((dir, old.sha256.as_str()))
+        });
+        let key = format!("{doc}/{page}/{}", asset.name);
+        let (replaced, mtime) = pull_asset(
+            &state.store,
+            client,
+            config,
+            doc,
+            page,
+            &asset.name,
+            digest,
+            previous,
+            cloud.assets.get(&key).copied(),
+        )
+        .await?;
+        if let Some(mtime) = mtime {
+            // Do not echo the freshly downloaded bytes back upstream.
+            cloud.assets.insert(key, mtime);
+        }
+        if replaced {
+            changed.push(format!("{doc}/{page}/{}", asset.name));
+        }
+    }
+    Some(changed)
+}
 
 /// Does the on-disk page hold content the cloud has never seen? True when
 /// the local sha differs from the last content we recorded as pushed/pulled.
@@ -1243,107 +1444,179 @@ async fn pull_page(
     doc: &str,
     page: &str,
 ) -> bool {
+    if !crate::store::safe_id(doc) || !crate::store::safe_id(page) {
+        return false;
+    }
+    let key = format!("{doc}/{page}");
+    let dir = recovery_dir(cloud, doc, page);
+    let saved = dir.as_deref().and_then(recovery::load);
+    let (local_bytes, local_rev) = state.store.read_page(doc, page).unwrap_or_default();
     let url = format!("{}/api/documents/{doc}/pages/{page}/rm", config.url);
-    let Ok(r) = client
+    let mut request = client
         .get(&url)
         .header("x-device-token", &config.token)
-        .send()
-        .await
-    else {
+        .header("x-weft-recovery", "1");
+    if !local_rev.is_empty() {
+        request = request.header("x-weft-native-sha256", &local_rev);
+        if let Some(saved) = saved.as_ref().filter(|s| s.head.native_sha256 == local_rev) {
+            request = request.header("if-none-match", &saved.etag);
+        }
+    }
+    let Ok(r) = request.send().await else {
         return false;
     };
+    if r.status().as_u16() == 304 {
+        let Some(saved) = saved.filter(|s| s.head.native_sha256 == local_rev) else {
+            return false;
+        };
+        cloud
+            .revisions
+            .insert(key.clone(), saved.head.revision.clone());
+        cloud.pushed.insert(key.clone(), local_rev);
+        cloud
+            .pulled_asset_revisions
+            .insert(key.clone(), saved.asset_revision.clone());
+        cloud
+            .protected
+            .insert(key, (saved.head.revision, saved.asset_revision));
+        return true;
+    }
     if r.status().as_u16() != 200 {
         return false;
     }
-    let cloud_rev = r
+    let has_recovery = r
         .headers()
-        .get("x-rm-revision")
+        .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let Ok(bytes) = r.bytes().await else {
-        return false;
+        .is_some_and(|v| v.split(';').next() == Some("application/json"));
+    let (cloud_rev, fetched_rev, bytes, checkpoint) = if has_recovery {
+        let Some(etag) = r
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+        else {
+            return false;
+        };
+        let Ok(payload) = r.json::<recovery::Response>().await else {
+            return false;
+        };
+        if !payload.head.valid() {
+            return false;
+        }
+        let bytes = match payload.native_base64 {
+            Some(base64) => match base64::engine::general_purpose::STANDARD.decode(base64) {
+                Ok(bytes) => bytes,
+                Err(_) => return false,
+            },
+            None if !local_rev.is_empty() && payload.head.native_sha256 == local_rev => local_bytes,
+            None => return false,
+        };
+        if crate::store::sha256_hex(&bytes) != payload.head.native_sha256 {
+            return false;
+        }
+        if !payload.missing_assets.is_empty() {
+            eprintln!("cloud: recovery assets not available for {doc}/{page}; retrying");
+            return false;
+        }
+        (
+            payload.head.revision.clone(),
+            payload.head.native_sha256.clone(),
+            bytes,
+            Some(Checkpoint {
+                version: 1,
+                etag,
+                asset_revision: payload.asset_revision,
+                head: payload.head,
+            }),
+        )
+    } else {
+        // Older relay: exact existing native protocol, with separately
+        // conditional image GETs and no recovery claim.
+        let revision = r
+            .headers()
+            .get("x-rm-revision")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let Ok(bytes) = r.bytes().await else {
+            return false;
+        };
+        (
+            revision,
+            crate::store::sha256_hex(&bytes),
+            bytes.to_vec(),
+            None,
+        )
     };
-
-    let local_rev = state
+    let native_changed = fetched_rev != local_rev;
+    // A differing page that the tablet has not pushed cannot be overwritten.
+    // Push it using the existing causal base and let the relay merge first.
+    if native_changed && has_unpushed_local(&local_rev, cloud.pushed.get(&key).map(String::as_str))
+    {
+        eprintln!("cloud: {doc}/{page} has unpushed local edits; pushing before pull");
+        return Box::pin(push_page(state, client, config, cloud, doc, page)).await;
+    }
+    // Even when both .rm byte hashes agree, editable state and same-name
+    // images may have been changed independently of native graphics.
+    let manifest = checkpoint.as_ref().map(|c| c.head.assets.as_slice());
+    let previous = dir.as_deref().zip(saved.as_ref());
+    let changed = pull_assets(state, client, config, cloud, doc, page, manifest, previous).await;
+    let mut changed = match changed {
+        Some(changed) => changed,
+        None if checkpoint.is_none() => Vec::new(), // preserve legacy best-effort asset behavior
+        None => return false, // coherent recovery must not consume an incomplete generation
+    };
+    if native_changed {
+        match state.store.write_page(doc, page, &local_rev, &bytes).await {
+            Ok(_) => changed.push(format!("{doc}/{page}.rm")),
+            Err(WriteError::StaleRevision { current }) => {
+                eprintln!(
+                    "cloud: {doc}/{page} changed locally mid-pull (on-disk {}); will resync",
+                    &current[..current.len().min(12)]
+                );
+                return true;
+            }
+            Err(WriteError::Io(e)) => {
+                eprintln!("cloud: local write of {doc}/{page} failed: {e}");
+                return false;
+            }
+        }
+    } else if state
         .store
         .read_page(doc, page)
         .map(|(_, rev)| rev)
-        .unwrap_or_default();
-    if local_rev == cloud_rev {
-        cloud.revisions.insert(format!("{doc}/{page}"), cloud_rev);
-        return true;
+        .as_deref()
+        != Some(&fetched_rev)
+    {
+        // Native bytes changed while the assets were in flight. Only a real
+        // accepted base can be used later to interpret native undo/deletion.
+        return false;
     }
-    // CONTENT compare, not just revision compare: an op-mode cloud revision is
-    // an opaque marker ("ops:N+S") that never equals the local sha, so without
-    // this every marker change rewrote the tablet file (and dbus-reloaded an
-    // open doc) even when the bytes were already identical. Identical bytes ⇒
-    // just adopt the marker; the file, xochitl, and the push dedup are already
-    // in the right state.
-    let fetched_rev = crate::store::sha256_hex(&bytes);
-    if fetched_rev == local_rev {
-        let key = format!("{doc}/{page}");
-        cloud.revisions.insert(key.clone(), cloud_rev);
-        cloud.pushed.insert(key, fetched_rev);
-        return true;
+    cloud.revisions.insert(key.clone(), cloud_rev);
+    cloud.pushed.insert(key.clone(), fetched_rev);
+    if !changed.is_empty() {
+        if let Some(conn) = &state.dbus {
+            crate::dbus::trigger_reload(conn, doc, &changed).await;
+        }
     }
-    // UNPUSHED-LOCAL GUARD: if the file differs from the last content we
-    // pushed/pulled, it holds tablet edits the cloud has never seen —
-    // writing the cloud bytes over it would destroy them. Push FIRST:
-    // applyDevicePut union-merges server-side and push_page's merged
-    // pullback writes the union here. Only report the change consumed if
-    // the push actually landed (recorded hash moved); otherwise leave the
-    // cursor to retry — a failed push must never convert into a clobber.
-    let key = format!("{doc}/{page}");
-    if has_unpushed_local(&local_rev, cloud.pushed.get(&key).map(String::as_str)) {
-        eprintln!("cloud: {doc}/{page} has unpushed local edits; pushing before pull");
-        // true only when the push (and its merged pull-back) actually landed
-        // the converged state on DISK — a failed pull-back must leave the
-        // cursor so the change retries next tick (attack panel H8)
-        return Box::pin(push_page(state, client, config, cloud, doc, page)).await;
-    }
-    // assets first: the incoming .rm may reference them (E26)
-    pull_assets(state, client, config, doc, page).await;
-    match state.store.write_page(doc, page, &local_rev, &bytes).await {
-        Ok(written_rev) => {
-            let key = format!("{doc}/{page}");
-            cloud.revisions.insert(key.clone(), cloud_rev);
-            // Record the CONTENT hash we just wrote to disk so the very next
-            // push dedups instead of re-PUTting a file we just RECEIVED from the
-            // cloud (F5). write_page returns the sha256 of the bytes now on
-            // disk; for op-mode pages that hash is what should_skip_push compares
-            // against local_rev. Without this, `pushed[key]` stays stale/absent
-            // and the page.changed event this write emits (plus the periodic
-            // reconcile_all) would push the just-pulled bytes straight back —
-            // the exact pull->push seam the dedup is meant to close, and the
-            // most common op-mode flow (web edit -> tablet). Set on both regimes
-            // (blob-mode still short-circuits on base==local_rev first).
-            cloud.pushed.insert(key, written_rev);
-            // tell xochitl to reload if the doc is open
-            if let Some(conn) = &state.dbus {
-                crate::dbus::trigger_reload(conn, doc, &[format!("{doc}/{page}.rm")]).await;
+    if let Some(checkpoint) = checkpoint {
+        let marker = (
+            checkpoint.head.revision.clone(),
+            checkpoint.asset_revision.clone(),
+        );
+        cloud
+            .pulled_asset_revisions
+            .insert(key.clone(), checkpoint.asset_revision.clone());
+        if let Some(dir) = dir {
+            if let Err(e) = recovery::commit(&dir, checkpoint, &bytes) {
+                eprintln!("cloud: recovery commit for {doc}/{page} failed: {e}");
+                return false;
             }
-            eprintln!("cloud: pulled {doc}/{page}");
-            true
-        }
-        // Local file changed under us between read and write (a concurrent
-        // xochitl save): the local copy is newer, so there is nothing to pull.
-        // Treat as an intentional skip (advance the cursor) — re-fetching would
-        // just hit the same stale-revision every tick and stall later changes;
-        // the tablet's own edit pushes its state up via its change event.
-        Err(WriteError::StaleRevision { current }) => {
-            eprintln!(
-                "cloud: {doc}/{page} changed locally mid-pull (on-disk {}); will resync",
-                &current[..current.len().min(12)]
-            );
-            true
-        }
-        // Real local write failure: do NOT advance the cursor; retry next tick.
-        Err(WriteError::Io(e)) => {
-            eprintln!("cloud: local write of {doc}/{page} failed: {e}");
-            false
+            cloud.protected.insert(key, marker);
         }
     }
+    true
 }
 
 async fn pull_changes(
@@ -1936,6 +2209,141 @@ mod tests {
         assert_eq!(cloud.since, 3);
         assert_eq!(first_requests.load(Ordering::Relaxed), 2);
         assert_eq!(second_requests.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn recovery_sweep_replaces_same_name_without_new_native_bytes_and_preserves_previous_on_failure() {
+        use axum::{http::{HeaderMap, StatusCode}, response::IntoResponse, routing::get, Router};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let native = b"native page already on tablet";
+        let native_sha = crate::store::sha256_hex(native);
+        let old = b"first image";
+        let new = b"replacement image";
+        let fname = "resource.png";
+        let variant = Arc::new(AtomicUsize::new(1));
+        let stale_asset = Arc::new(AtomicBool::new(false));
+        let revision_variant = variant.clone();
+        let page_variant = variant.clone();
+        let asset_variant = variant.clone();
+        let asset_stale = stale_asset.clone();
+        let advertised_native = native_sha.clone();
+        let page_hits = Arc::new(AtomicUsize::new(0));
+        let pages_seen = page_hits.clone();
+        let key = format!("{STAMP_DOC}/{STAMP_PAGE}");
+        let revision_key = key.clone();
+        let relay = Router::new()
+            .route("/api/revisions", get(move |headers: HeaderMap| {
+                let v = revision_variant.load(Ordering::Relaxed);
+                let tag = format!(r#""inventory-{v}""#);
+                let key = revision_key.clone();
+                async move {
+                    assert_eq!(headers["x-weft-recovery"], "1");
+                    if headers.get("if-none-match").is_some_and(|h| h == &tag) {
+                        return (StatusCode::NOT_MODIFIED, "").into_response();
+                    }
+                    ([("etag", tag)], axum::Json(serde_json::json!({
+                        "pages": { (&key): "ops:3+4" },
+                        "assets": { (&key): format!("assets-{v}") },
+                    }))).into_response()
+                }
+            }))
+            .route("/api/documents/{doc}/pages/{page}/rm", get(move |headers: HeaderMap| {
+                let v = page_variant.load(Ordering::Relaxed);
+                let sha = advertised_native.clone();
+                pages_seen.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    assert_eq!(headers["x-weft-recovery"], "1");
+                    assert_eq!(headers["x-weft-native-sha256"].to_str().unwrap(), sha);
+                    let digest = crate::store::sha256_hex(if v == 1 { old } else { new });
+                    let tag = format!(r#""checkpoint-{v}""#);
+                    if headers.get("if-none-match").is_some_and(|h| h == &tag) {
+                        return (StatusCode::NOT_MODIFIED, "").into_response();
+                    }
+                    ([("etag", tag)], axum::Json(serde_json::json!({
+                        "revision": "ops:3+4", "snapshotSeq": 4, "opSeq": 3,
+                        "nativeSha256": sha, "nativeBase64": null,
+                        "overlay": {"shapes": [{"props":{"weftArrowLinks":[{"toId":"shape:target"}]}}]},
+                        "assetRevision": format!("assets-{v}"),
+                        "assets": [{"name": fname, "sha256": digest}],
+                    }))).into_response()
+                }
+            }))
+            .route("/api/documents/{doc}/pages/{page}/assets/{name}", get(move || {
+                let v = asset_variant.load(Ordering::Relaxed);
+                let stale = asset_stale.load(Ordering::Relaxed);
+                async move {
+                    let bytes: &[u8] = if v == 1 || stale { old } else { new };
+                    let hash = crate::store::sha256_hex(bytes);
+                    ([("etag", format!(r#""{hash}""#))], bytes)
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = CloudConfig {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "test-device".into(),
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, relay).await.unwrap() });
+        let disk = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: Store::new(disk.path().to_path_buf()),
+            dbus: None,
+            events: tokio::sync::broadcast::channel(1).0,
+            firmware: String::new(),
+            model: String::new(),
+            templates_dir: disk.path().to_path_buf(),
+        };
+        assert!(state.store.create_notebook(STAMP_DOC, "Recovery", "", STAMP_PAGE, ""));
+        state.store.write_page(STAMP_DOC, STAMP_PAGE, "", native).await.unwrap();
+        let root = disk.path().join("recovery").join(cloud_identity(&config));
+        let path = recovery::page_dir(&root, STAMP_DOC, STAMP_PAGE).unwrap();
+        let native_asset = disk.path().join(STAMP_DOC).join(STAMP_PAGE).join(fname);
+        let client = reqwest::Client::new();
+        let mut cloud = CloudState {
+            recovery_root: Some(root),
+            revisions: [(key.clone(), "ops:3+4".into())].into(),
+            ..CloudState::default()
+        };
+        let mut etag = None;
+        let docs = state.store.list_documents();
+        reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
+        let protected = recovery::load(&path).unwrap();
+        assert_eq!(protected.etag, "\"checkpoint-1\"");
+        assert_eq!(protected.head.overlay["shapes"][0]["props"]["weftArrowLinks"][0]["toId"], "shape:target");
+        assert_eq!(std::fs::read(path.join(format!("{native_sha}.rm"))).unwrap(), native);
+        assert_eq!(std::fs::read(&native_asset).unwrap(), old);
+        assert_eq!(cloud.assets[&format!("{key}/{fname}")], mtime_ms(&native_asset).unwrap());
+
+        // No new page fetch when only the sweep request revalidates.
+        reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
+        assert_eq!(page_hits.load(Ordering::Relaxed), 1);
+
+        // Same native and semantic revisions, but independently changed asset.
+        variant.store(2, Ordering::Relaxed);
+        stale_asset.store(true, Ordering::Relaxed);
+        reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
+        assert_eq!(std::fs::read(&native_asset).unwrap(), old);
+        assert_eq!(recovery::load(&path).unwrap().etag, "\"checkpoint-1\"");
+
+        // Fail CAPTURE after successfully installing the replacement. The old
+        // marker still names the original bytes, kept in a fallback blob.
+        stale_asset.store(false, Ordering::Relaxed);
+        let blocked = path.join(".weft-tmp-checkpoint.json");
+        std::fs::create_dir(&blocked).unwrap();
+        reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
+        assert_eq!(std::fs::read(&native_asset).unwrap(), new);
+        assert_eq!(recovery::load(&path).unwrap().etag, "\"checkpoint-1\"");
+        let fallback = path.join(format!("{}.asset", crate::store::sha256_hex(old)));
+        assert_eq!(std::fs::read(&fallback).unwrap(), old);
+
+        std::fs::remove_dir(blocked).unwrap();
+        reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
+        assert_eq!(recovery::load(&path).unwrap().etag, "\"checkpoint-2\"");
+        assert!(!fallback.exists());
+        assert_eq!(state.store.read_page(STAMP_DOC, STAMP_PAGE).unwrap().0, native);
+        // The restored asset mtime is acknowledged to prevent a stale echo.
+        assert_eq!(cloud.assets[&format!("{key}/{fname}")], mtime_ms(&native_asset).unwrap());
         server.abort();
     }
 
