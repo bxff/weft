@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { RmDocument, Pen, PenColor, crdtId } from "@weft/rm-format";
+import { RmDocument, Pen, PenColor, crdtId, lww, uuidToBytesLE } from "@weft/rm-format";
 import { startCloud } from "../src/server";
 import type { OverlayDocument } from "@weft/sync-engine";
 
@@ -25,9 +25,22 @@ function line(x: number) {
   };
 }
 
+const imageId = "aaaaaaaa-0000-4000-a000-000000000004";
+const filename = imageId + ".png";
+const checkpointImage = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC", "base64");
+const replacementImage = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC", "base64");
+
 function fixture() {
   const base = RmDocument.empty(author);
   base.appendLine(line(100), { authorUuid: author });
+  base.blocks.push({
+    type: "sceneImageInfo", extraData: new Uint8Array(), version: { min: 1, current: 1 },
+    images: [{ uuid: imageId, filename: lww(crdtId(1, 11), filename), flags: lww(crdtId(1, 12), new Uint8Array([17, 0])) }],
+  });
+  base.appendImage({
+    kind: "image", uuid: lww(crdtId(1, 12), uuidToBytesLE(imageId)), timestamp: crdtId(0, 0),
+    vertices: [0, 0, 0, 0, 10, 0, 1, 0, 10, 10, 1, 1], indices: [0, 1, 2], filename: null,
+  }, { authorUuid: author });
   const native = base.serialize();
   // Stock Undo removes a block outright. A fresh-pairing PUT from unknown
   // ancestry cannot prove this removal; explicit restore has the exact base.
@@ -35,12 +48,14 @@ function fixture() {
   current.appendLine(line(200), { authorUuid: author });
   current.blocks.splice(current.blocks.findIndex(b => b.type === "sceneLineItem"), 1);
   return {
-    version: 1,
+    version: 1, mode: "same-tablet-newer-native",
     notebook: { id: notebookId, name: "Recovery", type: "notebook", parent: "",
       pages: [{ id: pageId, template: "Blank" }] },
     pages: [{ id: pageId, nativeBase64: Buffer.from(native).toString("base64"),
-      nativeSha256: digest(native), currentNativeBase64: Buffer.from(current.serialize()).toString("base64"),
-      overlay, assets: [] }],
+      nativeSha256: digest(native),
+      currentNative: { base64: Buffer.from(current.serialize()).toString("base64"),
+        assets: [{ name: filename, sha256: digest(checkpointImage) }] },
+      overlay, assets: [{ name: filename, sha256: digest(checkpointImage), base64: checkpointImage.toString("base64") }] }],
   };
 }
 
@@ -58,6 +73,23 @@ test("explicit recovery restores editable state and reconciles tablet Undo into 
     const fresh = credential("fresh");
     const other = credential("other");
     const body = fixture();
+    const { mode: _mode, ...ordinary } = body;
+    const { currentNative, ...storedPage } = body.pages[0]!;
+    expect((await post(ordinary, fresh)).status).toBe(400); // A caller must declare newer-native provenance.
+    expect((await post({ ...ordinary, pages: [{ ...storedPage, currentNativeBase64: currentNative.base64 }] }, fresh)).status).toBe(400);
+    const withCurrentDigests = (assets: { name: string; sha256: string }[]) => ({
+      ...body, pages: [{ ...storedPage, currentNative: { ...currentNative, assets } }],
+    });
+    expect((await post(withCurrentDigests([]), fresh)).status).toBe(400);
+    expect((await post(withCurrentDigests([{ name: filename, sha256: digest(replacementImage) }]), fresh)).status).toBe(400);
+    const checkpoint = credential("checkpoint");
+    expect((await post({ ...ordinary, pages: [storedPage] }, checkpoint)).status).toBe(201);
+    const url = baseUrl + "/documents/" + notebookId + "/pages/" + pageId;
+    const exact = await fetch(url + "/rm", { headers: checkpoint });
+    expect(Buffer.from(await exact.arrayBuffer()).toString("base64")).toBe(storedPage.nativeBase64);
+    const exactImage = await fetch(url + "/assets/" + filename, { headers: checkpoint });
+    expect(Buffer.from(await exactImage.arrayBuffer())).toEqual(checkpointImage);
+
     const badDigest = {
       ...body, pages: [{ ...body.pages[0]!, nativeSha256: "0".repeat(64) }],
     };
@@ -68,7 +100,6 @@ test("explicit recovery restores editable state and reconciles tablet Undo into 
     const result = await post(body, fresh);
     expect(result.status).toBe(201);
     expect(await result.json()).toEqual(expected);
-    const url = baseUrl + "/documents/" + notebookId + "/pages/" + pageId;
     const native = await fetch(url + "/rm", { headers: fresh });
     expect(native.status).toBe(200);
     const nativeDoc = RmDocument.parse(await native.arrayBuffer());

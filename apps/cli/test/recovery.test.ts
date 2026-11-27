@@ -11,8 +11,9 @@ const page = '23456789-1234-1234-1234-123456789abc'
 const deleted = '34567890-1234-1234-1234-123456789abc'
 const base = 'base'
 const ink = 'new ink'
-const image = 'mock image'
-const sha = (v: string) => createHash('sha256').update(v).digest('hex')
+const image = atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC')
+const replacement = atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC')
+const sha = (v: string) => createHash('sha256').update(v, 'latin1').digest('hex')
 const paths: string[] = []
 afterEach(() => { for (const p of paths.splice(0)) rmSync(p, { recursive: true, force: true }) })
 
@@ -31,7 +32,7 @@ function fixture() {
         cPages: { pages: [{ id: deleted, deleted: { value: 1 } }, { id: page }] },
     }))
     writeFileSync(join(nativeDirectory, doc, `${page}.rm`), ink)
-    writeFileSync(join(nativeDirectory, doc, page, 'photo.png'), image)
+    writeFileSync(join(nativeDirectory, doc, page, 'photo.png'), Buffer.from(image, 'latin1'))
     writeFileSync(join(checkpointDir, `${sha(base)}.rm`), base)
     const overlay = { shapes: [{ shapeId: 'shape:arrow', props: { weftArrowLinks: [{ toId: 'shape:text', props: {} }] } }] }
     writeFileSync(join(checkpointDir, 'checkpoint.json'), JSON.stringify({
@@ -40,16 +41,22 @@ function fixture() {
     return { opts: { notebookId: doc, recoveryDirectory, nativeDirectory }, overlay, checkpointDir }
 }
 
-test('plans one current notebook and preserves overlay, exact base and newer ink', () => {
+test('defaults to exact checkpoint and only includes newer ink with explicit opt-in', () => {
     const { opts, overlay } = fixture()
     const restore = prepareNotebookRestore(opts)
     expect(restore.notebook).toEqual({ id: doc, type: 'notebook', parent: '', name: 'Current name', pages: [{ id: page }] })
     expect(restore.pages).toEqual([{
-        id: page, overlay, nativeSha256: sha(base), nativeBase64: btoa(base), currentNativeBase64: btoa(ink),
+        id: page, overlay, nativeSha256: sha(base), nativeBase64: btoa(base),
         assets: [{ name: 'photo.png', sha256: sha(image), base64: btoa(image) }],
     }])
-    writeFileSync(join(opts.nativeDirectory, doc, `${page}.rm`), base)
-    expect(prepareNotebookRestore(opts).pages[0]).not.toHaveProperty('currentNativeBase64')
+    const withCurrent = prepareNotebookRestore({ ...opts, includeNewerNative: true })
+    expect(withCurrent.mode).toBe('same-tablet-newer-native')
+    expect(withCurrent.pages[0]?.currentNative).toEqual({
+        base64: btoa(ink), assets: [{ name: 'photo.png', sha256: sha(image) }],
+    })
+    // Checkpoint-only restore does not need any current native page bytes.
+    rmSync(join(opts.nativeDirectory, doc, `${page}.rm`))
+    expect(prepareNotebookRestore(opts)).toEqual(restore)
 })
 
 test('fails closed on asset version mismatch, missing checkpoint or symlink', () => {
@@ -59,7 +66,7 @@ test('fails closed on asset version mismatch, missing checkpoint or symlink', ()
     expect(() => prepareNotebookRestore(opts)).toThrow('asset hash mismatch')
     rmSync(asset)
     const other = join(opts.nativeDirectory, 'other.png')
-    writeFileSync(other, image)
+    writeFileSync(other, Buffer.from(image, 'latin1'))
     symlinkSync(other, asset)
     expect(() => prepareNotebookRestore(opts)).toThrow('must not be symlinks')
     rmSync(join(checkpointDir, 'checkpoint.json'))
@@ -68,10 +75,14 @@ test('fails closed on asset version mismatch, missing checkpoint or symlink', ()
 
 test('can recover the prior generation only from a verified hash-named fallback', () => {
     const { opts, checkpointDir } = fixture()
-    writeFileSync(join(opts.nativeDirectory, doc, page, 'photo.png'), 'replacement')
+    writeFileSync(join(opts.nativeDirectory, doc, page, 'photo.png'), Buffer.from(replacement, 'latin1'))
     const fallback = join(checkpointDir, `${sha(image)}.asset`)
-    writeFileSync(fallback, image)
-    expect(prepareNotebookRestore(opts).pages[0]?.assets[0]?.base64).toBe(btoa(image))
+    writeFileSync(fallback, Buffer.from(image, 'latin1'))
+    const restore = prepareNotebookRestore(opts)
+    expect(restore.pages[0]?.assets[0]?.base64).toBe(btoa(image))
+    expect(restore.pages[0]).not.toHaveProperty('currentNative')
+    expect(() => prepareNotebookRestore({ ...opts, includeNewerNative: true }))
+        .toThrow('Run without --include-newer-native')
     writeFileSync(fallback, 'bad fallback')
     expect(() => prepareNotebookRestore(opts)).toThrow('asset hash mismatch')
 })
@@ -118,5 +129,5 @@ test('rejects unsupported source documents and an oversized request before uploa
     expect(() => prepareNotebookRestore(f.opts)).toThrow('blank-template')
     writeFileSync(catalog, JSON.stringify({ cPages: { pages: [{ id: page }] } }))
     writeFileSync(join(f.opts.nativeDirectory, doc, `${page}.rm`), Buffer.alloc(13 * 1024 * 1024))
-    expect(() => prepareNotebookRestore(f.opts)).toThrow('16 MiB limit')
+    expect(() => prepareNotebookRestore({ ...f.opts, includeNewerNative: true })).toThrow('16 MiB limit')
 })

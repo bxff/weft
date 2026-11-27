@@ -60,6 +60,9 @@ function readOverlay(value: unknown): OverlayDocument {
 export function parseRecoveryImport(value: unknown): RecoveryImport {
   const input = record(value);
   const book = record(input?.notebook);
+  if (input?.mode !== undefined && input.mode !== "same-tablet-newer-native") {
+    return reject("unsupported recovery mode");
+  }
   const id = book?.id;
   const name = book?.name;
   if (input?.version !== 1 || book?.type !== "notebook" || book.parent !== "" ||
@@ -85,26 +88,41 @@ export function parseRecoveryImport(value: unknown): RecoveryImport {
         typeof raw.nativeSha256 !== "string") return reject("invalid recovery page");
     const overlay = readOverlay(raw.overlay);
     const native = readCanonicalBase64(raw.nativeBase64, raw.nativeSha256);
-    const currentNative = raw.currentNativeBase64 === undefined
-      ? undefined
-      : readCanonicalBase64(raw.currentNativeBase64);
-    const names = new Set<string>();
+    if (raw.currentNativeBase64 !== undefined) return reject("legacy current native input is ambiguous");
+    const current = raw.currentNative === undefined ? null : record(raw.currentNative);
+    if (raw.currentNative !== undefined &&
+        (input.mode !== "same-tablet-newer-native" || !current || !Array.isArray(current.assets))) {
+      return reject("current native requires explicit same-tablet newer-native mode and image digests");
+    }
+    const currentNative = current ? readCanonicalBase64(current.base64) : undefined;
+    const names = new Map<string, string>();
     const assets = raw.assets.map((entry: unknown) => {
       const asset = record(entry);
       if (!asset || typeof asset.name !== "string" || !assetPattern.test(asset.name) ||
           typeof asset.sha256 !== "string" || names.has(asset.name)) {
         return reject("invalid or duplicate recovery image");
       }
-      names.add(asset.name);
+      names.set(asset.name, asset.sha256);
       return { name: asset.name, bytes: readCanonicalBase64(asset.base64, asset.sha256) };
     });
-    // Validate the native file before writing anything, and require assets of
-    // the base AND later tablet edits so the imported page can open offline.
-    for (const bytes of currentNative ? [native, currentNative] : [native]) {
-      const doc = RmDocument.parse(bytes);
-      for (const [, item] of doc.tree().walk()) {
-        if (item.kind === "image" && (!item.filename || !names.has(item.filename))) {
-          return reject("recovery page is missing a referenced image");
+    const references = (bytes: Uint8Array) => [...RmDocument.parse(bytes).tree().walk()]
+      .flatMap(([, item]) => item.kind === "image" ? [item.filename] : []);
+    for (const filename of references(native)) {
+      if (!filename || !names.has(filename)) return reject("recovery checkpoint is missing a referenced image");
+    }
+    if (current && currentNative) {
+      const proof = new Map<string, string>();
+      for (const entry of current.assets as unknown[]) {
+        const asset = record(entry);
+        if (!asset || typeof asset.name !== "string" || typeof asset.sha256 !== "string" ||
+            proof.has(asset.name) || names.get(asset.name) !== asset.sha256) {
+          return reject("current image differs from the checkpoint; restore only the checkpoint instead");
+        }
+        proof.set(asset.name, asset.sha256);
+      }
+      for (const filename of references(currentNative)) {
+        if (!filename || !proof.has(filename)) {
+          return reject("current native references an unverified image; restore only the checkpoint instead");
         }
       }
     }

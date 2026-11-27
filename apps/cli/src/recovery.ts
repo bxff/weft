@@ -58,7 +58,7 @@ function notebookPages(content: Record<string, unknown>): Page[] {
 }
 
 /** Source consists of copies; acquisition and tablet pairing remain separate. */
-export function prepareNotebookRestore(opts: { notebookId: string; recoveryDirectory: string; nativeDirectory: string }) {
+export function prepareNotebookRestore(opts: { notebookId: string; recoveryDirectory: string; nativeDirectory: string; includeNewerNative?: boolean }) {
     const id = opts.notebookId
     if (!uuid.test(id)) throw Error('Expected the native notebook UUID')
     const recovery = realpathSync(resolve(opts.recoveryDirectory))
@@ -85,8 +85,9 @@ export function prepareNotebookRestore(opts: { notebookId: string; recoveryDirec
         if (!Array.isArray(overlay.shapes)) throw Error(`Missing editable state for page ${page}`)
         const nativeBase = verifiedRead(recovery, [id, page, `${nativeSha256}.rm`])
         if (hash(nativeBase) !== nativeSha256) throw Error(`Recovery base hash mismatch for page ${page}`)
-        const current = verifiedRead(native, [id, `${page}.rm`])
-        const currentSha256 = hash(current)
+        const current = opts.includeNewerNative ? verifiedRead(native, [id, `${page}.rm`]) : undefined
+        const newer = current && hash(current) !== nativeSha256 ? current : undefined
+        const currentAssets: { name: string; sha256: string }[] = []
         if (!Array.isArray(c.assets)) throw Error(`Missing asset manifest for page ${page}`)
         // The manifest names the exact assets this recovery checkpoint covers.
         const seen = new Set<string>()
@@ -98,7 +99,14 @@ export function prepareNotebookRestore(opts: { notebookId: string; recoveryDirec
             seen.add(name)
             const local = [id, page, name]
             let bytes = existsSync(join(native, ...local)) ? verifiedRead(native, local, maxAssetBytes) : undefined
-            if (!bytes || hash(bytes) !== sha256) {
+            const localMatches = bytes !== undefined && hash(bytes) === sha256
+            if (newer) {
+                if (!localMatches) {
+                    throw Error(`Cannot include newer tablet edits: current image differs from the checkpoint for page ${page}: ${name}. Run without --include-newer-native to restore the saved checkpoint instead.`)
+                }
+                currentAssets.push({ name, sha256 })
+            }
+            if (!localMatches) {
                 // A failed same-name replacement can leave the older checkpoint's
                 // verified bytes alongside it so that generation remains usable.
                 const fallback = [id, page, `${sha256}.asset`]
@@ -111,7 +119,7 @@ export function prepareNotebookRestore(opts: { notebookId: string; recoveryDirec
             id: page,
             nativeSha256,
             nativeBase64: nativeBase.toString('base64'),
-            ...(currentSha256 === nativeSha256 ? {} : { currentNativeBase64: current.toString('base64') }),
+            ...(newer ? { currentNative: { base64: newer.toString('base64'), assets: currentAssets } } : {}),
             overlay,
             assets,
         }
@@ -121,6 +129,7 @@ export function prepareNotebookRestore(opts: { notebookId: string; recoveryDirec
     })
     const restore = {
         version: 1,
+        ...(opts.includeNewerNative ? { mode: 'same-tablet-newer-native' as const } : {}),
         notebook: { id, name, parent: '', type: 'notebook', pages: pageList },
         pages,
     }
@@ -152,7 +161,12 @@ export async function submitNotebookRestore(opts: {
         redirect: 'error',
         signal: AbortSignal.timeout(120_000),
     })
-    if (r.status !== 200 && r.status !== 201) throw Error(`Restore failed (HTTP ${r.status}). The tablet has not been linked or changed.`)
+    if (r.status !== 200 && r.status !== 201) {
+        const retry = r.status === 400 && opts.restore.mode === 'same-tablet-newer-native'
+            ? ' Run without --include-newer-native to restore only the saved checkpoint.'
+            : ''
+        throw Error(`Restore failed (HTTP ${r.status}). The tablet has not been linked or changed.${retry}`)
+    }
     const result = await r.json().catch(() => null)
     if (!result || result.ok !== true || result.notebookId !== opts.restore.notebook.id) {
         throw Error('The relay did not confirm the restore. Check the destination before continuing.')

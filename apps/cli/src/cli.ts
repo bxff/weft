@@ -35,6 +35,7 @@ const flags = (() => {
                 'native-dir': { type: 'string' },
                 'store-timeout': { type: 'string' },
                 'dry-run': { type: 'boolean' },
+                'include-newer-native': { type: 'boolean' },
                 'two-way': { type: 'boolean' },
                 'no-auto-reinstall': { type: 'boolean' },
                 'experimental-rm2': { type: 'boolean' },
@@ -549,13 +550,14 @@ function link(): void {
 
 async function restoreNotebook(): Promise<void> {
     if (!flags.notebook || !flags['recovery-dir'] || !flags['native-dir'] || !CLOUD) {
-        throw Error('Usage: weft restore-notebook --cloud URL --notebook UUID --recovery-dir DIR --native-dir DIR [--dry-run]')
+        throw Error('Usage: weft restore-notebook --cloud URL --notebook UUID --recovery-dir DIR --native-dir DIR [--include-newer-native] [--dry-run]')
     }
     const { prepareNotebookRestore, submitNotebookRestore } = await import('./recovery')
     const restore = prepareNotebookRestore({
         notebookId: flags.notebook,
         recoveryDirectory: flags['recovery-dir'],
         nativeDirectory: flags['native-dir'],
+        includeNewerNative: flags['include-newer-native'],
     })
     if (DRY) {
         console.log(`Verified ${restore.pages.length} page(s). Nothing uploaded or changed.`)
