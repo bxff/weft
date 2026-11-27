@@ -127,3 +127,82 @@ test("explicit recovery restores editable state and reconciles tablet Undo into 
     else process.env.HOST = host;
   }
 });
+
+test("file-backed recovery rolls back a durability fault and verifies the edited head after restart", async () => {
+  const { mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { encodeSnapshot } = await import("@weft/sync-engine");
+  const host = process.env.HOST;
+  process.env.HOST = "127.0.0.1";
+  const dir = mkdtempSync(join(tmpdir(), "weft-restore-integrity-"));
+  const db = join(dir, "restore.sqlite");
+  const snapshots = join(dir, "restore.sqlite-files", "snapshots");
+  let cloud = startCloud({ port: 0, db });
+  try {
+    const raw = cloud.store as unknown as {
+      db: import("bun:sqlite").Database;
+      syncRecoveryPath(path: string): void;
+    };
+    const headers = { "x-api-key": cloud.store.mintApiKey("fresh", "restore").key, "content-type": "application/json" };
+    const body = JSON.stringify(fixture());
+    const post = () => fetch(`http://127.0.0.1:${cloud.port}/api/recovery/notebook`, { method: "POST", headers, body });
+    const barrier = raw.syncRecoveryPath.bind(raw);
+    const checked: string[] = [];
+    raw.syncRecoveryPath = (path) => {
+      expect(raw.db.inTransaction).toBe(true);
+      expect(raw.db.query("PRAGMA synchronous").values()).toEqual([[2]]);
+      checked.push(path);
+      if (path === snapshots) throw new Error("synthetic directory flush failure");
+      barrier(path);
+    };
+    expect((await post()).status).toBe(500);
+    expect(checked.filter(path => path.startsWith(snapshots + "/"))).toHaveLength(2);
+    expect(readdirSync(snapshots)).toEqual([]);
+    expect(JSON.parse(cloud.store.getDocuments("fresh"))).toEqual({ documents: [] });
+    expect(raw.db.query("SELECT * FROM recovery_imports").all()).toEqual([]);
+    expect(raw.db.query("PRAGMA synchronous").values()).toEqual([[1]]);
+    raw.syncRecoveryPath = barrier;
+    expect((await post()).status).toBe(201);
+    expect(raw.db.query("PRAGMA synchronous").values()).toEqual([[1]]);
+    const native = RmDocument.parse(Buffer.from(fixture().pages[0]!.currentNative.base64, "base64"));
+    native.appendLine(line(333), { authorUuid: author });
+    cloud.store.putSnapshot("fresh", notebookId, pageId, encodeSnapshot(native.serialize(), overlay));
+    cloud.store.putAsset("fresh", notebookId, pageId, filename, replacementImage);
+    const row = raw.db.query<{ path: string }, []>("SELECT path FROM page_snapshots ORDER BY seq DESC LIMIT 1").get()!;
+    cloud.stop();
+    raw.db.close();
+    cloud = startCloud({ port: 0, db });
+    expect((await post()).status).toBe(200);
+    const edited = await fetch(`http://127.0.0.1:${cloud.port}/api/documents/${notebookId}/pages/${pageId}/rm`, { headers });
+    expect([...RmDocument.parse(await edited.arrayBuffer()).tree().walk()]
+      .some(([, item]) => item.kind === "line" && item.points[0]?.x === 333)).toBe(true);
+    const exact = readFileSync(row.path);
+    const corrupt = Buffer.from(exact);
+    corrupt[corrupt.length - 1] ^= 0xff;
+    writeFileSync(row.path, corrupt);
+    expect((await post()).status).toBe(503);
+    expect(readFileSync(row.path)).toEqual(corrupt); // no repair or re-import
+    rmSync(row.path);
+    expect((await post()).status).toBe(503);
+    writeFileSync(row.path, exact);
+    const live = cloud.store as unknown as { db: import("bun:sqlite").Database };
+    // Rows written before the checksum migration have no trusted expected bytes.
+    live.db.run("UPDATE page_snapshots SET sha256=NULL WHERE path=?", [row.path]);
+    expect((await post()).status).toBe(503);
+    expect(readFileSync(row.path)).toEqual(exact);
+    live.db.run("UPDATE page_snapshots SET sha256=? WHERE path=?", [digest(exact), row.path]);
+    live.db.run("UPDATE assets SET bytes=? WHERE user_id=?", [checkpointImage, "fresh"]);
+    expect((await post()).status).toBe(503);
+    live.db.run("DELETE FROM assets WHERE user_id=?", ["fresh"]);
+    expect((await post()).status).toBe(503);
+    cloud.store.putAsset("fresh", notebookId, pageId, filename, replacementImage);
+    expect((await post()).status).toBe(200);
+  } finally {
+    cloud.stop();
+    (cloud.store as unknown as { db: import("bun:sqlite").Database }).db.close();
+    rmSync(dir, { recursive: true, force: true });
+    if (host === undefined) delete process.env.HOST;
+    else process.env.HOST = host;
+  }
+});
