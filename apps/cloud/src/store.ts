@@ -5,6 +5,7 @@
 
 import { Database } from "bun:sqlite";
 import { publishBackup } from "./backup";
+import { drainAccountPurge, initAccountPurge, isAccountFenced, stageAccountPurge, withAccountBlobWrite } from "./account-purge";
 import {
   mkdirSync,
   mkdtempSync,
@@ -381,6 +382,20 @@ export class CloudStore {
       }
     }
     this.initUsageTracking();
+    initAccountPurge(this.db);
+  }
+
+  isAccountFenced(userId: string): boolean {
+    return isAccountFenced(this.db, userId);
+  }
+
+  /** Storage-only foundation; not connected to request handlers. */
+  stageAccountPurge(userId: string): void {
+    stageAccountPurge(this.db, userId);
+  }
+
+  drainAccountPurge(userId: string): { removed: number; remaining: number } {
+    return drainAccountPurge(this.db, this.filesDir, userId);
   }
 
   // ----- per-user storage usage (two classes) -----
@@ -1691,12 +1706,14 @@ export class CloudStore {
     bytes: Uint8Array,
     mime = "application/pdf",
   ): void {
-    const path = this.filePath(user, doc);
-    writeFileSync(path, bytes);
-    this.db.run(
-      "INSERT OR REPLACE INTO files (user_id, doc, path, size, mime, etag) VALUES (?, ?, ?, ?, ?, ?)",
-      [user, doc, path, bytes.length, mime, sha256hex(bytes)],
-    );
+    withAccountBlobWrite(this.db, user, () => {
+      const path = this.filePath(user, doc);
+      writeFileSync(path, bytes);
+      this.db.run(
+        "INSERT OR REPLACE INTO files (user_id, doc, path, size, mime, etag) VALUES (?, ?, ?, ?, ?, ?)",
+        [user, doc, path, bytes.length, mime, sha256hex(bytes)],
+      );
+    });
   }
 
   /** Disk reference for a document's source file (for streaming + Range), or
@@ -2472,23 +2489,25 @@ export class CloudStore {
       ),
     );
     try {
-      writeFileSync(path, bytes);
-      const seq = this.db
-        .query(
-          "INSERT INTO page_snapshots (user_id, doc, page, path, size, ts, op_seq, revert) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .run(
-          user,
-          doc,
-          page,
-          path,
-          bytes.length,
-          Date.now(),
-          opSeq,
-          revert ? 1 : 0,
-        ).lastInsertRowid as number;
-      this.stagedPageFiles?.push(path);
-      return seq;
+      return withAccountBlobWrite(this.db, user, () => {
+        writeFileSync(path, bytes);
+        const seq = this.db
+          .query(
+            "INSERT INTO page_snapshots (user_id, doc, page, path, size, ts, op_seq, revert) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          )
+          .run(
+            user,
+            doc,
+            page,
+            path,
+            bytes.length,
+            Date.now(),
+            opSeq,
+            revert ? 1 : 0,
+          ).lastInsertRowid as number;
+        this.stagedPageFiles?.push(path);
+        return seq;
+      });
     } catch (error) {
       this.removeSnapshotFile(path);
       throw error;
