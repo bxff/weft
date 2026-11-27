@@ -8,6 +8,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1344,8 +1345,8 @@ fn read_asset_hash(path: &std::path::Path) -> Option<Option<String>> {
     }
 }
 
-/// Verify the exact manifest version before installing a replacement. The
-/// expected digest is optional only for a legacy relay's name-only listing.
+/// Ordinary sync installs missing assets. Recovery verifies the manifest and
+/// writes only to its sidecar, never into the live notebook.
 async fn pull_asset(
     store: &Store,
     client: &reqwest::Client,
@@ -1354,7 +1355,7 @@ async fn pull_asset(
     page: &str,
     name: &str,
     expected: Option<&str>,
-    prev: Option<(&std::path::Path, &str)>,
+    sidecar: Option<(&std::path::Path, &mut Vec<String>)>,
     budget: Option<&mut recovery::Budget>,
     deadline: Option<tokio::time::Instant>,
 ) -> Option<(bool, Option<u64>)> {
@@ -1362,40 +1363,46 @@ async fn pull_asset(
         return None;
     }
     let local = store.xochitl_dir.join(doc).join(page).join(name);
-    let before = read_asset_hash(&local)?;
-    if expected.is_some() && expected == before.as_deref() {
-        return Some((false, mtime_ms(&local)));
-    }
-    if expected.is_none() && before.is_some() {
-        // Ordinary sync retains its original filename-immutable behavior.
-        return Some((false, mtime_ms(&local)));
-    }
-    if let Some(existing) = before.as_deref() {
-        // A first backfill or an unsent local edit cannot be overwritten on
-        // the strength of an mtime or a matching filename. Only replace
-        // bytes known to belong to the previous protected generation.
-        if !prev.is_some_and(|(_, previous)| existing == previous) {
-            return None;
+    let mut sidecar = sidecar;
+    let before = if let Some(hash) = expected {
+        let (dir, staged) = sidecar.as_mut()?;
+        if recovery::has_asset(dir, hash) {
+            return Some((false, None));
         }
-    }
+        // Live bytes are mutable. Reuse them as a source, never as the only
+        // retained copy. Commit the exact verified bytes, not a hard link.
+        let mut bytes = Vec::new();
+        if std::fs::File::open(&local)
+            .and_then(|file| {
+                file.take(MAX_ASSET_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+            })
+            .is_ok()
+            && bytes.len() <= MAX_ASSET_BYTES
+            && crate::store::sha256_hex(&bytes) == hash
+        {
+            staged.push(hash.to_owned());
+            recovery::save_asset(dir, hash, &bytes, budget).ok()?;
+            return Some((false, None));
+        }
+        None
+    } else {
+        let before = read_asset_hash(&local)?;
+        if before.is_some() {
+            // Ordinary sync retains its original filename-immutable behavior.
+            return Some((false, mtime_ms(&local)));
+        }
+        before
+    };
     let url = format!(
         "{}/api/documents/{doc}/pages/{page}/assets/{name}",
         config.url
     );
     let mut request = client.get(url).header("x-device-token", &config.token);
-    if let Some(hash) = before.as_deref() {
-        request = request.header("if-none-match", format!(r#""{hash}""#));
-    }
     if let Some(deadline) = deadline {
         request = request.timeout(deadline.checked_duration_since(tokio::time::Instant::now())?);
     }
     let response = request.send().await.ok()?;
-    if response.status().as_u16() == 304 {
-        return (before.is_some()
-            && (expected.is_none() || expected == before.as_deref())
-            && read_asset_hash(&local)? == before)
-            .then(|| (false, mtime_ms(&local)));
-    }
     if response.status().as_u16() != 200
         || response
             .content_length()
@@ -1421,24 +1428,20 @@ async fn pull_asset(
     let digest = crate::store::sha256_hex(&bytes);
     if expected.is_some_and(|hash| hash != digest)
         || advertised.as_deref().is_some_and(|hash| hash != digest)
-        || read_asset_hash(&local)? != before
     {
-        // Relay changed this name after issuing the manifest, or the
-        // tablet wrote a newer resource while the request was in flight.
         return None;
     }
-    if before.as_deref() == Some(&digest) {
-        return Some((false, mtime_ms(&local)));
+    if let Some(hash) = expected {
+        let (dir, staged) = sidecar?;
+        staged.push(hash.to_owned());
+        recovery::save_asset(dir, hash, &bytes, budget).ok()?;
+        // Never acknowledge a sidecar fetch as a local device asset upload.
+        return Some((false, None));
     }
-    if let Some((dir, previous)) = prev.filter(|(_, old)| before.as_deref() == Some(*old)) {
-        recovery::preserve_asset(dir, previous, &local, budget).ok()?;
+    if read_asset_hash(&local)? != before {
+        return None;
     }
     store.write_asset(doc, page, name, &bytes).ok()?;
-    if expected.is_some() {
-        // The ordinary store treats a directory sync failure as best effort.
-        // Recovery may only advertise assets whose directory entry is durable.
-        std::fs::File::open(local.parent()?).ok()?.sync_all().ok()?;
-    }
     Some((true, mtime_ms(&local)))
 }
 
@@ -1450,7 +1453,7 @@ async fn pull_assets(
     doc: &str,
     page: &str,
     manifest: Option<&[AssetDigest]>,
-    previous: Option<(&std::path::Path, &Checkpoint)>,
+    mut sidecar: Option<(&std::path::Path, &mut Vec<String>)>,
     changed: &mut Vec<String>,
     deadline: Option<tokio::time::Instant>,
 ) -> Option<()> {
@@ -1498,14 +1501,6 @@ async fn pull_assets(
             return None;
         }
         let digest = (!asset.sha256.is_empty()).then_some(asset.sha256.as_str());
-        let previous = previous.and_then(|(dir, saved)| {
-            let old = saved
-                .head
-                .assets
-                .iter()
-                .find(|old| old.name == asset.name)?;
-            Some((dir, old.sha256.as_str()))
-        });
         let key = format!("{doc}/{page}/{}", asset.name);
         let Some((replaced, mtime)) = pull_asset(
             &state.store,
@@ -1515,7 +1510,7 @@ async fn pull_assets(
             page,
             &asset.name,
             digest,
-            previous,
+            sidecar.as_mut().map(|(dir, staged)| (*dir, &mut **staged)),
             cloud.recovery_budget.as_mut(),
             deadline,
         )
@@ -1524,8 +1519,8 @@ async fn pull_assets(
             complete = false;
             continue;
         };
-        if let Some(mtime) = mtime.filter(|_| replaced || digest.is_some()) {
-            // Do not echo fetched or exact hash-verified bytes upstream.
+        if let Some(mtime) = mtime.filter(|_| replaced) {
+            // Do not echo newly installed ordinary sync assets upstream.
             cloud.assets.insert(key, mtime);
         }
         if replaced {
@@ -1603,12 +1598,11 @@ async fn pull_page_inner(
     let dir = capture.then(|| recovery_dir(cloud, doc, page)).flatten();
     let saved = dir.as_deref().and_then(recovery::load);
     let (local_bytes, local_rev) = state.store.read_page(doc, page).unwrap_or_default();
-    let assets_dir = state.store.xochitl_dir.join(doc).join(page);
     let verified = saved.as_ref().filter(|saved| {
         saved.head.native_sha256 == local_rev
             && dir
                 .as_deref()
-                .is_some_and(|dir| recovery::verify_files(dir, &assets_dir, saved))
+                .is_some_and(|dir| recovery::verify_files(dir, saved))
     });
     let url = format!("{}/api/documents/{doc}/pages/{page}/rm", config.url);
     let mut request = client.get(&url).header("x-device-token", &config.token);
@@ -1638,7 +1632,7 @@ async fn pull_page_inner(
                 != Some(&local_rev)
             || !dir
                 .as_deref()
-                .is_some_and(|dir| recovery::verify_files(dir, &assets_dir, saved))
+                .is_some_and(|dir| recovery::verify_files(dir, saved))
         {
             return false;
         }
@@ -1702,8 +1696,8 @@ async fn pull_page_inner(
             !payload.missing_assets.is_empty(),
         )
     } else {
-        // Older relay: exact existing native protocol, with separately
-        // conditional image GETs and no recovery claim.
+        // Older relay: exact existing native protocol, with separate image
+        // GETs and no recovery claim.
         let revision = r
             .headers()
             .get("x-rm-revision")
@@ -1722,12 +1716,59 @@ async fn pull_page_inner(
         )
     };
     let native_changed = fetched_rev != local_rev;
-    if capture && (native_changed || cloud.revisions.get(&key) != Some(&cloud_rev)) {
-        // Recovery is a sidecar of the accepted native revision, never a
-        // second writer of page data or of the normal change cursor.
+    if let (Some(checkpoint), Some(dir)) = (checkpoint, dir.as_deref()) {
+        // Recovery only protects an accepted native revision. Never write the
+        // live page, advance the regular cursor, or acknowledge local assets.
+        if native_changed || cloud.revisions.get(&key) != Some(&cloud_rev) || missing_assets {
+            return false;
+        }
+        let mut staged = Vec::new();
+        let complete = pull_assets(
+            state,
+            client,
+            config,
+            cloud,
+            doc,
+            page,
+            Some(&checkpoint.head.assets),
+            Some((dir, &mut staged)),
+            &mut Vec::new(),
+            deadline,
+        )
+        .await
+        .is_some();
+        let still_current = state
+            .store
+            .read_page(doc, page)
+            .is_some_and(|(_, rev)| rev == fetched_rev);
+        if complete && still_current {
+            let marker = (
+                checkpoint.head.revision.clone(),
+                checkpoint.asset_revision.clone(),
+            );
+            match recovery::commit(dir, checkpoint, &bytes, cloud.recovery_budget.as_mut()) {
+                Ok(()) => {
+                    cloud
+                        .pulled_asset_revisions
+                        .insert(key.clone(), marker.1.clone());
+                    cloud.protected.insert(key, marker);
+                    return true;
+                }
+                Err(e) => eprintln!("cloud: recovery commit for {doc}/{page} failed: {e}"),
+            }
+        }
+        recovery::discard_staged_assets(
+            dir,
+            saved.as_ref(),
+            &staged,
+            cloud.recovery_budget.as_mut(),
+        );
         return false;
     }
-    if !capture && !native_changed {
+    if capture {
+        return false;
+    }
+    if !native_changed {
         cloud.revisions.insert(key.clone(), cloud_rev);
         cloud.pushed.insert(key, fetched_rev);
         return true;
@@ -1740,85 +1781,40 @@ async fn pull_page_inner(
         eprintln!("cloud: {doc}/{page} has unpushed local edits; pushing before pull");
         return Box::pin(push_page(state, client, config, cloud, doc, page)).await;
     }
-    // Even when both .rm byte hashes agree, editable state and same-name
-    // images may have been changed independently of native graphics.
-    let manifest = checkpoint.as_ref().map(|c| c.head.assets.as_slice());
-    let previous = dir.as_deref().zip(saved.as_ref());
     let mut changed = Vec::new();
-    let assets_verified = pull_assets(
+    let _ = pull_assets(
         state,
         client,
         config,
         cloud,
         doc,
         page,
-        manifest,
-        previous,
+        None,
+        None,
         &mut changed,
-        deadline,
+        None,
     )
-    .await
-    .is_some()
-        && !missing_assets;
-    if native_changed {
-        match state.store.write_page(doc, page, &local_rev, &bytes).await {
-            Ok(_) => changed.push(format!("{doc}/{page}.rm")),
-            Err(WriteError::StaleRevision { current }) => {
-                eprintln!(
-                    "cloud: {doc}/{page} changed locally mid-pull (on-disk {}); will resync",
-                    &current[..current.len().min(12)]
-                );
-                return true;
-            }
-            Err(WriteError::Io(e)) => {
-                eprintln!("cloud: local write of {doc}/{page} failed: {e}");
-                return false;
-            }
+    .await;
+    match state.store.write_page(doc, page, &local_rev, &bytes).await {
+        Ok(_) => changed.push(format!("{doc}/{page}.rm")),
+        Err(WriteError::StaleRevision { current }) => {
+            eprintln!(
+                "cloud: {doc}/{page} changed locally mid-pull (on-disk {}); will resync",
+                &current[..current.len().min(12)]
+            );
+            return true;
         }
-    } else if state
-        .store
-        .read_page(doc, page)
-        .map(|(_, rev)| rev)
-        .as_deref()
-        != Some(&fetched_rev)
-    {
-        // Native bytes changed while the assets were in flight. Only a real
-        // accepted base can be used later to interpret native undo/deletion.
-        return false;
-    }
-    if !capture {
-        cloud.revisions.insert(key.clone(), cloud_rev);
-        cloud.pushed.insert(key.clone(), fetched_rev);
-    }
-    if !changed.is_empty() {
-        if !native_changed {
-            // An asset-only replacement must refresh an already open page.
-            changed.push(format!("{doc}/{page}.rm"));
-        }
-        if let Some(conn) = &state.dbus {
-            crate::dbus::trigger_reload(conn, doc, &changed).await;
+        Err(WriteError::Io(e)) => {
+            eprintln!("cloud: local write of {doc}/{page} failed: {e}");
+            return false;
         }
     }
-    if let Some(checkpoint) = checkpoint.filter(|_| assets_verified) {
-        let marker = (
-            checkpoint.head.revision.clone(),
-            checkpoint.asset_revision.clone(),
-        );
-        cloud
-            .pulled_asset_revisions
-            .insert(key.clone(), checkpoint.asset_revision.clone());
-        if let Some(dir) = dir {
-            if !recovery::verify_assets(&dir, &assets_dir, &checkpoint) {
-                return false;
-            }
-            match recovery::commit(&dir, checkpoint, &bytes, cloud.recovery_budget.as_mut()) {
-                Ok(()) => {
-                    cloud.protected.insert(key, marker);
-                }
-                Err(e) => eprintln!("cloud: recovery commit for {doc}/{page} failed: {e}"),
-            }
-        }
+    cloud.revisions.insert(key.clone(), cloud_rev);
+    cloud.pushed.insert(key, fetched_rev);
+    if let Some(conn) = &state.dbus {
+        crate::dbus::trigger_reload(conn, doc, &changed).await;
     }
+
     true
 }
 
@@ -2478,8 +2474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_sweep_replaces_same_name_without_new_native_bytes_and_preserves_previous_on_failure(
-    ) {
+    async fn recovery_sweep_keeps_same_name_assets_in_sidecar_and_never_changes_local_bytes() {
         use axum::{
             http::{HeaderMap, StatusCode},
             response::IntoResponse,
@@ -2551,6 +2546,9 @@ mod tests {
                     }))).into_response()
                 }
             }))
+            .route("/api/documents/{doc}/pages/{page}/assets", get(move || async move {
+                axum::Json(serde_json::json!({"files": [fname]}))
+            }))
             .route("/api/documents/{doc}/pages/{page}/assets/{name}", get(move || {
                 let v = asset_variant.load(Ordering::Relaxed);
                 let stale = asset_stale.load(Ordering::Relaxed);
@@ -2588,24 +2586,22 @@ mod tests {
         let native_asset = disk.path().join(STAMP_DOC).join(STAMP_PAGE).join(fname);
         let client = reqwest::Client::new();
         let mut cloud = CloudState {
+            recovery_budget: Some(recovery::Budget::open(root.parent().unwrap()).unwrap()),
             recovery_root: Some(root),
             revisions: [(key.clone(), "ops:3+4".into())].into(),
             ..CloudState::default()
         };
-        let mut etag = None;
         let docs = state.store.list_documents();
-        // First backfill has no trustworthy old generation. A pending
-        // same-name local resource must survive a differing remote digest.
+        // First backfill must capture the relay bytes without modifying or
+        // acknowledging an unsent same-name local resource.
         state
             .store
             .write_asset(STAMP_DOC, STAMP_PAGE, fname, b"unsent local")
             .unwrap();
+        let mut etag = None;
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
-        assert_eq!(std::fs::read(&native_asset).unwrap(), b"unsent local");
-        assert!(recovery::load(&path).is_none());
-        assert!(etag.is_none());
-        std::fs::remove_file(&native_asset).unwrap();
-        reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
+        let fallback = path.join(format!("{}.asset", crate::store::sha256_hex(old)));
+        assert_eq!(std::fs::read(&fallback).unwrap(), old);
         let protected = recovery::load(&path).unwrap();
         assert_eq!(protected.etag, "\"checkpoint-1\"");
         assert_eq!(
@@ -2616,15 +2612,12 @@ mod tests {
             std::fs::read(path.join(format!("{native_sha}.rm"))).unwrap(),
             native
         );
-        assert_eq!(std::fs::read(&native_asset).unwrap(), old);
-        assert_eq!(
-            cloud.assets[&format!("{key}/{fname}")],
-            mtime_ms(&native_asset).unwrap()
-        );
+        assert_eq!(std::fs::read(&native_asset).unwrap(), b"unsent local");
+        assert!(!cloud.assets.contains_key(&format!("{key}/{fname}")));
 
         // No new page fetch when only the sweep request revalidates.
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
-        assert_eq!(page_hits.load(Ordering::Relaxed), 2);
+        assert_eq!(page_hits.load(Ordering::Relaxed), 1);
 
         // Valid JSON can silently lose overlay data without affecting the
         // native/asset hashes or stored validator. Simulate a restart and
@@ -2637,23 +2630,45 @@ mod tests {
         assert_eq!(parsed["etag"], "\"checkpoint-1\"");
         std::fs::write(&manifest_path, corrupt).unwrap();
         assert!(recovery::load(&path).is_none());
+        // Reuse matching live bytes as a source but retain an independent
+        // copy, so deleting or editing that live file cannot break restore.
+        std::fs::remove_file(&fallback).unwrap();
+        state
+            .store
+            .write_asset(STAMP_DOC, STAMP_PAGE, fname, old)
+            .unwrap();
         cloud.protected.clear();
         cloud.pulled_asset_revisions.clear();
         etag = None;
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
-        assert_eq!(page_hits.load(Ordering::Relaxed), 3);
+        assert_eq!(page_hits.load(Ordering::Relaxed), 2);
         assert_eq!(std::fs::read_to_string(&manifest_path).unwrap(), original);
+        state
+            .store
+            .write_asset(STAMP_DOC, STAMP_PAGE, fname, b"another local edit")
+            .unwrap();
+        assert_eq!(std::fs::read(&fallback).unwrap(), old);
+        assert!(recovery::verify_files(
+            &path,
+            &recovery::load(&path).unwrap()
+        ));
+        std::fs::remove_file(&native_asset).unwrap();
+        assert!(recovery::verify_files(
+            &path,
+            &recovery::load(&path).unwrap()
+        ));
 
         // Simulate recovery storage loss across a restart. A stale ETag cannot
         // mask a missing asset or a base file with the correct name but bad bytes.
-        std::fs::remove_file(&native_asset).unwrap();
+        std::fs::write(&fallback, b"corrupt").unwrap();
         std::fs::write(path.join(format!("{native_sha}.rm")), b"corrupt").unwrap();
         cloud.protected.clear();
         cloud.pulled_asset_revisions.clear();
         etag = None;
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
-        assert_eq!(page_hits.load(Ordering::Relaxed), 4);
-        assert_eq!(std::fs::read(&native_asset).unwrap(), old);
+        assert_eq!(page_hits.load(Ordering::Relaxed), 3);
+        assert!(!native_asset.exists());
+        assert_eq!(std::fs::read(&fallback).unwrap(), old);
         assert_eq!(
             std::fs::read(path.join(format!("{native_sha}.rm"))).unwrap(),
             native
@@ -2664,24 +2679,33 @@ mod tests {
         variant.store(2, Ordering::Relaxed);
         stale_asset.store(true, Ordering::Relaxed);
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
-        assert_eq!(std::fs::read(&native_asset).unwrap(), old);
+        assert!(!native_asset.exists());
+        assert_eq!(std::fs::read(&fallback).unwrap(), old);
         assert_eq!(recovery::load(&path).unwrap().etag, "\"checkpoint-1\"");
 
-        // Fail CAPTURE after successfully installing the replacement. The old
-        // marker still names the original bytes, kept in a fallback blob.
+        // Fail manifest commit after staging the replacement. The old
+        // manifest still reads its original verified sidecar blob.
         stale_asset.store(false, Ordering::Relaxed);
         let blocked = path.join(".weft-tmp-checkpoint.json");
         std::fs::create_dir(&blocked).unwrap();
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
-        assert_eq!(std::fs::read(&native_asset).unwrap(), new);
+        assert!(!native_asset.exists());
         assert_eq!(recovery::load(&path).unwrap().etag, "\"checkpoint-1\"");
-        let fallback = path.join(format!("{}.asset", crate::store::sha256_hex(old)));
         assert_eq!(std::fs::read(&fallback).unwrap(), old);
+
+        let new_sidecar = path.join(format!("{}.asset", crate::store::sha256_hex(new)));
+        assert!(
+            !new_sidecar.exists(),
+            "failed capture must retire its new budget charge"
+        );
 
         std::fs::remove_dir(blocked).unwrap();
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
         assert_eq!(recovery::load(&path).unwrap().etag, "\"checkpoint-2\"");
         assert!(!fallback.exists());
+        let replacement = path.join(format!("{}.asset", crate::store::sha256_hex(new)));
+        assert_eq!(std::fs::read(replacement).unwrap(), new);
+        assert!(!native_asset.exists());
         assert_eq!(
             state.store.read_page(STAMP_DOC, STAMP_PAGE).unwrap().0,
             native
@@ -2695,11 +2719,49 @@ mod tests {
         assert_eq!(recovery::load(&path).unwrap().head.revision, "ops:3+4");
         assert_eq!(cloud.protected[&key].0, "ops:3+4");
 
-        // The restored asset mtime is acknowledged to prevent a stale echo.
-        assert_eq!(
-            cloud.assets[&format!("{key}/{fname}")],
-            mtime_ms(&native_asset).unwrap()
-        );
+        assert!(!cloud.assets.contains_key(&format!("{key}/{fname}")));
+        // Ordinary sync still downloads a missing resource and acknowledges
+        // only that live install; it does not replace a present filename.
+        let mut changed = Vec::new();
+        pull_assets(
+            &state,
+            &client,
+            &config,
+            &mut cloud,
+            STAMP_DOC,
+            STAMP_PAGE,
+            None,
+            None,
+            &mut changed,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&native_asset).unwrap(), new);
+        assert_eq!(changed.len(), 1);
+        let ack = cloud.assets[&format!("{key}/{fname}")];
+        state
+            .store
+            .write_asset(STAMP_DOC, STAMP_PAGE, fname, b"dirty")
+            .unwrap();
+        changed.clear();
+        pull_assets(
+            &state,
+            &client,
+            &config,
+            &mut cloud,
+            STAMP_DOC,
+            STAMP_PAGE,
+            None,
+            None,
+            &mut changed,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&native_asset).unwrap(), b"dirty");
+        assert!(changed.is_empty());
+        assert_eq!(cloud.assets[&format!("{key}/{fname}")], ack);
         server.abort();
     }
 
