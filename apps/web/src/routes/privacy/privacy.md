@@ -3,7 +3,7 @@ title: Privacy Notice
 description: How hosted Weft handles sign-in, synced notebooks, and privacy requests.
 ---
 
-Last revised 26 November 2026.
+Last revised 27 November 2026.
 
 ## Who runs Weft and what this notice covers
 
@@ -65,4 +65,4 @@ Disconnecting your tablet stops syncing but does not remove the hosted copy. Del
 
 ## Changes to this notice
 
-I may update this notice as Weft changes. I’ll update the revision date and notify affected users before material changes to how I use their personal data take effect.
+I may update this notice as Weft changes. The revision date shows when it was last updated. I’ll bring significant changes to affected people’s attention and tell them before using their existing personal data for a new purpose.
