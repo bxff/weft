@@ -68,7 +68,7 @@ The relay listens on <http://localhost:8080>. SQLite persists in the
 
 ### Password-based self-hosting with Bun
 
-From the repo root, run `bun install --frozen-lockfile`. Copy `.env.example` to `.env`, clear the example `CLERK_SECRET_KEY`, and set a strong `WEFT_PASSWORD`. Leave `PUBLIC_CLERK_PUBLISHABLE_KEY` empty in the web build. The `WEFT_REQUIRE_HOSTED_TERMS` setting is reserved for the weft.page relay; leave it unset when self-hosting.
+From the repo root, run `bun install --frozen-lockfile`. Copy `.env.example` to `.env`, clear the example `CLERK_SECRET_KEY`, and set a strong `WEFT_PASSWORD`. Leave `PUBLIC_CLERK_PUBLISHABLE_KEY` empty in the web build.
 
 ```sh
 HOST=127.0.0.1 PORT=8080 CLOUD_DB=/path/to/weft.db bun --env-file=.env apps/cloud/src/server.ts
