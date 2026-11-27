@@ -125,23 +125,28 @@ test('styled wrap changes at the measured edge and avoids splitting Unicode fall
     expectInk(result!.lineWidthsInk[2]!, 24)
 })
 
-test('a serialized anchor after a wrap keeps its absolute ink baseline', () => {
-    const author = 'aaaa0000-0000-4000-a000-000000000001'
-    const doc = RmDocument.empty(author)
-    createRootText(doc, { posX: -419, posY: 271.25, width: 28 })
-    insertText(doc, null, 'A i A', { authorUuid: author })
-    const chars = rootTextCharPositions(doc.rootTextBlock!.text)
-    const lastChar = chars.find((c) => c.offset === 4)
-    if (!lastChar) throw new Error('missing anchor at the last glyph')
-    const group = doc.blocks.find((b) => b.type === 'treeNode' && b.nodeId.part2 === 11)
-    if (group?.type !== 'treeNode') throw new Error('missing layer')
-    const ts = crdtId(1, 1000)
-    group.anchorId = lww(ts, lastChar.id)
-    group.anchorType = lww(ts, 2)
-    group.anchorOriginX = lww(ts, -419)
-    group.anchorThreshold = lww(ts, 0)
-    const restored = RmDocument.parse(doc.serialize())
-    const offset = computeAnchorOffsets(restored).get('0:11')
-    expect(offset?.dx).toBe(-419)
-    expectInk(offset!.dy, 395.9375)
-})
+test.each([
+    ['A i A', 28, [0, 2, 4]],
+    ['😀i A', 31.5, [0, 2, 4]],
+] as const)(
+    'a serialized anchor after wrapping %s keeps the absolute baseline',
+    (text, width, starts) => {
+        const author = 'aaaa0000-0000-4000-a000-000000000001'
+        const doc = RmDocument.empty(author)
+        createRootText(doc, { posX: -419, posY: 271.25, width })
+        insertText(doc, null, text, { authorUuid: author })
+        const lastChar = rootTextCharPositions(doc.rootTextBlock!.text).at(-1)!
+        const group = doc.blocks.find((b) => b.type === 'treeNode' && b.nodeId.part2 === 11)
+        if (group?.type !== 'treeNode') throw new Error('missing layer')
+        const ts = crdtId(1, 1000)
+        group.anchorId = lww(ts, lastChar.id)
+        group.anchorType = lww(ts, 2)
+        group.anchorOriginX = lww(ts, -419)
+        group.anchorThreshold = lww(ts, 0)
+        const restored = RmDocument.parse(doc.serialize())
+        const offset = computeAnchorOffsets(restored).get('0:11')
+        expect(layoutText([para(text)], width).paras[0]!.lineStarts).toEqual([...starts])
+        expect(offset).toEqual({ dx: -419, dy: 395.9375 })
+        expect(rootTextCharPositions(restored.rootTextBlock!.text).at(-1)?.offset).toBe(4)
+    },
+)
