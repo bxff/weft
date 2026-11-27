@@ -1185,6 +1185,24 @@ export function TldrawApp({ docId, pageId, onController }: TldrawAppProps) {
                                     Your edits stay in this browser; nothing is lost.
                                 </>
                             )}
+                        {controller.hasParkedProjectionDrafts && (
+                            <p>
+                                A newer edit won. Weft kept your text draft in this browser instead of replacing the newer edit.{' '}
+                                <button onClick={() => {
+                                    const bytes = controller.exportParkedProjectionDrafts()
+                                    if (bytes) downloadBytes(bytes, `${pageId}-text-drafts.json`, 'application/json')
+                                }}>
+                                    Download text draft
+                                </button>
+                            </p>
+                        )}
+                        {controller.hasUnattributedLegacyEdits && (
+                            <p>
+                                If an older Weft version left unsynced edits, they stay in their original browser storage.
+                                Weft couldn’t verify their account, so it does not open, move, or upload them.
+                                If you still have their original editor open under the original account, finish syncing there.
+                            </p>
+                        )}
                         {controller.hasUnreadableShapes && (
                             <p>
                                 This version of Weft can’t display some browser shapes.

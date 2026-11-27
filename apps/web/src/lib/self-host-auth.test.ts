@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
-import { getAuthToken, selfHostLogin, signOut } from './auth'
+import { bearerMatchesClerkReplicaAccount, getAuthToken, selectedClerkReplicaAccount, selfHostLogin, signOut } from './auth'
 import { connection, setCloudUrl } from './settings'
 import { openSource } from './sourceFile'
-import { resetTransport, transport } from './transport'
+import { readBoundBearer, resetTransport, transport } from './transport'
 
 const firstRelay = 'https://first-relay.invalid'
 const secondRelay = 'https://second-relay.invalid'
@@ -17,6 +17,11 @@ function mockFetch(implementation: (...args: Parameters<typeof fetch>) => Return
 beforeEach(() => {
     const values = new Map<string, string>([['weft-clerk-pk', '']])
     const props = {
+        sessionStorage: {
+            getItem: (key: string) => values.get('session:' + key) ?? null,
+            setItem: (key: string, value: string) => values.set('session:' + key, value),
+            removeItem: (key: string) => values.delete('session:' + key),
+        },
         localStorage: {
             getItem: (key: string) => values.get(key) ?? null,
             setItem: (key: string, value: string) => values.set(key, value),
@@ -195,4 +200,48 @@ test('a cold hosted PDF open takes its owner from the authenticated session', as
         Reflect.deleteProperty(host, '__WEFT_CLERK_MOCK__')
         mock.mockRestore()
     }
+})
+
+
+test('scoped editor requires an explicitly selected Clerk issuer and subject and rejects switched bearers', () => {
+    const clerk = 'pk_test_example'
+    localStorage.setItem('weft-clerk-pk', clerk)
+    const selection = `weft-clerk-active/${encodeURIComponent(firstRelay)}/${encodeURIComponent(clerk)}`
+    const claims = { iss: 'https://issuer-a.example.invalid', sub: 'same-subject', exp: Date.now() / 1000 + 90 }
+    const bearer = (patch: Partial<typeof claims> = {}) => 'h.' + btoa(JSON.stringify({ ...claims, ...patch })) + '.s'
+    const account = JSON.stringify(['clerk', claims.iss, claims.sub])
+    sessionStorage.setItem('weft-clerk-token', JSON.stringify({
+        value: bearer(), publishableKey: clerk, relay: firstRelay,
+    }))
+    expect(selectedClerkReplicaAccount()).toBeNull()
+    localStorage.setItem(selection, account)
+    expect(selectedClerkReplicaAccount()).toBe(account)
+    expect(bearerMatchesClerkReplicaAccount(bearer(), account)).toBe(true)
+    expect(bearerMatchesClerkReplicaAccount(bearer({ iss: 'https://issuer-b.example.invalid' }), account)).toBe(false)
+    expect(bearerMatchesClerkReplicaAccount(bearer({ sub: 'different user' }), account)).toBe(false)
+    expect(bearerMatchesClerkReplicaAccount(bearer({ exp: 1 }), account)).toBe(false)
+    localStorage.setItem(selection, '')
+    expect(selectedClerkReplicaAccount()).toBeNull()
+    localStorage.setItem(selection, account)
+    setCloudUrl(secondRelay)
+    expect(selectedClerkReplicaAccount()).toBeNull()
+})
+
+
+test('a bearer refresh in progress cannot authorize a retired scope', async () => {
+    const refresh = Promise.withResolvers<string>()
+    let selected = true
+    const waiting = readBoundBearer(() => selected, token => token === 'old account bearer', () => refresh.promise)
+    selected = false
+    refresh.resolve('old account bearer')
+    await expect(waiting).rejects.toThrow()
+    let refreshed = false
+    await expect(readBoundBearer(() => false, () => true, async () => {
+        refreshed = true
+        return 'must not refresh'
+    })).rejects.toThrow()
+    expect(refreshed).toBe(false)
+    await expect(readBoundBearer(() => true, token => token === 'expected', async () => 'wrong'))
+        .rejects.toThrow()
+    expect(await readBoundBearer(() => true, token => token === 'expected', async () => 'expected')).toBe('expected')
 })

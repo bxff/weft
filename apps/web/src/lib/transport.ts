@@ -2,30 +2,66 @@
  *  self-hosted) with a bearer token; the tablet is a sync agent, not an app server. */
 import { HttpTransport, EngineFailure, type DocumentInfo, type Transport } from '@weft/sync-engine'
 import { connection, isSelfHosted, watchRelayChange } from './settings'
-import { getAuthToken } from './auth'
+import { bearerMatchesClerkReplicaAccount, devUser, getAuthToken, localPreferenceOwner, selectedClerkReplicaAccount } from './auth'
 import { cacheDocumentList, clearCachedDocumentList, libraryCacheScope, readCachedDocumentList } from './library-cache'
 
-let instance: { relay: string; transport: HttpTransport } | null = null
+let instance: { relay: string; transport: HttpTransport; projectionAccount: string | null } | null = null
+const projectionScopes = new WeakMap<Transport, { scope: string; valid: () => boolean }>()
+
+export function projectionScope(source: Transport): string | undefined {
+    const binding = projectionScopes.get(source)
+    return instance?.transport === source && binding?.valid() ? binding.scope : undefined
+}
+
+export function needsHostedProjectionScope(): boolean {
+    return import.meta.env.MODE === 'projection-journal-hosted-review' && !isSelfHosted()
+}
+
 let relayWatcher: AbortController | null = null
+
+/** Check the selected owner on both sides of Clerk's asynchronous refresh. */
+export async function readBoundBearer(
+    authorized: () => boolean,
+    matches: (bearer: string | null) => boolean,
+    read: () => Promise<string | null> = getAuthToken,
+): Promise<string | null> {
+    if (!authorized()) throw new EngineFailure({ _tag: 'Unauthorized' })
+    const bearer = await read()
+    if (!authorized() || !matches(bearer)) throw new EngineFailure({ _tag: 'Unauthorized' })
+    return bearer
+}
 
 export function transport(): HttpTransport {
     const relay = connection().cloudUrl
-    if (instance && instance.relay !== relay) resetTransport()
+    const hosted = needsHostedProjectionScope()
+    const account = hosted ? selectedClerkReplicaAccount() : null
+    if (instance && (instance.relay !== relay || instance.projectionAccount !== account)) resetTransport()
     if (!instance) {
         relayWatcher = new AbortController()
         watchRelayChange(resetTransport, relayWatcher.signal)
+        // Isolated, loopback-only proof. Do not silently switch an installed
+        // browser to a fresh replica format; legacy ownership is unknown.
+        const dev = import.meta.env.MODE === 'projection-journal-test' ? devUser() : ''
+        const proof = dev &&
+            /^http:\/\/(localhost|127\.0\.0\.1)(:[0-9]+)?$/.test(relay) &&
+            localPreferenceOwner() === `dev:${dev}` ? JSON.stringify([relay, dev]) : undefined
+        const scope = account ? JSON.stringify([relay, 'clerk', account]) : proof || undefined
+        const valid = () => connection().cloudUrl === relay &&
+            (account ? needsHostedProjectionScope() && selectedClerkReplicaAccount() === account
+                : localPreferenceOwner() === `dev:${dev}`)
         const transport = new HttpTransport({
             baseUrl: relay,
             documentListBaseUrl: !isSelfHosted() && window.location.origin === import.meta.env.PUBLIC_WEFT_PAGES_ORIGIN
                 ? window.location.origin : undefined,
-            getAuthToken: async () => {
-                if (connection().cloudUrl !== relay) throw new EngineFailure({ _tag: 'Unauthorized' })
-                const token = await getAuthToken()
-                if (connection().cloudUrl !== relay) throw new EngineFailure({ _tag: 'Unauthorized' })
-                return token
-            },
+            getAuthToken: () => readBoundBearer(
+                () => connection().cloudUrl === relay &&
+                    (!scope || instance?.transport === transport && valid()),
+                bearer => account ? bearerMatchesClerkReplicaAccount(bearer, account)
+                    : !proof || bearer === `dev:${dev}`,
+            ),
         })
-        instance = { relay, transport }
+        if (scope) projectionScopes.set(transport, { scope, valid })
+        instance = { relay, transport, projectionAccount: account }
     }
     return instance.transport
 }

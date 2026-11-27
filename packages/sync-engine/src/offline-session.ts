@@ -19,7 +19,7 @@ import {
 } from './ops'
 import { decodeSnapshot, encodeSnapshot } from './snapshot'
 import { applyMoveRewrites, auditOverlay, reconcile as reconcilePolicy } from './reconciler'
-import type { KeyValueStorage } from './storage'
+import type { KeyValueStorage, StorageEntry } from './storage'
 import type { OpRecord, PageEvent, Transport } from './transport'
 import {
     EngineFailure,
@@ -66,6 +66,8 @@ export interface OfflineSessionOptions extends ApplyOptions {
      * Defaults to primary (single-context callers: tests, tools).
      */
     cachePrimary?: boolean
+    /** Stable, verified connection+account identity. Never guess ownership of a legacy unscoped queue. */
+    replicaScope?: string
     /**
      * Run `fn` while exclusively holding the given author's cross-tab lock,
      * or return false if unavailable (that author's tab is alive). Orphan
@@ -127,7 +129,8 @@ export class OfflineSession {
     ) {}
 
     private key(suffix: string): string {
-        return `page/${this.docId}/${this.pageId}/${suffix}`
+        const scope = this.opts.replicaScope
+        return `page/${scope ? encodeURIComponent(scope) + '/' : ''}${this.docId}/${this.pageId}/${suffix}`
     }
 
     static async open(
@@ -424,6 +427,41 @@ export class OfflineSession {
         })
         this.status({ state: 'pending', ops: this.pendingOps.length })
         void this.reconcile()
+    }
+
+    deferredDraftStorageKey(draftId: string): string {
+        if (!this.opts.replicaScope) throw new Error('Deferred drafts require a scoped notebook replica')
+        return this.key(`deferred/${this.opts.authorUuid}/${encodeURIComponent(draftId)}`)
+    }
+
+    /** Move one already-durable editor draft into this author's outbox.
+     *  The caller owns the draft namespace/author lease and supplies its exact
+     *  captured value and scope check. Projection is not visible to the
+     *  sync engine until the local transition is committed. */
+    async applyDeferredDraft(
+        draft: StorageEntry, ops: LocalOp[], isCurrent: () => boolean,
+    ): Promise<boolean> {
+        if (!ops.length) return false
+        const prefix = this.deferredDraftStorageKey('')
+        if (!draft[0].startsWith(prefix) || draft[0].length === prefix.length) return false
+        const consume = this.storage.consume?.bind(this.storage)
+        if (!consume) throw new Error('Atomic draft storage unavailable')
+        let committed = false
+        await this.writePending(async () => {
+            const mayWrite = () => !this.disposed && isCurrent()
+            if (!mayWrite()) return
+            const next = [...this.pendingOps, ...ops]
+            const destination: StorageEntry = [this.pendingKey(), new TextEncoder().encode(JSON.stringify(next))]
+            if (!await consume(draft, destination, mayWrite)) return
+            this.pendingOps = next
+            this.pendingVersion++
+            committed = true
+        })
+        if (committed && !this.disposed) {
+            this.status({ state: 'pending', ops: this.pendingOps.length })
+            void this.reconcile()
+        }
+        return committed
     }
 
     private status(s: SyncStatus): void {

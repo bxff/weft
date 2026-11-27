@@ -17,6 +17,13 @@ export interface KeyValueStorage {
     keys(prefix: string): Promise<string[]>
     /** Commit both changes together. Required for orphan queue adoption. */
     setAndDelete?(key: string, value: Uint8Array, deleteKey: string): Promise<void>
+    /** Atomically consume the exact generation of a deferred edit. A replaced
+     *  or missing source must not change either key. Keys must be distinct. */
+    consume?(source: StorageEntry, destination: StorageEntry, mayWrite: () => boolean): Promise<boolean>
+}
+
+function sameBytes(left: Uint8Array | null, right: Uint8Array): boolean {
+    return left !== null && left.length === right.length && left.every((byte, i) => byte === right[i])
 }
 
 export class MemoryStorage implements KeyValueStorage {
@@ -46,6 +53,13 @@ export class MemoryStorage implements KeyValueStorage {
     async setAndDelete(key: string, value: Uint8Array, deleteKey: string): Promise<void> {
         this.map.set(key, value.slice())
         this.map.delete(deleteKey)
+    }
+    async consume(source: StorageEntry, destination: StorageEntry, mayWrite: () => boolean): Promise<boolean> {
+        if (source[0] === destination[0]) throw new Error('Cannot consume into the same key')
+        if (!mayWrite() || !sameBytes(this.map.get(source[0]) ?? null, source[1])) return false
+        this.map.set(destination[0], destination[1].slice())
+        this.map.delete(source[0])
+        return true
     }
     async keys(prefix: string): Promise<string[]> {
         return [...this.map.keys()].filter((k) => k.startsWith(prefix))
@@ -133,6 +147,24 @@ export class IdbStorage implements KeyValueStorage {
         await this.tx('readwrite', (store) => {
             store.put(value, key)
             return store.delete(deleteKey)
+        })
+    }
+    async consume(source: StorageEntry, destination: StorageEntry, mayWrite: () => boolean): Promise<boolean> {
+        if (source[0] === destination[0]) throw new Error('Cannot consume into the same key')
+        return this.transaction('readwrite', (store) => {
+            let consumed = false
+            const read = store.get(source[0])
+            read.onsuccess = () => {
+                try {
+                    if (!mayWrite() || !sameBytes(this.readBytes(read.result), source[1])) return
+                    store.put(destination[1], destination[0])
+                    store.delete(source[0])
+                    consumed = true
+                } catch {
+                    store.transaction.abort()
+                }
+            }
+            return () => consumed
         })
     }
     async keys(prefix: string): Promise<string[]> {

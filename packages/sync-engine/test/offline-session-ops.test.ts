@@ -1794,3 +1794,64 @@ test('an individual subscriber sees both loose ink and a browser shape from the 
         session.dispose()
     }
 })
+
+test('deferred projection is transferred only for its exact durable generation', async () => {
+    const daemon = FakeDaemon.withBlankPage(DOC, PAGE)
+    const storage = new MemoryStorage()
+    const openScoped = (transport: FakeDaemon, replicaScope = 'account-a@relay-a') =>
+        OfflineSession.open(storage, transport, DOC, PAGE, {
+            clientId: 'client-A', authorUuid: AUTHOR_A, replicaScope, onPatch: () => {},
+        })
+    const client = await openScoped(daemon)
+    await settle(client)
+    const draft = client.deferredDraftStorageKey('shape')
+    const old = new Uint8Array([1])
+    const latest = new Uint8Array([2])
+    await storage.set(draft, latest)
+    expect(await client.applyDeferredDraft([draft, old], [shapeOp('shape', 1)], () => true)).toBe(false)
+    expect(await client.applyDeferredDraft([draft, latest], [shapeOp('shape', 2)], () => false)).toBe(false)
+    expect(client.pendingCount).toBe(0)
+    expect(await storage.get(draft)).toEqual(latest)
+
+    const failCommit = spyOn(storage, 'consume').mockRejectedValueOnce(new Error('transaction aborted'))
+    await expect(client.applyDeferredDraft([draft, latest], [shapeOp('shape', 2)], () => true))
+        .rejects.toThrow('transaction aborted')
+    expect(client.pendingCount).toBe(0)
+    expect(await storage.get(draft)).toEqual(latest)
+    expect(client.currentOverlay.shapes).toHaveLength(0)
+    failCommit.mockRestore()
+    await client.disposeAndDrainLocalWrites()
+
+    const offline = new Proxy(daemon, {
+        get(target, key) {
+            if (key === 'appendOps' || key === 'putSnapshot') return async () => { throw new Error('offline') }
+            const value = Reflect.get(target, key)
+            return typeof value === 'function' ? value.bind(target) : value
+        },
+    })
+    const reopened = await openScoped(offline)
+    await settle(reopened)
+    expect(await reopened.applyDeferredDraft([draft, latest], [shapeOp('shape', 2)], () => true)).toBe(true)
+    expect(await storage.get(draft)).toBeNull()
+    expect(await reopened.applyDeferredDraft([draft, latest], [shapeOp('shape', 2)], () => true)).toBe(false)
+    expect(reopened.pendingCount).toBe(1)
+    await reopened.disposeAndDrainLocalWrites()
+    const otherRelay = FakeDaemon.withBlankPage(DOC, PAGE)
+    for (const changedScope of ['account-b@relay-a', 'account-a@relay-b']) {
+        const other = await openScoped(otherRelay, changedScope)
+        await settle(other)
+        expect(other.pendingCount).toBe(0)
+        expect(other.currentOverlay.shapes).toHaveLength(0)
+        expect(await other.applyDeferredDraft([draft, latest], [shapeOp('shape', 2)], () => true)).toBe(false)
+        await other.disposeAndDrainLocalWrites()
+    }
+    expect(await otherRelay.opsSince(DOC, PAGE, 0)).toEqual([])
+    const reconnected = await openScoped(daemon)
+    await settle(reconnected)
+    const peer = await openSession(daemon, new MemoryStorage(), 'client-B', AUTHOR_B)
+    await settle(peer)
+    expect(peer.currentOverlay.shapes.map(s => s.shapeId)).toEqual(['shape'])
+    expect(liveLines(peer.document)).toBe(1)
+    await reconnected.disposeAndDrainLocalWrites()
+    await peer.disposeAndDrainLocalWrites()
+})
