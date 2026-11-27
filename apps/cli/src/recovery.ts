@@ -114,12 +114,10 @@ export function prepareNotebookRestore(opts: { notebookId: string; recoveryDirec
             const local = [id, page, name]
             let bytes = existsSync(join(native, ...local)) ? verifiedRead(native, local, maxAssetBytes) : undefined
             const localMatches = bytes !== undefined && hash(bytes) === sha256
-            if (newer) {
-                if (!localMatches) {
-                    throw Error(`Cannot include newer tablet edits: current image differs from the checkpoint for page ${page}: ${name}. Run without --include-newer-native to restore the saved checkpoint instead.`)
-                }
-                currentAssets.push({ name, sha256 })
+            if (opts.includeNewerNative && !localMatches) {
+                throw Error(`Cannot include newer tablet edits: current image differs from the checkpoint for page ${page}: ${name}. Run without --include-newer-native to restore the saved checkpoint instead.`)
             }
+            if (newer) currentAssets.push({ name, sha256 })
             if (!localMatches) {
                 // A failed same-name replacement can leave the older checkpoint's
                 // verified bytes alongside it so that generation remains usable.

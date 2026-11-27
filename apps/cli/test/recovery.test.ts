@@ -96,6 +96,10 @@ test('can recover the prior generation only from a verified hash-named fallback'
     expect(restore.pages[0]).not.toHaveProperty('currentNative')
     expect(() => prepareNotebookRestore({ ...opts, includeNewerNative: true }))
         .toThrow('Run without --include-newer-native')
+    // Image-only edits can change the photo without touching native .rm bytes.
+    writeFileSync(join(opts.nativeDirectory, doc, `${page}.rm`), base)
+    expect(() => prepareNotebookRestore({ ...opts, includeNewerNative: true }))
+        .toThrow('Run without --include-newer-native')
     writeFileSync(fallback, 'bad fallback')
     expect(() => prepareNotebookRestore(opts)).toThrow('asset hash mismatch')
 })
