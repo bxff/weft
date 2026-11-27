@@ -58,3 +58,22 @@ test("unknown tracking never guesses age; known legacy activity does not backdat
     ...notified, lastActivityAt: graceEnd + 1,
   }, graceEnd)).toEqual({ action: "wait", reason: "unknown" });
 });
+
+test("missing or malformed hold clearance cannot mark an account eligible", () => {
+  for (const held of [undefined, null, 0]) {
+    const unverified = { ...notified, held } as unknown as AccountRetentionFacts;
+    expect(planAccountRetention(unverified, graceEnd)).toEqual({
+      action: "wait", reason: "hold",
+    });
+  }
+});
+
+test("a premature, future, or unconfirmed notice cannot start the grace period", () => {
+  for (const deliveredAt of [sixMonths - 1, graceEnd + 1, null]) {
+    const notice = { inactivitySince: tracked.observedSince!, deliveredAt };
+    const facts = { ...tracked, notice } as AccountRetentionFacts;
+    expect(planAccountRetention(facts, graceEnd)).toEqual({
+      action: "notice", inactivitySince: tracked.observedSince,
+    });
+  }
+});

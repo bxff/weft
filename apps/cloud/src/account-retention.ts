@@ -40,7 +40,7 @@ export function planAccountRetention(
   facts: AccountRetentionFacts,
   now: number,
 ): AccountRetentionDecision {
-  if (facts.held) return { action: "wait", reason: "hold" };
+  if (facts.held !== false) return { action: "wait", reason: "hold" };
   const known = (value: number | null): value is number =>
     value !== null && Number.isSafeInteger(value) && value >= 0 && value <= now;
   if (!Number.isSafeInteger(now) || !known(facts.observedSince) ||
