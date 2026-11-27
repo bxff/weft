@@ -1061,21 +1061,17 @@ async fn reconcile_pulls(
                         .insert(key.clone(), (saved.head.revision, saved.asset_revision));
                 }
             }
-            let recovery_needed = asset_marker.is_some_and(|asset| {
-                cloud.pulled_asset_revisions.get(&key).map(String::as_str) != Some(asset)
-                    || (cloud.recovery_root.is_some()
-                        && cloud
-                            .protected
-                            .get(&key)
-                            .map(|(rev, assets)| (rev.as_str(), assets.as_str()))
-                            != Some((cloud_rev, asset)))
-            });
+            let recovery_needed = needs_recovery(cloud, &key, cloud_rev, asset_marker);
             if recovery_needed
                 || needs_pull(cloud.revisions.get(&key).map(String::as_str), cloud_rev)
             {
                 eprintln!("cloud: reconcile sweep pulling {key} (cloud at {cloud_rev})");
-                if !pull_page(state, client, config, cloud, &doc.id, &page.id).await {
-                    all_ok = false; // transient failure: retry on the next sweep
+                if !pull_page(state, client, config, cloud, &doc.id, &page.id).await
+                    || needs_recovery(cloud, &key, cloud_rev, asset_marker)
+                {
+                    // Native feed progress stays independent of protection.
+                    // Don't cache a 304 validator over an incomplete capture.
+                    all_ok = false;
                 }
             }
         }
@@ -1086,6 +1082,19 @@ async fn reconcile_pulls(
     if all_ok {
         *etag = fresh_etag;
     }
+}
+
+fn needs_recovery(
+    cloud: &CloudState,
+    key: &str,
+    native_rev: &str,
+    asset_rev: Option<&str>,
+) -> bool {
+    asset_rev.is_some_and(|asset| {
+        cloud.pulled_asset_revisions.get(key).map(String::as_str) != Some(asset)
+            || (cloud.recovery_root.is_some() && cloud.protected.get(key)
+                .map(|(rev, assets)| (rev.as_str(), assets.as_str())) != Some((native_rev, asset)))
+    })
 }
 
 async fn reconcile_current_pulls(
@@ -1333,6 +1342,11 @@ async fn pull_asset(
         recovery::preserve_asset(dir, previous, &local).ok()?;
     }
     store.write_asset(doc, page, name, &bytes).ok()?;
+    if expected.is_some() {
+        // The ordinary store treats a directory sync failure as best effort.
+        // Recovery may only advertise assets whose directory entry is durable.
+        std::fs::File::open(local.parent()?).ok()?.sync_all().ok()?;
+    }
     Some((true, mtime_ms(&local)))
 }
 
@@ -1345,7 +1359,8 @@ async fn pull_assets(
     page: &str,
     manifest: Option<&[AssetDigest]>,
     previous: Option<(&std::path::Path, &Checkpoint)>,
-) -> Option<Vec<String>> {
+    changed: &mut Vec<String>,
+) -> Option<()> {
     let legacy;
     let entries = match manifest {
         Some(assets) => assets,
@@ -1365,7 +1380,7 @@ async fn pull_assets(
                 .ok()?;
             if response.status().as_u16() == 404 {
                 // Very old relay with no assets route.
-                return Some(Vec::new());
+                return Some(());
             }
             legacy = response
                 .error_for_status()
@@ -1384,7 +1399,7 @@ async fn pull_assets(
             &legacy
         }
     };
-    let mut changed = Vec::new();
+    let mut complete = true;
     for asset in entries {
         let digest = (!asset.sha256.is_empty()).then_some(asset.sha256.as_str());
         let previous = previous.and_then(|(dir, saved)| {
@@ -1396,7 +1411,7 @@ async fn pull_assets(
             Some((dir, old.sha256.as_str()))
         });
         let key = format!("{doc}/{page}/{}", asset.name);
-        let (replaced, mtime) = pull_asset(
+        let Some((replaced, mtime)) = pull_asset(
             &state.store,
             client,
             config,
@@ -1407,7 +1422,10 @@ async fn pull_assets(
             previous,
             cloud.assets.get(&key).copied(),
         )
-        .await?;
+        .await else {
+            complete = false;
+            continue;
+        };
         if let Some(mtime) = mtime {
             // Do not echo the freshly downloaded bytes back upstream.
             cloud.assets.insert(key, mtime);
@@ -1416,7 +1434,7 @@ async fn pull_assets(
             changed.push(format!("{doc}/{page}/{}", asset.name));
         }
     }
-    Some(changed)
+    complete.then_some(())
 }
 
 /// Does the on-disk page hold content the cloud has never seen? True when
@@ -1489,7 +1507,7 @@ async fn pull_page(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.split(';').next() == Some("application/json"));
-    let (cloud_rev, fetched_rev, bytes, checkpoint) = if has_recovery {
+    let (cloud_rev, fetched_rev, bytes, checkpoint, missing_assets) = if has_recovery {
         let Some(etag) = r
             .headers()
             .get("etag")
@@ -1515,10 +1533,6 @@ async fn pull_page(
         if crate::store::sha256_hex(&bytes) != payload.head.native_sha256 {
             return false;
         }
-        if !payload.missing_assets.is_empty() {
-            eprintln!("cloud: recovery assets not available for {doc}/{page}; retrying");
-            return false;
-        }
         (
             payload.head.revision.clone(),
             payload.head.native_sha256.clone(),
@@ -1529,6 +1543,7 @@ async fn pull_page(
                 asset_revision: payload.asset_revision,
                 head: payload.head,
             }),
+            !payload.missing_assets.is_empty(),
         )
     } else {
         // Older relay: exact existing native protocol, with separately
@@ -1547,6 +1562,7 @@ async fn pull_page(
             crate::store::sha256_hex(&bytes),
             bytes.to_vec(),
             None,
+            false,
         )
     };
     let native_changed = fetched_rev != local_rev;
@@ -1561,12 +1577,9 @@ async fn pull_page(
     // images may have been changed independently of native graphics.
     let manifest = checkpoint.as_ref().map(|c| c.head.assets.as_slice());
     let previous = dir.as_deref().zip(saved.as_ref());
-    let changed = pull_assets(state, client, config, cloud, doc, page, manifest, previous).await;
-    let mut changed = match changed {
-        Some(changed) => changed,
-        None if checkpoint.is_none() => Vec::new(), // preserve legacy best-effort asset behavior
-        None => return false, // coherent recovery must not consume an incomplete generation
-    };
+    let mut changed = Vec::new();
+    let assets_verified = pull_assets(state, client, config, cloud, doc, page, manifest, previous,
+        &mut changed).await.is_some() && !missing_assets;
     if native_changed {
         match state.store.write_page(doc, page, &local_rev, &bytes).await {
             Ok(_) => changed.push(format!("{doc}/{page}.rm")),
@@ -1596,11 +1609,15 @@ async fn pull_page(
     cloud.revisions.insert(key.clone(), cloud_rev);
     cloud.pushed.insert(key.clone(), fetched_rev);
     if !changed.is_empty() {
+        if !native_changed {
+            // An asset-only replacement must refresh an already open page.
+            changed.push(format!("{doc}/{page}.rm"));
+        }
         if let Some(conn) = &state.dbus {
             crate::dbus::trigger_reload(conn, doc, &changed).await;
         }
     }
-    if let Some(checkpoint) = checkpoint {
+    if let Some(checkpoint) = checkpoint.filter(|_| assets_verified) {
         let marker = (
             checkpoint.head.revision.clone(),
             checkpoint.asset_revision.clone(),
@@ -1609,11 +1626,12 @@ async fn pull_page(
             .pulled_asset_revisions
             .insert(key.clone(), checkpoint.asset_revision.clone());
         if let Some(dir) = dir {
-            if let Err(e) = recovery::commit(&dir, checkpoint, &bytes) {
-                eprintln!("cloud: recovery commit for {doc}/{page} failed: {e}");
-                return false;
+            match recovery::commit(&dir, checkpoint, &bytes) {
+                Ok(()) => {
+                    cloud.protected.insert(key, marker);
+                }
+                Err(e) => eprintln!("cloud: recovery commit for {doc}/{page} failed: {e}"),
             }
-            cloud.protected.insert(key, marker);
         }
     }
     true
@@ -2234,6 +2252,11 @@ mod tests {
         let key = format!("{STAMP_DOC}/{STAMP_PAGE}");
         let revision_key = key.clone();
         let relay = Router::new()
+            .route("/api/changes", get(|| async {
+                axum::Json(serde_json::json!({ "changes": [{
+                    "seq": 10, "doc": STAMP_DOC, "page": STAMP_PAGE, "revision": "ops:3+5"
+                }] }))
+            }))
             .route("/api/revisions", get(move |headers: HeaderMap| {
                 let v = revision_variant.load(Ordering::Relaxed);
                 let tag = format!(r#""inventory-{v}""#);
@@ -2262,11 +2285,13 @@ mod tests {
                         return (StatusCode::NOT_MODIFIED, "").into_response();
                     }
                     ([("etag", tag)], axum::Json(serde_json::json!({
-                        "revision": "ops:3+4", "snapshotSeq": 4, "opSeq": 3,
+                        "revision": if v == 3 { "ops:3+5" } else { "ops:3+4" },
+                        "snapshotSeq": if v == 3 { 5 } else { 4 }, "opSeq": 3,
                         "nativeSha256": sha, "nativeBase64": null,
                         "overlay": {"shapes": [{"props":{"weftArrowLinks":[{"toId":"shape:target"}]}}]},
                         "assetRevision": format!("assets-{v}"),
                         "assets": [{"name": fname, "sha256": digest}],
+                        "missingAssets": if v == 3 { vec!["missing.png"] } else { vec![] },
                     }))).into_response()
                 }
             }))
@@ -2342,6 +2367,15 @@ mod tests {
         assert_eq!(recovery::load(&path).unwrap().etag, "\"checkpoint-2\"");
         assert!(!fallback.exists());
         assert_eq!(state.store.read_page(STAMP_DOC, STAMP_PAGE).unwrap().0, native);
+        // A snapshot with a permanently missing dependency is not protected,
+        // but it must not strand the device's native change-feed cursor.
+        variant.store(3, Ordering::Relaxed);
+        pull_changes(&state, &client, &config, &mut cloud).await;
+        assert_eq!(cloud.since, 10);
+        assert_eq!(cloud.revisions[&key], "ops:3+5");
+        assert_eq!(recovery::load(&path).unwrap().head.revision, "ops:3+4");
+        assert_eq!(cloud.protected[&key].0, "ops:3+4");
+
         // The restored asset mtime is acknowledged to prevent a stale echo.
         assert_eq!(cloud.assets[&format!("{key}/{fname}")], mtime_ms(&native_asset).unwrap());
         server.abort();

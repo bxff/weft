@@ -73,7 +73,12 @@ pub(crate) fn page_dir(root: &Path, doc: &str, page: &str) -> Option<PathBuf> {
 pub(crate) fn load(dir: &Path) -> Option<Checkpoint> {
     let saved: Checkpoint =
         serde_json::from_slice(&std::fs::read(dir.join("checkpoint.json")).ok()?).ok()?;
-    (saved.version == 1 && saved.head.valid()).then_some(saved)
+    (saved.version == 1
+        && saved.head.valid()
+        && dir
+            .join(format!("{}.rm", saved.head.native_sha256))
+            .is_file())
+    .then_some(saved)
 }
 
 // Fsync parent directories as the new tree is created, since syncing only the
