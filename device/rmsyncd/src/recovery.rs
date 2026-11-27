@@ -220,7 +220,7 @@ fn verify_assets(dir: &Path, saved: &Checkpoint) -> bool {
 // Fsync parent directories as the new tree is created, since syncing only the
 // leaf does not make a newly-created ancestor directory durable after a crash.
 fn create_durable_dir(path: &Path) -> io::Result<()> {
-    if path.is_dir() {
+    if path.as_os_str().is_empty() || path.is_dir() {
         return Ok(());
     }
     let parent = path
