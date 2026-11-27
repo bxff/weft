@@ -220,7 +220,7 @@ fn verify_assets(dir: &Path, saved: &Checkpoint) -> bool {
 // Fsync parent directories as the new tree is created, since syncing only the
 // leaf does not make a newly-created ancestor directory durable after a crash.
 fn create_durable_dir(path: &Path) -> io::Result<()> {
-    if path.is_dir() {
+    if path.as_os_str().is_empty() || path.is_dir() {
         return Ok(());
     }
     let parent = path
@@ -232,7 +232,7 @@ fn create_durable_dir(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
         Err(e) => return Err(e),
     }
-    std::fs::File::open(parent)?.sync_all()
+    sync_directory(parent)
 }
 
 pub(crate) fn has_asset(dir: &Path, hash: &str) -> bool {
@@ -305,8 +305,57 @@ pub(crate) fn discard_staged_assets(
     };
 }
 
+// Retry both the manifest rename and the directory links created by an
+// earlier attempt whose ancestor fsync may have failed. The pre-existing
+// Weft state directory is the boundary; never sync above it.
+pub(crate) fn certify_checkpoint(dir: &Path, boundary: &Path) -> io::Result<()> {
+    let depth = dir
+        .strip_prefix(boundary)
+        .map_err(|_| io::Error::other("checkpoint outside recovery storage"))?
+        .components()
+        .count();
+    // state/recovery-v1/relay/document/page
+    if depth > 4 {
+        return Err(io::Error::other("invalid checkpoint storage depth"));
+    }
+    for directory in dir.ancestors().take(depth + 1) {
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn sync_directory(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    {
+        let mut failures = DIRECTORY_SYNC_FAILURES.lock().unwrap();
+        if let Some(index) = failures.iter().position(|path| path == dir) {
+            failures.swap_remove(index);
+            return Err(io::Error::other("injected recovery directory sync failure"));
+        }
+    }
+    // A filename-only --cloud-config has an empty relative parent.
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(test)]
+static DIRECTORY_SYNC_FAILURES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn fail_next_directory_sync(dir: &Path) {
+    DIRECTORY_SYNC_FAILURES
+        .lock()
+        .unwrap()
+        .push(dir.to_path_buf());
+}
+
 pub(crate) fn commit(
     dir: &Path,
+    boundary: &Path,
     checkpoint: Checkpoint,
     native: &[u8],
     budget: Option<&mut Budget>,
@@ -340,7 +389,7 @@ pub(crate) fn commit(
             }
             write_recovery_file(dir, "checkpoint.json", &manifest)?;
             manifest_renamed = true;
-            std::fs::File::open(dir)?.sync_all()?;
+            certify_checkpoint(dir, boundary)?;
             remove_obsolete(dir, &checkpoint, &base);
             Ok(())
         })();
@@ -413,8 +462,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("doc").join("page");
         let native = b"native bytes";
-        commit(&dir, checkpoint(native, 1), native, None).unwrap();
-        commit(&dir, checkpoint(native, 2), native, None).unwrap();
+        commit(&dir, root.path(), checkpoint(native, 1), native, None).unwrap();
+        commit(&dir, root.path(), checkpoint(native, 2), native, None).unwrap();
         let saved = load(&dir).unwrap();
         assert_eq!(saved.head.op_seq, 3);
         assert_eq!(saved.head.snapshot_seq, 2);
@@ -428,8 +477,22 @@ mod tests {
     #[test]
     fn invalid_new_base_does_not_supersede_last_checkpoint() {
         let root = tempfile::tempdir().unwrap();
-        commit(root.path(), checkpoint(b"good", 1), b"good", None).unwrap();
-        assert!(commit(root.path(), checkpoint(b"new", 2), b"bad", None).is_err());
+        commit(
+            root.path(),
+            root.path(),
+            checkpoint(b"good", 1),
+            b"good",
+            None,
+        )
+        .unwrap();
+        assert!(commit(
+            root.path(),
+            root.path(),
+            checkpoint(b"new", 2),
+            b"bad",
+            None
+        )
+        .is_err());
         assert_eq!(load(root.path()).unwrap().head.snapshot_seq, 1);
     }
 
@@ -441,10 +504,24 @@ mod tests {
         let mut budget = Budget::open(root.path()).unwrap();
         assert_eq!(budget.used, 18);
         let dir = root.path().join("link").join("doc").join("page");
-        commit(&dir, checkpoint(b"good", 1), b"good", Some(&mut budget)).unwrap();
+        commit(
+            &dir,
+            root.path(),
+            checkpoint(b"good", 1),
+            b"good",
+            Some(&mut budget),
+        )
+        .unwrap();
         assert_eq!(budget.used, disk_bytes(root.path()).unwrap());
         budget.limit = budget.used;
-        assert!(commit(&dir, checkpoint(b"new", 2), b"new", Some(&mut budget)).is_err());
+        assert!(commit(
+            &dir,
+            root.path(),
+            checkpoint(b"new", 2),
+            b"new",
+            Some(&mut budget)
+        )
+        .is_err());
         assert_eq!(load(&dir).unwrap().head.snapshot_seq, 1);
         assert_eq!(
             std::fs::read(&previous_link).unwrap(),
@@ -465,7 +542,7 @@ mod tests {
         });
         let mut budget = Budget::open(disk.path()).unwrap();
         save_asset(&dir, &old_hash, old, Some(&mut budget)).unwrap();
-        commit(&dir, saved, b"base", Some(&mut budget)).unwrap();
+        commit(&dir, disk.path(), saved, b"base", Some(&mut budget)).unwrap();
         let baseline = budget.used;
         let new = b"new";
         let new_hash = sha256_hex(new);
@@ -494,6 +571,7 @@ mod tests {
         let mut budget = Budget::open(disk.path()).unwrap();
         commit(
             &dir,
+            disk.path(),
             checkpoint(b"old native", 1),
             b"old native",
             Some(&mut budget),
@@ -519,7 +597,7 @@ mod tests {
         let blocked = dir.join(".weft-tmp-checkpoint.json");
         std::fs::create_dir(&blocked).unwrap();
         save_asset(&dir, &asset_hash, new_asset, Some(&mut budget)).unwrap();
-        assert!(commit(&dir, next(), new_native, Some(&mut budget)).is_err());
+        assert!(commit(&dir, disk.path(), next(), new_native, Some(&mut budget)).is_err());
         discard_staged_assets(&dir, Some(&old), &[asset_hash.clone()], Some(&mut budget));
         assert_eq!(budget.used, baseline);
         assert_eq!(load(&dir).unwrap().etag, old.etag);
@@ -528,8 +606,30 @@ mod tests {
         assert!(!has_asset(&dir, &asset_hash));
         std::fs::remove_dir(&blocked).unwrap();
         save_asset(&dir, &asset_hash, new_asset, Some(&mut budget)).unwrap();
-        commit(&dir, next(), new_native, Some(&mut budget)).unwrap();
+        commit(&dir, disk.path(), next(), new_native, Some(&mut budget)).unwrap();
         assert!(verify_files(&dir, &load(&dir).unwrap()));
+    }
+
+    #[test]
+    fn retry_certifies_a_visible_directory_left_by_parent_sync_failure() {
+        let disk = tempfile::tempdir().unwrap();
+        let doc = disk.path().join("recovery-v1").join("relay").join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        let dir = doc.join("page");
+        let native = b"first generation";
+
+        // Directory creation succeeded, but its entry in doc is uncertified.
+        fail_next_directory_sync(&doc);
+        assert!(commit(&dir, disk.path(), checkpoint(native, 1), native, None).is_err());
+        assert!(dir.is_dir());
+        assert!(load(&dir).is_none());
+
+        // Existing directories must still be re-certified on the retry.
+        fail_next_directory_sync(&doc);
+        assert!(commit(&dir, disk.path(), checkpoint(native, 1), native, None).is_err());
+        let visible = load(&dir).unwrap();
+        assert!(verify_files(&dir, &visible));
+        certify_checkpoint(&dir, disk.path()).unwrap();
     }
 
     #[test]
