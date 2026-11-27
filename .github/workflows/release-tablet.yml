@@ -1,0 +1,115 @@
+name: Release tablet daemon
+on:
+  workflow_dispatch:
+    inputs:
+      sequence:
+        description: "Increasing integer N for the stable release tablet-vN"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+concurrency:
+  group: tablet-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      WEFT_RELEASE_SEQUENCE: ${{ inputs.sequence }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate release inputs
+        run: |
+          [[ "$WEFT_RELEASE_SEQUENCE" =~ ^[1-9][0-9]{0,14}$ ]]
+          [[ "$(cat apps/cli/src/tablet-release-key.txt)" =~ ^[0-9a-f]{64}$ ]]
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl,armv7-unknown-linux-musleabihf
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - run: cargo install --locked cargo-zigbuild --version 0.20.1
+      - run: cargo test --locked
+        working-directory: device
+      - name: Build static tablet executables
+        working-directory: device
+        run: |
+          set -euo pipefail
+          mkdir release
+          for arch in aarch64 armv7; do
+            target="$arch-unknown-linux-musl"
+            if [[ "$arch" == armv7 ]]; then target="${target}eabihf"; fi
+            cargo zigbuild --locked --release --target "$target"
+            cp "target/$target/release/rmsyncd" "release/rmsyncd-$arch"
+            readelf -h "release/rmsyncd-$arch"
+            if readelf -l "release/rmsyncd-$arch" | grep -q INTERP; then exit 1; fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tablet-release
+          path: device/release/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    environment: tablet-release-signing
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SEQUENCE: ${{ inputs.sequence }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: apps/cli/src/tablet-release-key.txt
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: tablet-release
+          path: release
+      - name: Sign exact binaries and publish
+        env:
+          SIGNING_KEY: ${{ secrets.WEFT_TABLET_SIGNING_KEY_PEM }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$SEQUENCE" =~ ^[1-9][0-9]{0,14}$ ]]
+          # Include prior tablet releases even if another kind is now latest.
+          existing="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')"
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^tablet-v([1-9][0-9]{0,14})$ ]]; then
+              (( SEQUENCE > ${BASH_REMATCH[1]} ))
+            fi
+          done <<< "$existing"
+          cd release
+          pin="$(cat ../apps/cli/src/tablet-release-key.txt)"
+          [[ "$pin" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s' "302a300506032b6570032100$pin" | xxd -r -p > public.der
+          key="$(mktemp)"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$SIGNING_KEY" > "$key"
+          unset SIGNING_KEY
+          printf 'weft-tablet-release-v1\ntablet-v%s\n' "$SEQUENCE" > tablet-release.txt
+          for arch in aarch64 armv7; do
+            name="rmsyncd-$arch"
+            read -r sha _ < <(sha256sum "$name")
+            size="$(stat -c %s "$name")"
+            (( size > 0 && size <= 64 * 1024 * 1024 ))
+            printf '%s %s %s\n' "$sha" "$size" "$name" >> tablet-release.txt
+          done
+          openssl pkeyutl -sign -inkey "$key" -rawin -in tablet-release.txt -out tablet-release.sig
+          openssl pkeyutl -verify -pubin -keyform DER -inkey public.der -rawin -in tablet-release.txt -sigfile tablet-release.sig
+          rm -f "$key"
+          # Keep incomplete draft releases invisible to the updater.
+          gh release create "tablet-v$SEQUENCE" rmsyncd-aarch64 rmsyncd-armv7 tablet-release.txt tablet-release.sig \
+            --target "$GITHUB_SHA" --draft --title "Weft tablet daemon $SEQUENCE" --generate-notes
+          gh release edit "tablet-v$SEQUENCE" --draft=false --latest

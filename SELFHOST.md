@@ -28,8 +28,10 @@ Three screens answer "is everything working":
 3. **Usage counters** — `GET /api/admin/stats` (admin users only): request /
    429 / 507 counters, per-user storage, doc counts.
 
-To offer tablet updates from your own relay, set `WEFT_DAEMON_RELEASE` and,
-if needed, `WEFT_DAEMON_RELEASE_ARMV7` to the corresponding binaries.
+A self-hosted relay does not distribute tablet executables. The official installer
+and daemon verify public GitHub Releases regardless of which relay is linked.
+For custom binaries, build from source and use `weft setup --from-source`;
+those builds do not auto-update. See [tablet installer](device/installer/README.md).
 
 ## HTTPS: use your tunnel or Caddy
 

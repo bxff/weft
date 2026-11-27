@@ -105,12 +105,9 @@ async fn main() {
     );
     if let Some(config) = cloud::load_config(&cloud_config_path) {
         let state_path = cloud_config_path.with_file_name("cloud-state.json");
-        cloud::spawn(state.clone(), config.clone(), state_path);
-        // self-update: polls the cloud's release binary; a swap exits(0) and
-        // systemd relaunches the new binary. Inert until the server sets
-        // WEFT_DAEMON_RELEASE (404 = nothing to do).
-        update::spawn(config);
+        cloud::spawn(state.clone(), config, state_path);
     }
+    update::spawn();
 
     // A/B firmware-update survival (opt-in, off until device-verified on a real
     // OTA). Injects weft's unit into a staged OTA's inactive slot before the

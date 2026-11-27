@@ -1,0 +1,1 @@
+# Ed25519 public key, as 64 lowercase hex digits. No key is provisioned yet.
