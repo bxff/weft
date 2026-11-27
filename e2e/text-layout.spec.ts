@@ -387,8 +387,8 @@ test('a text edit reapplies native layer visibility without replacing the ink', 
     expect(opacity).toBe(1)
 })
 
-test('a tablet END-anchor uses the heading baseline, then reflows to a blank final line without rewriting ink', async ({ page, request }) => {
-    const { RmDocument, crdtId, setParagraphStyle } = await import('../packages/rm-format/src/index')
+test('a tablet END-anchor follows the last explicit line without rewriting ink', async ({ page, request }) => {
+    const { RmDocument, crdtId, linearizeRootText, setParagraphStyle } = await import('../packages/rm-format/src/index')
     const { RM_SCALE } = await import('../packages/rm-ink/src/pen')
     const id = crypto.randomUUID()
     const endpoint = `/api/documents/${DOC}/pages/${id}/rm`
@@ -409,15 +409,24 @@ test('a tablet END-anchor uses the heading baseline, then reflows to a blank fin
         await page.goto(`/app/${DOC}/${id}`)
         await expect(page.getByTestId('sync-status')).toHaveText('synced', { timeout: 30_000 })
     }
+    const readWire = async () => RmDocument.parse(new Uint8Array(await (await request.get(endpoint)).body()) as never)
+    const paragraphs = async () => linearizeRootText((await readWire()).tree().rootText!).length
+    const headingY = (rawY + rootY + 63.203125) * RM_SCALE
+    const firstBlankY = (rawY + rootY + 100 + 33.59375) * RM_SCALE
     await open()
-    await expect.poll(y).toBeCloseTo((rawY + rootY + 63.203125) * RM_SCALE, 1)
+    await expect.poll(y).toBeCloseTo(headingY, 1)
     await appendToDeviceText(page, '\n')
-    await expect.poll(y).toBeCloseTo((rawY + rootY + 100) * RM_SCALE, 1)
+    await expect.poll(paragraphs).toBe(2)
+    await expect.poll(y).toBeCloseTo(headingY, 1)
+    await appendToDeviceText(page, '\n')
+    await expect.poll(paragraphs).toBe(3)
+    await expect.poll(y).toBeCloseTo(firstBlankY, 1)
     await expect(page.getByTestId('sync-status')).toHaveText('synced')
-    const after = RmDocument.parse(new Uint8Array(await (await request.get(endpoint)).body()) as never)
+    const after = await readWire()
     expect(native(after)).toEqual(initial)
+    expect(after.anchoredGroups()).toEqual(seeded.anchoredGroups())
     await open()
-    await expect.poll(y).toBeCloseTo((rawY + rootY + 100) * RM_SCALE, 1)
+    await expect.poll(y).toBeCloseTo(firstBlankY, 1)
 })
 
 test('layer visibility reaches native ink and images below a nested group', async ({ page, request }) => {
