@@ -7,7 +7,7 @@
 import { expect, test } from 'bun:test'
 import { layoutText, metricsFor, penPositions, PARA_STRIDE_INK, type MeasureFn } from './text-metrics'
 import { paragraphsToRichText } from './device-text-richtext'
-import { buildSvgLines } from './device-text-svg'
+import { buildSvgLines, svgContentBounds } from './device-text-svg'
 import { computeAnchorOffsets, lineTopOf } from './text-anchor-layout'
 import {
     ANCHOR_TEXT_START,
@@ -18,6 +18,7 @@ import {
     setParagraphStyle,
     crdtId,
     crdtIdKey,
+    rootTextCharPositions,
     lww,
     type TextParagraph,
 } from '@weft/rm-format'
@@ -217,4 +218,68 @@ test('unsupported glyph geometry stays deterministic without a browser canvas', 
     svg.forEach((line, i) =>
         expect(line.endX - line.startX).toBeCloseTo(layout.lineWidthsInk[i]!, 10),
     )
+})
+
+test('compound emoji advances are measured as one grapheme and use UTF-16 wraps', () => {
+    const samples = ['❤️', '👍🏽', '👩‍💻', '🇮🇳']
+    for (const emoji of samples) {
+        const requested: string[] = []
+        const measureCluster: MeasureFn = (s) => {
+            requested.push(s)
+            return 20
+        }
+        const text = 'A' + emoji + 'B'
+        const m = metricsFor(1)
+        const line = penPositions(text, m, undefined, measureCluster)
+        const throughEmoji = penPositions(text.slice(0, -1), m, undefined, measureCluster).end
+        const layout = layoutText([para(text)], throughEmoji + 8.1, measureCluster)
+        expect(line.units).toEqual(['A', emoji, 'B'])
+        expect(line.xs[2]).toBeCloseTo(throughEmoji, 8)
+        expect(layout.paras[0]!.lineStarts).toEqual([0, 1 + emoji.length])
+        expect(layout.paras[0]!.lineWidthsInk[0]).toBeCloseTo(throughEmoji, 8)
+        expect(requested).toEqual([emoji, emoji, emoji])
+    }
+})
+
+test('emoji formatting boundaries cannot split a shaping cluster or move the next glyph', () => {
+    const full = 'A👍🏽B'
+    const styled = { ...para(full), spans: [
+        { text: 'A👍', bold: false, italic: false },
+        { text: '🏽B', bold: true, italic: false },
+    ] }
+    const rendered = buildSvgLines(paragraphsToRichText([styled]), 400)[0]!
+    expect(rendered.runs.map((run) => [run.text, run.xs.length, run.bold])).toEqual([
+        ['A', 1, false], ['👍🏽', 1, false], ['B', 1, true],
+    ])
+    const m = metricsFor(1)
+    expect(rendered.runs[2]!.xs[0]).toBe(rendered.startX + penPositions('A👍🏽', m).end)
+    expect(rendered.endX).toBe(rendered.startX + penPositions('A👍🏽', m).end
+        + penPositions('B', m, { bold: true }).end)
+})
+
+test('a native anchor after a shaped emoji follows the wrapped baseline and the SVG bounds', () => {
+    const author = 'aaaa0000-0000-4000-a000-000000000001'
+    const text = 'A👩‍💻B'
+    const m = metricsFor(1)
+    // No browser-canvas dependency: one unsupported cluster gets one fallback
+    // advance. This width leaves room for the cluster but not the final B.
+    const width = 8.1 + penPositions(text.slice(0, -1), m).end
+    const doc = RmDocument.empty(author)
+    createRootText(doc, { width })
+    insertText(doc, null, text, { authorUuid: author })
+    const group = doc.blocks.find((b) => b.type === 'treeNode' && b.nodeId.part2 === 11)
+    if (group?.type !== 'treeNode') throw new Error('missing layer')
+    const target = rootTextCharPositions(doc.tree().rootText!).at(-1)!
+    expect(target.offset).toBe(text.length - 1)
+    const stamp = crdtId(1, 1000)
+    group.anchorId = lww(stamp, target.id)
+    group.anchorType = lww(stamp, 2)
+    group.anchorThreshold = lww(stamp, 0)
+    group.anchorOriginX = lww(stamp, -464)
+    const lines = buildSvgLines(paragraphsToRichText([para(text)]), width)
+    expect(lines.map((line) => line.runs.map((run) => run.text).join(''))).toEqual(['A👩‍💻', 'B'])
+    expect(computeAnchorOffsets(RmDocument.parse(doc.serialize())).get('0:11')?.dy).toBeCloseTo(234 + lines[1]!.y, 5)
+    const bounds = svgContentBounds(lines)!
+    expect(bounds.x1).toBeCloseTo(lines[0]!.startX + penPositions('A👩‍💻', m).end, 8)
+    expect(bounds.y1).toBe(lines[1]!.bottom)
 })
