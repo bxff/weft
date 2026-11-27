@@ -15,6 +15,8 @@ import {
     RmDocument,
     createRootText,
     insertText,
+    deleteText,
+    insertFormatCode,
     setParagraphStyle,
     crdtId,
     crdtIdKey,
@@ -80,11 +82,13 @@ test('first paragraph line box sits at the column top for every size', () => {
     }
 })
 
+const sentinelAuthor = 'aaaa0000-0000-4000-a000-000000000001'
+
 function sentinelDocument(anchor = ANCHOR_TEXT_START, firstStyle = 2, text = '\n') {
-    const author = 'aaaa0000-0000-4000-a000-000000000001'
+    const author = sentinelAuthor
     const doc = RmDocument.empty(author)
     createRootText(doc)
-    insertText(doc, null, text, { authorUuid: author })
+    if (text) insertText(doc, null, text, { authorUuid: author })
     setParagraphStyle(doc, crdtId(0, 0), firstStyle, { authorUuid: author })
     const group = doc.blocks.find((b) => b.type === 'treeNode' && b.nodeId.part2 === 11)!
     if (group.type !== 'treeNode') throw new Error('missing layer')
@@ -114,10 +118,74 @@ test('body/body START follows the second paragraph top without adding its baseli
     expect(computeAnchorOffsets(doc, measure).get('0:11')?.dy).toBe(303.546875)
 })
 
-test('type-2 END still uses the line top for a trailing empty paragraph', () => {
-    const doc = sentinelDocument(ANCHOR_TEXT_END)
-    expect(doc.anchoredGroups()[0]!.anchorType).toBe(2)
-    expect(computeAnchorOffsets(doc, measure).get('0:11')?.dy).toBe(334)
+// Native vectors in the synthetic notebook export agree on the baseline of
+// the last explicit source position. A final LF is on the preceding line.
+const wrapped = `ALPHA ${'MMMM '.repeat(14)}OMEGA`
+test.each([
+    ['no trailing LF', 'ALPHA marker', 1, 267.59375],
+    ['one trailing LF', 'ALPHA marker\n', 1, 267.59375],
+    ['two trailing LF', 'ALPHA marker\n\n', 1, 337.140625],
+    ['three trailing LF', 'ALPHA marker\n\n\n', 1, 406.6875],
+    ['one blank LF', '\n', 1, 267.59375],
+    ['20 blank LF', '\n'.repeat(20), 1, 1588.984375],
+    ['wrapped body', wrapped, 1, 358.6875],
+    ['wrapped heading', wrapped, 2, 677.1875],
+] as const)('type-2 END follows its native baseline with %s', (_, text, style, dy) => {
+    const doc = sentinelDocument(ANCHOR_TEXT_END, style, text)
+    const bytes = doc.serialize()
+    const offset = computeAnchorOffsets(doc, measure).get('0:11')!
+    expect(offset.dx).toBe(-464)
+    // The independently measured heading baseline differs from the shared
+    // heading layout by one 1/64-ink quantization unit.
+    expect(Math.abs(offset.dy - dy)).toBeLessThanOrEqual(1 / 64)
+    expect(doc.serialize()).toEqual(bytes)
+})
+
+test.each([1, 20])('type-2 END ignores a deleted last LF after %i live LF', (count) => {
+    const doc = sentinelDocument(ANCHOR_TEXT_END, 1, '\n'.repeat(count + 1))
+    const before = doc.rootTextBlock!.text
+    const final = rootTextCharPositions(before).at(-1)!
+    expect(final.offset).toBe(-1)
+    deleteText(doc, [final.id])
+    const read = RmDocument.parse(doc.serialize())
+    expect(rootTextCharPositions(read.rootTextBlock!.text).at(-1)?.deleted).toBe(true)
+    const group = read.blocks.find((block) => block.type === 'treeNode' && block.anchorId)
+    if (group?.type !== 'treeNode') throw new Error('missing anchored group')
+    group.anchorOriginX = lww(crdtId(1, 1000), -253.859375)
+    expect(computeAnchorOffsets(read, measure).get('0:11')).toEqual({
+        dx: -253.859375,
+        dy: count === 1 ? 267.59375 : 1588.984375,
+    })
+})
+
+test.each([false, true])('long blank END survives tombstones and formatting (mixed styles: %s)', (mixed) => {
+    const doc = sentinelDocument(ANCHOR_TEXT_END, mixed ? 2 : 1, '\n'.repeat(20))
+    const text = doc.rootTextBlock!.text
+    const openers = rootTextCharPositions(text).map((pos) => pos.id)
+    const opts = { authorUuid: sentinelAuthor }
+    if (mixed) setParagraphStyle(doc, openers[1]!, 3, opts)
+    for (const [pIdx, count] of [[1, 15], [2, 14], [9, 16], [17, 17], [18, 18], [20, 2]] as const) {
+        const open = insertFormatCode(doc, openers[pIdx - 1]!, 1, opts)
+        const first = insertText(doc, open, 'x'.repeat(count), opts)
+        const removed = Array.from({ length: count }, (_, i) => crdtId(first.part1, first.part2 + i))
+        insertFormatCode(doc, removed.at(-1)!, 2, opts)
+        deleteText(doc, removed)
+    }
+    const bytes = doc.serialize()
+    const round = RmDocument.parse(bytes)
+    expect(rootTextCharPositions(round.rootTextBlock!.text).filter((pos) => pos.deleted)).toHaveLength(82)
+    expect(computeAnchorOffsets(round, measure).get('0:11')).toEqual({
+        dx: -464,
+        dy: mixed ? 1632.890625 : 1588.984375,
+    })
+    expect(round.serialize()).toEqual(bytes)
+})
+
+test('type-2 END without explicit source positions retains its fallback', () => {
+    const doc = sentinelDocument(ANCHOR_TEXT_END, 1, '')
+    expect(computeAnchorOffsets(doc, measure).get('0:11')).toEqual({ dx: -464, dy: 234 })
+    doc.blocks.splice(doc.blocks.findIndex((block) => block.type === 'rootText'), 1)
+    expect(computeAnchorOffsets(doc, measure).size).toBe(0)
 })
 
 test('single-paragraph START retains its existing fallback', () => {
