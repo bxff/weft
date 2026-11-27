@@ -7,7 +7,7 @@ use base64::Engine;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -153,6 +153,9 @@ struct CloudState {
     recovery_budget: Option<recovery::Budget>,
     #[serde(skip)]
     recovery_after: Option<String>,
+    // Inspect a page at most once per process, even while relay I/O retries.
+    #[serde(skip)]
+    recovery_reclaim_checked: HashSet<String>,
     /// Last asset generation applied independently of native page revisions.
     #[serde(default)]
     pulled_asset_revisions: HashMap<String, String>,
@@ -1603,6 +1606,17 @@ async fn pull_page_inner(
         .and_then(|root| Some(root.parent()?.parent()?.to_path_buf()));
     let saved = dir.as_deref().and_then(recovery::load);
     let (local_bytes, local_rev) = state.store.read_page(doc, page).unwrap_or_default();
+    if saved.is_some() && cloud.recovery_reclaim_checked.insert(key.clone()) {
+        if let (Some(dir), Some(boundary), Some(budget)) = (
+            dir.as_deref(),
+            durable_parent.as_deref(),
+            cloud.recovery_budget.as_mut(),
+        ) {
+            if let Err(error) = recovery::reclaim_interrupted_page(dir, boundary, budget) {
+                eprintln!("cloud: recovery reclaim for {doc}/{page} failed: {error}");
+            }
+        }
+    }
     let verified = saved.as_ref().filter(|saved| {
         saved.head.native_sha256 == local_rev
             && dir
