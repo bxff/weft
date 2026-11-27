@@ -228,3 +228,20 @@ to survive provider-level loss):
 
 Restore = stop container, copy the newest snapshot pair back into /data,
 start. Test it once before launch, not during an incident.
+
+### Optional tablet recovery checkpoints
+
+Normal tablet sync does not write recovery checkpoints. To capture editable
+checkpoints on a tablet you control, set `WEFT_TABLET_RECOVERY=1` in the
+`weft.service` environment and restart the daemon. Both the tablet and relay
+need recovery support. Backfill proceeds in batches and a page with a missing
+or conflicting resource is not reported as protected.
+
+Checkpoints under `/home/root/weft/recovery-v1` can contain the full native
+page, editable browser overlay, and image data. This local copy is not
+encrypted by Weft. The daemon allows up to 256 MiB across all link identities
+and defers additional capture rather than evicting existing checkpoints.
+Disabling capture, changing the link, or deleting data from the relay does
+not delete local backups. To remove them, stop the daemon and delete the
+recovery directory deliberately; ordinary notebook and sync state are
+separate. Recovery is supplementary, not a replacement for a separate backup.

@@ -5,6 +5,7 @@
 mod ab_survival;
 mod cloud;
 mod dbus;
+mod recovery;
 mod server;
 mod store;
 mod update;

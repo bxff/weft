@@ -332,7 +332,7 @@ export function startCloud(
   const CORS = {
     "access-control-allow-origin": "*",
     "access-control-allow-headers":
-      "authorization, content-type, x-base-revision, x-client-id, x-device-token, x-api-key, range, if-none-match, x-if-snapshot-seq-gt",
+      "authorization, content-type, x-base-revision, x-client-id, x-device-token, x-api-key, range, if-none-match, x-if-snapshot-seq-gt, x-weft-recovery, x-weft-native-sha256",
     "access-control-allow-methods": "GET, PUT, POST, PATCH, DELETE, OPTIONS",
     // headers pdf.js + client caches read cross-origin (Range, revalidation etags)
     "access-control-expose-headers":
@@ -343,6 +343,7 @@ export function startCloud(
   // on Content-Length, then re-checked on the materialized body (the header is
   // advisory: absent or lying on chunked uploads).
   const MAX_RM = 32 * 1024 * 1024;
+  const MAX_RECOVERY_JSON = 16 * 1024 * 1024;
   const MAX_JSON = 16 * 1024 * 1024;
 
   // Per-user storage quotas, one per data class. Enforced as
@@ -1225,13 +1226,27 @@ export function startCloud(
       // ZERO body — the tablet never re-downloads markers it already acted
       // on (owner requirement: the sweep must not weigh on the device).
       if (path === "/api/revisions" && req.method === "GET") {
-        const etag = `"${store.latestChangeSeq(user)}"`;
-        if (req.headers.get("if-none-match") === etag) {
-          return new Response(null, {
-            status: 304,
-            headers: { etag, ...CORS },
+        const ifNoneMatch = req.headers.get("if-none-match");
+        if (auth.via === "device" && req.headers.get("x-weft-recovery") === "1") {
+          const recovery = store.readRecoveryRevisions(user, ifNoneMatch);
+          const headers = {
+            etag: recovery.etag, "cache-control": "private, no-store", vary: "X-Weft-Recovery",
+          };
+          if (!recovery.body) return new Response(null, {
+            status: 304, headers: { ...CORS, ...headers },
+          });
+          const body = JSON.stringify(recovery.body);
+          if (Buffer.byteLength(body) > MAX_RECOVERY_JSON) {
+            return json({ error: "Recovery inventory exceeds size limit" }, 413, headers);
+          }
+          return new Response(body, {
+            headers: { ...CORS, ...headers, "content-type": "application/json" },
           });
         }
+        const etag = quoteEtag(String(store.latestChangeSeq(user)));
+        if (ifNoneMatch === etag) return new Response(null, {
+          status: 304, headers: { etag, ...CORS },
+        });
         return json({ pages: store.pageRevisions(user) }, 200, { etag });
       }
 
@@ -1999,6 +2014,34 @@ export function startCloud(
         const kind = pageMatch[3];
         if (kind === "rm") {
           if (req.method === "GET") {
+            if (req.headers.get("x-weft-recovery") === "1" && auth.via === "device") {
+              const recovery = store.readRecoveryPage(user, doc, page,
+                req.headers.get("x-weft-native-sha256"), req.headers.get("if-none-match"));
+              if (!recovery) return json({ error: "page not found" }, 404);
+              const headers = {
+                etag: recovery.etag, "cache-control": "private, no-store",
+                vary: "X-Weft-Recovery, X-Weft-Native-Sha256, Accept-Encoding",
+              };
+              if (!recovery.body) return new Response(null, {
+                status: 304, headers: { ...CORS, ...headers },
+              });
+              const body = JSON.stringify(recovery.body);
+              if (Buffer.byteLength(body) > MAX_RECOVERY_JSON) {
+                return json({ error: "Recovery page exceeds size limit" }, 413, headers);
+              }
+              const [encoding] = acceptedEncodings(req, ["gzip", "identity"], ["gzip"]);
+              if (!encoding) return new Response(null, { status: 406, headers });
+              if (encoding === "gzip") {
+                const compressed = Readable.from([body])
+                  .pipe(createGzip({ level: zlib.Z_BEST_SPEED }));
+                return new Response(Readable.toWeb(compressed) as unknown as ConstructorParameters<typeof Response>[0], {
+                  headers: { ...CORS, ...headers, "content-type": "application/json", "content-encoding": "gzip" },
+                });
+              }
+              return new Response(body, {
+                headers: { ...CORS, ...headers, "content-type": "application/json" },
+              });
+            }
             // op-mode page (#45): materialize .rm from the op log for
             // the codec-dumb daemon; legacy pages serve the blob.
             if (store.isOpModePage(user, doc, page)) {
