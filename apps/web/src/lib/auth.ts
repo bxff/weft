@@ -321,6 +321,25 @@ function clerkBearerAccount(token: string): string | null {
     return JSON.stringify(['clerk', claims.iss, claims.sub])
 }
 
+/**
+ * Local replica identity, not a substitute for server authentication.
+ * Require the explicitly selected Clerk issuer+subject, never just user ID.
+ * A matching expired token may identify this offline replica, but the
+ * transport still obtains a fresh bearer and the relay verifies it.
+ */
+export function selectedClerkReplicaAccount(): string | null {
+    if (!clerkEnabled()) return null
+    const selected = selectedClerkToken()
+    if (!selected) return null
+    const account = clerkBearerAccount(selected.value)
+    return account && localStorage.getItem(clerkAccountKey(selected.relay, selected.publishableKey)) === account
+        ? account : null
+}
+
+export function bearerMatchesClerkReplicaAccount(token: string | null, account: string): boolean {
+    return !!token && !!validClerkClaims(token) && clerkBearerAccount(token) === account
+}
+
 function clerkSelectionSubject(selection: string | null): string | null {
     if (!selection) return null
     try {

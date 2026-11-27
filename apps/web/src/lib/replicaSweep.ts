@@ -101,11 +101,11 @@ async function replicaBytes(key: string): Promise<number> {
 }
 
 /** True when this replica holds bytes that exist nowhere else. */
-async function hasPendingWork(key: string): Promise<boolean> {
+export async function hasPendingWork(key: string): Promise<boolean> {
     // unflushed ops live under per-author keys: any pending queue on this page
     // is unpushed local work, never sweep it.
     const pending = await idb.keys(`page/${key}/pending/`)
-    if (pending.length > 0) return true
+    if (pending.length > 0 || (await idb.keys(`page/${key}/deferred/`)).length > 0) return true
     const raw = await idb.get(`page/${key}/state`)
     if (!raw) return false
     try {

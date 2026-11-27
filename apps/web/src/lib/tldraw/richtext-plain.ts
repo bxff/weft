@@ -10,7 +10,7 @@ import type { TLRichText } from 'tldraw'
 
 const isTextBlock = (type: string | undefined) => type === 'paragraph' || type === 'heading'
 
-export function textFromNode(node: unknown): string {
+export function textBlocksFromNode(node: unknown): string[] {
     const lines: string[] = []
     const inline = (n: unknown): string => {
         if (!n || typeof n !== 'object') return ''
@@ -29,7 +29,11 @@ export function textFromNode(node: unknown): string {
         for (const c of b.content ?? []) walk(c)
     }
     walk(node)
-    return lines.join('\n')
+    return lines
+}
+
+export function textFromNode(node: unknown): string {
+    return textBlocksFromNode(node).join('\n')
 }
 
 /** Erase at the same code-point positions used by the contour projection.

@@ -208,6 +208,15 @@ export interface MeasuredSpan {
     w: number
     /** Range-rect height = the CSS line box (fontSize * lineHeight). */
     h: number
+    /** Outline face selected by the browser for this styled run. */
+    font?: Font
+    fontSize?: number
+    sourceIndex?: number
+    color?: string
+    /** Measured baseline y in the same scaled shape-local coordinates as y. */
+    baseline?: number
+    /** Inline marks painted in the text color, attached to their source glyphs. */
+    decorations?: { underline?: boolean; strike?: boolean }
     /** Optional browser-measured pen offset (shape-local px, scale folded) of
      *  each code point relative to `x`; offsets[0] === 0. Suffix-independent,
      *  so a growing word never moves earlier glyphs (no re-mint churn). One per
@@ -273,6 +282,24 @@ function glyphAdvance(font: Font, fontSize: number, ch: string): number {
     }
 }
 
+function decorationLines(font: Font, size: number, marks: NonNullable<MeasuredSpan['decorations']>) {
+    const toLocal = size / font.unitsPerEm
+    const metric = (value: number | undefined, fallback: number) =>
+        value && Number.isFinite(value) ? value * toLocal : size * fallback
+    const post = font.tables?.post as { underlinePosition?: number; underlineThickness?: number } | undefined
+    const os2 = font.tables?.os2 as { yStrikeoutPosition?: number; yStrikeoutSize?: number } | undefined
+    const lines: { offset: number; width: number }[] = []
+    if (marks.underline) lines.push({
+        offset: -metric(post?.underlinePosition, -0.12),
+        width: tldrawWidthToRmMarkerWidth(Math.max(0.3, metric(post?.underlineThickness, 0.05))),
+    })
+    if (marks.strike) lines.push({
+        offset: -metric(os2?.yStrikeoutPosition, 0.30),
+        width: tldrawWidthToRmMarkerWidth(Math.max(0.3, metric(os2?.yStrikeoutSize, 0.05))),
+    })
+    return lines
+}
+
 export function textToGlyphParts(
     font: Font,
     layout: TextLayout,
@@ -290,31 +317,51 @@ export function textToGlyphParts(
     const desc = (Math.abs(font.descender) / font.unitsPerEm) * fontSize
     const lineBox = fontSize * lineHeight
     const baselineOf = (line: number) => line * lineBox + (lineBox - (asc + desc)) / 2 + asc
-    const strokeWidth = Math.max(0.3, fontSize * 0.04)
-    const width = tldrawWidthToRmMarkerWidth(strokeWidth)
-    const widths = [...new Set([width, Math.max(1, Math.floor(width / 2)), 1])]
-    const radii = widths.map(rmMarkerWidthToRadius)
     const advanceOf = (ch: string) => glyphAdvance(font, fontSize, ch)
     const wrapW = box.width && box.width > 0 ? box.width : Infinity
     const align = box.align ?? 'start'
 
     const parts: GlyphPart[] = []
-    const emitGlyph = (ch: string, x: number, baseline: number, srcIdx: number): void => {
+    const styles = new Map<number, { widths: number[]; radii: number[] }>()
+    const ringSizes = (size: number) => {
+        const existing = styles.get(size)
+        if (existing) return existing
+        const width = tldrawWidthToRmMarkerWidth(Math.max(0.3, size * 0.04))
+        const widths = [...new Set([width, Math.max(1, Math.floor(width / 2)), 1])]
+        const entry = { widths, radii: widths.map(rmMarkerWidthToRadius) }
+        styles.set(size, entry)
+        return entry
+    }
+    const emitGlyph = (
+        ch: string, x: number, baseline: number, srcIdx: number,
+        face = font, decorationEnd?: number, lines?: ReturnType<typeof decorationLines>,
+        size = fontSize, color = rmColor,
+    ): void => {
         const strokes: InkStroke[] = []
         try {
-            const glyph = font.charToGlyph(ch)
-            const path = glyph.getPath(x, baseline, fontSize)
+            const glyph = face.charToGlyph(ch)
+            const path = glyph.getPath(x, baseline, size)
+            const { widths, radii } = ringSizes(size)
             const contours = extractContours(path).filter((c) => c.length >= 4)
             for (const { paths, widthIndex } of insetGlyphFill(contours, radii)) {
                 for (const path of paths) {
                     strokes.push({
                         points: polylineToPoints(mapToRmSpace(path, shape), { width: widths[widthIndex]! }),
-                        color: rmColor,
+                        color,
                     })
                 }
             }
         } catch {
-            // unknown glyph: advance only
+            // unknown glyph: advance only (a decoration can still cross it)
+        }
+        if (decorationEnd !== undefined && Number.isFinite(x) && Number.isFinite(decorationEnd) && x !== decorationEnd) {
+            for (const { offset, width } of lines ?? []) {
+                const y = baseline + offset
+                strokes.push({
+                    points: polylineToPoints(mapToRmSpace([{ x, y }, { x: decorationEnd, y }], shape), { width }),
+                    color,
+                })
+            }
         }
         if (strokes.length > 0) parts.push({ partKey: `glyph:${srcIdx}`, strokes })
     }
@@ -341,7 +388,10 @@ export function textToGlyphParts(
             // scales every glyph, each edit moves every glyph after the first,
             // changing its contentHash and re-minting the entire word (N chars
             // -> ~N^2/2 strokes). Prefix offsets are overhead-free and stable.
-            const advances = chars.map(advanceOf)
+            const face = span.font ?? font
+            const size = span.fontSize ?? fontSize
+            const lines = span.decorations ? decorationLines(face, size, span.decorations) : undefined
+            const advances = chars.map(face === font && size === fontSize ? advanceOf : (ch) => glyphAdvance(face, size, ch))
             const total = advances.reduce((a, b) => a + b, 0)
             const fit = total > 0 && span.w > 0 && Number.isFinite(span.w) ? span.w / total : 1
             const offsets = span.offsets
@@ -349,8 +399,13 @@ export function textToGlyphParts(
                 offsets && offsets.length === chars.length
                     ? span.x + offsets[i]!
                     : span.x + advances.slice(0, i).reduce((a, b) => a + b, 0) * fit
-            const baseline = span.y + (span.h - (asc + desc)) / 2 + asc
+            const runAsc = face === font ? asc : (face.ascender / face.unitsPerEm) * fontSize
+            const runDesc = face === font ? desc : (Math.abs(face.descender) / face.unitsPerEm) * fontSize
+            const baseline = Number.isFinite(span.baseline) ? span.baseline! :
+                span.y + (span.h - (runAsc + runDesc)) / 2 + runAsc
+            const right = span.x + span.w
             let ci = 0
+            if (span.sourceIndex !== undefined) src = span.sourceIndex
             for (const ch of span.text) {
                 let srcIdx: number | null = null
                 if (source[src] === ch) {
@@ -364,10 +419,22 @@ export function textToGlyphParts(
                         src = at + 1
                     }
                 }
-                // whitespace mismatches are normalizeTextForDom artifacts
-                // (an empty line renders as one space): no glyph, no advance
-                if (!/\s/.test(ch)) emitGlyph(ch, xOf(ci), baseline, srcIdx ?? src)
-                ci++
+                // Whitespace mismatches are normalizeTextForDom artifacts
+                // (an empty line renders as one space). Never assign such a
+                // spacer to a source glyph or join marks across explicit wraps.
+                const index = ci++
+                const marked = !!lines?.length && srcIdx !== null && !/[\r\n]/.test(ch)
+                const isWhitespace = /\s/.test(ch)
+                if (!marked && isWhitespace) continue
+                const x = xOf(index)
+                let end: number | undefined
+                if (marked && span.w > 0 && Number.isFinite(right)) {
+                    const bound = ci < chars.length ? xOf(ci) : right
+                    if (bound > x && bound > span.x && x < right) end = Math.min(bound, right)
+                }
+                if (!isWhitespace || end !== undefined) {
+                    emitGlyph(ch, x, baseline, srcIdx ?? src, face, end, lines, size, span.color)
+                }
             }
         }
         return parts

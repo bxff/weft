@@ -9,6 +9,7 @@ import {
     AssetRecordType,
     createShapeId,
     DefaultFontFamilies,
+    getDisplayValues,
     isShapeId,
     Mat,
     T,
@@ -22,6 +23,7 @@ import {
     type ShapeUtil,
     type TLDrawShape,
     type TLShape,
+    type TLRichText,
     type TLShapeId,
 } from 'tldraw'
 import {
@@ -53,6 +55,8 @@ import {
     tldrawWidthToRmMarkerWidth,
     RM_SCALE,
     type InkStroke,
+    type ShapeTransform,
+    type GlyphPart,
 } from '@weft/rm-ink'
 import { RefResolver, remapImagesByUuid, type LiveImage } from '@weft/sync-engine'
 import {
@@ -83,14 +87,16 @@ import {
     DEVICE_TEXT_LEFT_MARGIN_INK,
 } from './text-metrics'
 import { computeAnchorOffsets } from './text-anchor-layout'
-import { parse as parseFont, type Font } from 'opentype.js'
-import { adoptOrphanAuthor, cachedDocuments, ensureUniqueAuthorUuid, uuidv4 } from '../transport'
+import { ProjectionFontLoader, type ProjectionFamily, type ProjectionFontKey } from './projection-fonts'
+import { measureRichProjection, richProjection } from './richtext-projection'
+import { adoptOrphanAuthor, cachedDocuments, ensureUniqueAuthorUuid, holdsAuthorLease, needsHostedProjectionScope, projectionScope, uuidv4 } from '../transport'
 import { fetchDataUrl, seedAssetBytes } from '../authedAsset'
 import { getPointsFromDrawSegments } from 'tldraw'
 import { decodeRmPointData } from '@weft/rm-ink'
 import { idb as storage } from '../idb'
 import {
     clearReplicaInUse,
+    hasPendingWork,
     primaryLockName,
     useReplica,
     markReplicaInUse,
@@ -123,6 +129,15 @@ const SYNCABLE = new Set(['draw', 'geo', 'arrow', 'line', 'text', 'highlight', '
 /** Overlay kind -> tldraw shape type (only 'draw-native' differs). */
 function overlayShapeType(kind: OverlayShape['kind']): TLShape['type'] {
     return kind === 'draw-native' ? 'draw' : kind
+}
+
+type ProjectionDraft = {
+    shape: TLShape
+    stamp: OpVersion
+    baseline: string
+    authorLeased?: true
+    opacity?: { opacity: number; opacityVersion: OpVersion }
+    order?: string
 }
 
 export interface ControllerOptions {
@@ -176,6 +191,8 @@ function sameNativeLine(a: Line, b: Line): boolean {
         })
 }
 
+const RETRY_TEXT_PROJECTION = Symbol('retry-text-projection')
+
 const closingReplicas = new Map<string, Promise<void>>()
 
 export class StudioController {
@@ -185,7 +202,7 @@ export class StudioController {
     /** PDF page size in points, reported by pdf.js once the file loads. */
     pdfPtSize: { w: number; h: number } | null = null
     private editor!: Editor
-    private font: Font | null = null
+    private readonly fonts: ProjectionFontLoader
     pageMeta: PageMeta = {
         docType: 'notebook',
         template: null,
@@ -206,6 +223,7 @@ export class StudioController {
     /** UI subscription for late-arriving page metadata (background doclist). */
     onMetaChanged: (() => void) | null = null
     private pendingShapeIds = new Set<string>()
+    private deferredTextProjection = new Set<string>()
     private readonly deferredOpacityRepaints = new Set<string>()
     private readonly pendingOpacityWrites = new Map<string, { opacity: number; opacityVersion: OpVersion }>()
     private pendingBrowserOrder = new Map<string, IndexKey>()
@@ -231,6 +249,14 @@ export class StudioController {
     private sceneRebuildPending = false
     private saveFailure: symbol | null = null
     private pendingCommands = new Set<Promise<void>>()
+    private projectionScope: string | undefined
+    private projectionAuthor: string | undefined
+    private readonly projectionDrafts = new Map<string, { draft: ProjectionDraft; bytes: Uint8Array }>()
+    private projectionDraftWrites = Promise.resolve()
+    private projectionDraftFailure: unknown
+    private readonly projectionDraftConflicts = new Map<string, ProjectionDraft>()
+    private legacyUnsynced = false
+
     private renderAfterRetry = new Set<() => void>()
     private deviceTextWork: Promise<void> | null = null
     private deviceTextDraft: unknown = undefined
@@ -248,7 +274,9 @@ export class StudioController {
     private assetUnsub: (() => void) | null = null
     private docListUnsub: (() => void) | null = null
 
-    constructor(private readonly opts: ControllerOptions) {}
+    constructor(private readonly opts: ControllerOptions) {
+        this.fonts = new ProjectionFontLoader(opts.fontUrl)
+    }
 
     /**
      * Cache-primary election: every tab edits (own author identity); the lock
@@ -260,7 +288,7 @@ export class StudioController {
     private async electCachePrimary(): Promise<boolean> {
         const locks = (globalThis.navigator as Navigator | undefined)?.locks
         if (!locks) return true
-        const name = primaryLockName(`${this.opts.docId}/${this.opts.pageId}`)
+        const name = primaryLockName(this.replicaKey)
         const immediate = await new Promise<boolean>((resolve) => {
             locks
                 .request(name, { ifAvailable: true }, (lock) => {
@@ -316,11 +344,19 @@ export class StudioController {
         }
     }
 
+    private get replicaDoc(): string {
+        return this.projectionScope ? `${encodeURIComponent(this.projectionScope)}/${this.opts.docId}` : this.opts.docId
+    }
+
     private get replicaKey(): string {
-        return `${this.opts.docId}/${this.opts.pageId}`
+        return `${this.replicaDoc}/${this.opts.pageId}`
     }
 
     async start(editor: Editor): Promise<void> {
+        this.projectionScope = projectionScope(this.opts.transport)
+        if (needsHostedProjectionScope() && !this.projectionScope) {
+            throw new Error('Sign in again before opening the scoped editor')
+        }
         const closing = closingReplicas.get(this.replicaKey)
         if (closing) await closing
         if (this.disposed) return
@@ -334,6 +370,13 @@ export class StudioController {
             `weft:open start@ ${(navAt !== undefined ? t0 - navAt : t0).toFixed(0)}ms after nav`,
         )
         this.editor = editor
+        if (this.projectionScope) {
+            // Never load or copy the legacy unscoped checkpoint or queue.
+            // Detect possible pending work for messaging, without exposing bytes.
+            this.legacyUnsynced = needsHostedProjectionScope() ||
+                await hasPendingWork(`${this.opts.docId}/${this.opts.pageId}`)
+            if (!this.canUseScopedSession()) return
+        }
         this.photoOwner = libraryCacheScope()
         // Device + document metadata (geometry convention, template, pdf index).
         // Not awaited: the session opens from the local replica and needs no
@@ -343,14 +386,14 @@ export class StudioController {
         lap('meta-cache')
         const loadDocs = () => {
             void cachedDocuments(this.opts.transport).then((docs) => {
-                if (this.disposed) return
+                if (!this.canUseScopedSession()) return
                 this.adoptDocs(docs)
                 if (this.session) this.onMetaChanged?.()
                 lap('doclist (background)')
             }).catch(() => {})
         }
         void this.opts.transport.health().then(() => {
-            if (this.disposed) return
+            if (!this.canUseScopedSession()) return
             if (this.session) this.onMetaChanged?.()
         }).catch(() => {})
         loadDocs()
@@ -361,7 +404,7 @@ export class StudioController {
             subscribePageAssets?: (handler: (event?: { doc: string; page: string; file: string }) => void) => () => void
         }
         this.assetUnsub = assets.subscribePageAssets?.((event) => {
-            if (this.disposed || (event && (event.doc !== this.opts.docId || event.page !== this.opts.pageId))) return
+            if (!this.canUseScopedSession() || (event && (event.doc !== this.opts.docId || event.page !== this.opts.pageId))) return
             for (const [id, file] of this.nativeImageFiles) {
                 if (!event || event.file === file) this.loadNativeImage(id, file, true)
             }
@@ -369,17 +412,17 @@ export class StudioController {
         // mark in-use synchronously so a concurrent app-start sweep can never
         // delete the replica we are about to open
         try {
-            await useReplica(`${this.opts.docId}/${this.opts.pageId}`, this.replicaUse.signal)
+            await useReplica(this.replicaKey, this.replicaUse.signal)
         } catch (error) {
-            if (this.disposed) return
+            if (!this.canUseScopedSession()) return
             throw error
         }
-        if (this.disposed) return
-        markReplicaInUse(this.opts.docId, this.opts.pageId)
+        if (!this.canUseScopedSession()) return
+        markReplicaInUse(this.replicaDoc, this.opts.pageId)
         this.replicaMarkedInUse = true
         // recency bookkeeping, off the open path: replica-sweep LRU index, and
         // the cloud web-open record (flows into the tablet's lastOpened).
-        void noteReplicaOpened(this.opts.docId, this.opts.pageId)
+        void noteReplicaOpened(this.replicaDoc, this.opts.pageId)
         void this.recordWebOpen()
         // per-tab author (a duplicated tab mints a fresh identity) + cache-
         // primary election
@@ -387,7 +430,8 @@ export class StudioController {
             ensureUniqueAuthorUuid(),
             this.electCachePrimary(),
         ])
-        if (this.disposed) return
+        if (!this.canUseScopedSession()) return
+        this.projectionAuthor = author
         const primaryAtOpen = cachePrimary || this.pageLockRelease !== null
         this.sessionOpening = OfflineSession.open(
             storage,
@@ -400,12 +444,19 @@ export class StudioController {
                 // history timeline label; CRDT identity stays authorUuid
                 historyAuthor: 'web',
                 cachePrimary: primaryAtOpen,
+                replicaScope: this.projectionScope,
                 adoptOrphanAuthor,
-                onPatch: (patch) => this.onPatches([patch]),
-                onPatchBatch: (patches) => this.onPatches(patches),
-                onStatus: (status) => { if (!this.disposed) this.opts.onStatus?.(status) },
+                onPatch: (patch) => { if (this.canUseScopedSession()) this.onPatches([patch]) },
+                onPatchBatch: (patches) => { if (this.canUseScopedSession()) this.onPatches(patches) },
+                onStatus: (status) => {
+                    if (!this.canUseScopedSession()) return
+                    this.opts.onStatus?.(this.projectionDraftConflicts.size > 0
+                        ? { state: 'error', detail: 'Text draft conflicts with a newer edit' }
+                        : status.state === 'synced' && this.projectionDrafts.size
+                            ? { state: 'pending', ops: this.projectionDrafts.size } : status)
+                },
                 onPageAvailable: () => {
-                    if (this.disposed) return
+                    if (!this.canUseScopedSession()) return
                     this.opts.onPageAvailable?.()
                     // The projection font is for future text edits. A cold
                     // drawing takes the network ahead of this warm-up.
@@ -416,10 +467,15 @@ export class StudioController {
         this.session = await this.sessionOpening
         lap('session-open')
         // A closing controller already waits for this session and drains it.
-        if (this.disposed) return
+        if (!this.canUseScopedSession()) {
+            if (!this.disposed) this.dispose()
+            return
+        }
         if (!primaryAtOpen && this.pageLockRelease) void this.session.promoteToCachePrimary()
         this.registerImageDrop()
         this.renderInitial()
+        if (this.projectionScope) await this.restoreProjectionDrafts()
+        if (!this.canUseScopedSession()) return
         lap('render')
         // first render measured wraps before the RM webfonts were resident;
         // re-settle device-text layout once they load (no-op if cached)
@@ -479,7 +535,10 @@ export class StudioController {
                 for (const record of Object.values(changes.removed)) {
                     const shape = record as TLShape
                     if (record.typeName === 'binding' && record.type === 'arrow') this.queueArrow(record.fromId)
-                    if (shape.typeName === 'shape') this.pendingDeletes.set(shape.id, this.shapeEditVersion(shape.id))
+                    if (shape.typeName === 'shape') {
+                        this.pendingDeletes.set(shape.id, this.shapeEditVersion(shape.id))
+                        this.discardProjectionDraft(shape.id)
+                    }
                 }
                 this.schedule()
             },
@@ -532,23 +591,29 @@ export class StudioController {
         if (toDelete.length) this.editor.deleteShapes(toDelete)
     }
 
-    /** Font loading retries on demand: a single failed fetch must not stop
-     *  text from ever syncing this session. */
-    private fontLoad: Promise<Font | null> | null = null
-    private async ensureFont(): Promise<Font | null> {
-        if (this.font) return this.font
-        if (!this.opts.fontUrl) return null
-        this.fontLoad ??= (async () => {
-            try {
-                const buf = await (await fetch(this.opts.fontUrl!)).arrayBuffer()
-                this.font = parseFont(buf)
-                return this.font
-            } catch {
-                this.fontLoad = null // transient failure: retry next flush
-                return null
+    private ensureFont(key: ProjectionFontKey = 'draw') {
+        return this.fonts.ensure(key, this.editor.getContainer().ownerDocument)
+    }
+
+    private projectionReady(shape: TLShape): boolean {
+        return [...projectionKeys(shape)].every((key) => this.fonts.get(key))
+    }
+
+    private async ensureShapeFonts(shape: TLShape): Promise<boolean> {
+        const faces = await Promise.all([...projectionKeys(shape)].map((key) => this.ensureFont(key)))
+        return faces.every(Boolean)
+    }
+
+    private missingProjectionFonts(): Set<ProjectionFontKey> {
+        const missing = new Set<ProjectionFontKey>()
+        for (const id of this.pendingShapeIds) {
+            const shape = this.editor.getShape(id as TLShapeId)
+            if (!shape) continue
+            for (const key of projectionKeys(shape)) {
+                if (!this.fonts.get(key)) missing.add(key)
             }
-        })()
-        return this.fontLoad
+        }
+        return missing
     }
 
     /** Detached-shape resolution: re-render from props (text stays text). */
@@ -556,12 +621,12 @@ export class StudioController {
         if (this.disposed) return
         const shape = this.editor.getShape(shapeId as TLShapeId)
         if (!shape) return
-        if (!this.font && needsProjectionFont(shape)) {
-            if (!(await this.ensureFont()) || this.disposed || this.editor.getShape(shape.id) !== shape) return
+        if (!this.projectionReady(shape)) {
+            if (!(await this.ensureShapeFonts(shape)) || this.disposed || this.editor.getShape(shape.id) !== shape) return
         }
         const opacity = this.storedOpacity(shapeId)
         const op = this.projectShape(shape)
-        if (!op) return
+        if (!op || op === RETRY_TEXT_PROJECTION) return
         await this.trackCommand(this.applyLocal([op], () => this.remote(() => {
             this.editor.updateShape({
                 id: shape.id,
@@ -613,12 +678,14 @@ export class StudioController {
             this.pageLockRelease = null
             this.replicaUse.abort()
             if (this.replicaMarkedInUse) {
-                clearReplicaInUse(this.opts.docId, this.opts.pageId)
-                void noteReplicaClosed(this.opts.docId, this.opts.pageId)
+                clearReplicaInUse(this.replicaDoc, this.opts.pageId)
+                void noteReplicaClosed(this.replicaDoc, this.opts.pageId)
             }
         }
-        const localWrites = this.session?.disposeAndDrainLocalWrites() ??
+        const engineWrites = this.session?.disposeAndDrainLocalWrites() ??
             opening?.then(session => session.disposeAndDrainLocalWrites(), () => {})
+        const localWrites = this.projectionScope
+            ? Promise.all([engineWrites, this.projectionDraftWrites]).then(() => {}) : engineWrites
         if (!localWrites) {
             release()
             return
@@ -1579,7 +1646,154 @@ export class StudioController {
             else if (changedOrder && !this.pendingShapeIds.has(record.id)) this.orderOnlyShapeIds.add(record.id)
         }
         this.pendingShapeIds.add(record.id)
-        this.pendingShapeVersions.set(record.id, this.captureShapeEdit(record.id))
+        const captured = this.captureShapeEdit(record.id)
+        this.pendingShapeVersions.set(record.id, captured)
+        this.captureProjectionDraft(record, captured.stamp)
+    }
+
+    private ownsProjectionDrafts(): boolean {
+        return this.projectionScope !== undefined && this.projectionScope === projectionScope(this.opts.transport)
+    }
+
+    private canUseScopedSession(): boolean {
+        return !this.disposed && (!this.projectionScope || this.ownsProjectionDrafts())
+    }
+
+    private projectionBaseline(id: string): string {
+        const overlay = this.session.currentOverlay
+        const shape = overlay.shapes.find(s => s.shapeId === id)
+        return JSON.stringify([shape?.version, shape?.renderRevision, shape?.state, overlay.tombstones?.[id]])
+    }
+
+    /** The loopback proof only restores independent page-root labels.
+     *  A parented or attached shape needs its separate graph dependencies. */
+    private draftSupported(shape: TLShape): boolean {
+        return isPageId(shape.parentId) && ['text', 'geo', 'note'].includes(shape.type) &&
+            !shape.meta.rmBrush && !shape.meta.detached
+    }
+
+    private writeProjectionDraft(fn: () => Promise<void>): void {
+        this.projectionDraftWrites = this.projectionDraftWrites.then(async () => {
+            if (!this.ownsProjectionDrafts()) throw new Error('Projection draft account changed')
+            await fn()
+        }).catch(error => {
+            this.projectionDraftFailure = error
+            if (!this.disposed) this.opts.onStatus?.({ state: 'error', detail: 'Text draft could not be saved' })
+        })
+    }
+
+    private captureProjectionDraft(shape: TLShape, stamp: OpVersion): void {
+        if (!this.ownsProjectionDrafts() || !this.draftSupported(shape) ||
+            (!this.projectionDrafts.has(shape.id) && this.projectionReady(shape))) return
+        const draft: ProjectionDraft = {
+            shape, stamp, baseline: this.projectionDrafts.get(shape.id)?.draft.baseline ??
+                this.projectionBaseline(shape.id),
+            ...(this.projectionAuthor && holdsAuthorLease(this.projectionAuthor) && { authorLeased: true }),
+            opacity: this.pendingOpacityWrites.get(shape.id),
+            order: this.pendingBrowserOrder.get(shape.id),
+        }
+        const bytes = new TextEncoder().encode(JSON.stringify(draft))
+        const key = this.session.deferredDraftStorageKey(shape.id)
+        this.projectionDrafts.set(shape.id, { draft, bytes })
+        this.writeProjectionDraft(() => storage.set(key, bytes))
+        this.opts.onStatus?.({ state: 'pending', ops: this.projectionDrafts.size })
+    }
+
+    private discardProjectionDraft(id: string): void {
+        if (!this.projectionDrafts.delete(id)) return
+        const key = this.session.deferredDraftStorageKey(id)
+        this.writeProjectionDraft(() => storage.delete(key))
+    }
+
+    private decodeProjectionDraft(bytes: Uint8Array): ProjectionDraft | null {
+        try {
+            const draft: ProjectionDraft = JSON.parse(new TextDecoder().decode(bytes))
+            if (typeof draft.baseline !== 'string' || !Number.isSafeInteger(draft.stamp?.ts) ||
+                typeof draft.stamp.actor !== 'string' || !this.draftSupported(draft.shape)) return null
+            return draft
+        } catch { return null }
+    }
+
+    /** Adopt only after the prior tab releases the same exclusive author
+     * lease as the projected queue. Both keys remain within this account's
+     * replica, and the original durable bytes move without restamping.
+     * Don't silently replace an existing draft for the same shape. */
+    private async adoptProjectionDrafts(): Promise<void> {
+        const consume = storage.consume?.bind(storage)
+        if (!consume || !this.canUseScopedSession() || !this.projectionAuthor ||
+            !holdsAuthorLease(this.projectionAuthor)) return
+        const namespace = this.session.deferredDraftNamespace()
+        const ownPrefix = this.session.deferredDraftStorageKey('')
+        for (const source of await storage.keys(namespace)) {
+            if (!this.canUseScopedSession()) return
+            if (source.startsWith(ownPrefix)) continue
+            const [author, draftId, extra] = source.slice(namespace.length).split('/')
+            if (!author || !draftId || extra !== undefined ||
+                !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(author)) continue
+            await adoptOrphanAuthor(author, async () => {
+                if (!this.canUseScopedSession()) return
+                const bytes = await storage.get(source)
+                const draft = bytes && this.decodeProjectionDraft(bytes)
+                if (!bytes || !draft || draft.authorLeased !== true || encodeURIComponent(draft.shape.id) !== draftId) return
+                const key = this.session.deferredDraftStorageKey(draft.shape.id)
+                await consume([source, bytes], [key, bytes], () => this.canUseScopedSession(), true)
+            })
+        }
+    }
+
+    private async restoreProjectionDrafts(): Promise<void> {
+        if (!this.ownsProjectionDrafts()) return
+        await this.adoptProjectionDrafts()
+        if (!this.canUseScopedSession()) return
+        const prefix = this.session.deferredDraftStorageKey('')
+        for (const key of await storage.keys(prefix)) {
+            const bytes = await storage.get(key)
+            if (this.disposed || !this.ownsProjectionDrafts()) return
+            if (!bytes) continue
+            const draft = this.decodeProjectionDraft(bytes)
+            if (!draft || key !== this.session.deferredDraftStorageKey(draft.shape.id)) continue
+            if (draft.baseline !== this.projectionBaseline(draft.shape.id)) {
+                this.parkProjectionDraft(draft)
+                continue
+            }
+            const shape = { ...draft.shape, parentId: this.editor.getCurrentPageId() }
+            this.remote(() => {
+                if (this.editor.getShape(shape.id)) this.editor.updateShape(shape)
+                else this.editor.createShape(shape)
+            })
+            this.projectionDrafts.set(shape.id, { draft: { ...draft, shape }, bytes })
+            this.pendingShapeIds.add(shape.id)
+            this.pendingShapeVersions.set(shape.id, { stamp: draft.stamp })
+            this.issuedShapeVersions.set(shape.id, draft.stamp.ts)
+            if (draft.opacity) this.pendingOpacityWrites.set(shape.id, draft.opacity)
+            if (draft.order) this.pendingBrowserOrder.set(shape.id, draft.order as TLShape['index'])
+        }
+        if (this.projectionDrafts.size > 0) {
+            this.opts.onStatus?.({ state: 'pending', ops: this.projectionDrafts.size })
+            this.schedule()
+        }
+    }
+
+    private parkProjectionDraft(draft: ProjectionDraft): void {
+        this.projectionDraftConflicts.set(draft.shape.id, draft)
+        this.opts.onStatus?.({ state: 'error', detail: 'Text draft conflicts with a newer edit' })
+    }
+
+    get hasParkedProjectionDrafts(): boolean {
+        return !this.disposed && this.ownsProjectionDrafts() && this.projectionDraftConflicts.size > 0
+    }
+
+    get hasUnattributedLegacyEdits(): boolean {
+        return !this.disposed && this.ownsProjectionDrafts() && this.legacyUnsynced
+    }
+
+    /** Explicit local export; never upload, auto-apply, or expose across accounts. */
+    exportParkedProjectionDrafts(): Uint8Array | null {
+        if (!this.hasParkedProjectionDrafts) return null
+        const drafts = [...this.projectionDraftConflicts.values()].map(({ shape }) => ({
+            id: shape.id, type: shape.type, props: shape.props,
+        }))
+        return new TextEncoder().encode(JSON.stringify({ version: 1, drafts }, null, 2))
     }
 
     private schedule(): void {
@@ -1661,11 +1875,9 @@ export class StudioController {
                 await Promise.all([...this.pendingCommands])
                 await this.flush()
                 if (this.disposed) return
-                const missingFont = !this.font && [...this.pendingShapeIds].some((id) =>
-                    needsProjectionFont(this.editor.getShape(id as TLShapeId)),
-                )
+                const missingFont = this.missingProjectionFonts().size > 0
                 const gestureInProgress = this.pendingInkTransforms.size > 0 && this.editor.inputs.getIsPointing()
-                if (missingFont || gestureInProgress) throw new Error('Some edits could not be projected yet')
+                if (missingFont || this.deferredTextProjection.size || gestureInProgress) throw new Error('Some edits could not be projected yet')
                 const failure = this.saveFailure
                 const renders = [...this.renderAfterRetry]
                 await this.session.savePending()
@@ -1697,17 +1909,22 @@ export class StudioController {
 
     private async flushBatch(): Promise<void> {
         if (this.disposed) return
-        if (!this.font && [...this.pendingShapeIds].some((id) =>
-            needsProjectionFont(this.editor.getShape(id as TLShapeId)),
-        )) {
-            await this.ensureFont()
+        const missingFonts = this.missingProjectionFonts()
+        if (missingFonts.size) {
+            await Promise.all([...missingFonts].map((key) => this.ensureFont(key)))
             if (this.disposed) return
+        }
+        if (this.projectionScope) {
+            await this.projectionDraftWrites
+            if (this.disposed) return
+            if (this.projectionDraftFailure) throw this.projectionDraftFailure
         }
         const ops: LocalOp[] = []
 
         for (const [shapeId, version] of this.pendingDeletes) {
             this.deferredOpacityRepaints.delete(shapeId)
             this.pendingShapeIds.delete(shapeId)
+            this.deferredTextProjection.delete(shapeId)
             this.pendingShapeVersions.delete(shapeId)
             this.pendingOpacityWrites.delete(shapeId)
             this.pendingBrowserOrder.delete(shapeId)
@@ -1768,10 +1985,18 @@ export class StudioController {
         const projected: string[] = []
         for (const shapeId of this.projectionOrder(batch)) {
             const shape = this.editor.getShape(shapeId as TLShapeId)
+            this.deferredTextProjection.delete(shapeId)
             if (!shape) continue
             const opacityWrite = opacityBatch.get(shapeId)
             const captured = versions.get(shapeId) ?? this.captureShapeEdit(shapeId)
-            const editVersion = this.projectionVersion(shapeId, captured)
+            const deferred = this.projectionDrafts.get(shapeId)
+            if (deferred && !this.ownsProjectionDrafts()) continue
+            if (deferred && deferred.draft.baseline !== this.projectionBaseline(shapeId)) {
+                this.parkProjectionDraft(deferred.draft)
+                this.reconcileToSessionState()
+                continue
+            }
+            const editVersion = deferred?.draft.stamp ?? this.projectionVersion(shapeId, captured)
             // noteChange skips detached shapes at ENQUEUE time, but a detach
             // arriving inside the debounce window slips past it — projecting
             // then re-renders stale props over the tablet's diverged ink and
@@ -1787,15 +2012,29 @@ export class StudioController {
                 }
                 continue
             }
-            if (!this.font && needsProjectionFont(shape)) {
+            const op = this.projectionReady(shape)
+                ? this.projectShape(shape, orderVersion, opacityWrite, editVersion)
+                : RETRY_TEXT_PROJECTION
+            if (op === RETRY_TEXT_PROJECTION) {
+                this.deferredTextProjection.add(shapeId)
                 this.pendingShapeIds.add(shapeId)
                 this.pendingShapeVersions.set(shapeId, captured)
                 if (opacityWrite && !this.pendingOpacityWrites.has(shapeId)) this.pendingOpacityWrites.set(shapeId, opacityWrite)
                 retries++
                 continue
             }
-            const op = this.projectShape(shape, orderVersion, opacityWrite, editVersion)
-            if (op) {
+            if (op && deferred) {
+                const committed = await this.session.applyDeferredDraft(
+                    [this.session.deferredDraftStorageKey(shapeId), deferred.bytes], [op],
+                    () => this.ownsProjectionDrafts() && !this.disposed &&
+                        this.projectionDrafts.get(shapeId) === deferred &&
+                        this.projectionBaseline(shapeId) === deferred.draft.baseline,
+                )
+                if (committed && this.projectionDrafts.get(shapeId) === deferred) {
+                    this.projectionDrafts.delete(shapeId)
+                    this.projectedShapeIds.add(shapeId)
+                }
+            } else if (op) {
                 ops.push(op)
                 projected.push(shapeId)
             }
@@ -2662,7 +2901,7 @@ export class StudioController {
         orderVersion?: OpVersion,
         opacityWrite?: { opacity: number; opacityVersion: OpVersion },
         version = this.shapeEditVersion(shape.id),
-    ): LocalOp | null {
+    ): LocalOp | null | typeof RETRY_TEXT_PROJECTION {
         const previous = shape.type === 'arrow'
             ? this.session.currentOverlay.shapes.find(record => record.shapeId === shape.id)?.props
             : undefined
@@ -2734,7 +2973,8 @@ export class StudioController {
                 }
             }
             case 'text': {
-                if (!this.font) return null
+                const font = this.fonts.get(projectionFamily(shape))
+                if (!font) return null
                 const props = shape.props as {
                     richText?: unknown
                     size?: string
@@ -2756,25 +2996,25 @@ export class StudioController {
                 const t = this.editor.getShapePageTransform(shape)
                 // browser-measured spans (the SAME layout the DOM rendered);
                 // null in tests / when the measurer is unavailable
-                const spans = this.measureSpans(text, {
+                const measure = {
                     fontSize: FONT_SIZES[props.size ?? 'm'] ?? 24,
                     scale,
-                    width:
-                        props.autoSize === false && typeof props.w === 'number'
-                            ? Math.max(16, Math.floor(props.w))
-                            : Math.ceil(
-                                  this.editor.getShapeGeometry(shape).bounds.w / scale,
-                              ) + 2,
+                    width: props.autoSize === false && typeof props.w === 'number'
+                        ? Math.max(16, Math.floor(props.w))
+                        : Math.ceil(this.editor.getShapeGeometry(shape).bounds.w / scale) + 2,
                     textAlign: props.textAlign ?? 'start',
-                    font: (shape.props as { font?: string }).font,
-                })
-                const parts = textToGlyphParts(
-                    this.font,
-                    { text, fontSize },
-                    { x: shape.x, y: shape.y, rotation: shape.rotation, m: [t.a, t.b, t.c, t.d, t.e, t.f] },
-                    colorOf(shape),
-                    spans ? { spans } : { width, align: props.textAlign },
-                )
+                    font: projectionFamily(shape),
+                }
+                const styled = this.measureStyled(shape, measure)
+                if (styled === null) return RETRY_TEXT_PROJECTION
+                const spans = styled?.spans ?? this.measureSpans(text, measure)
+                const transform: ShapeTransform = {
+                    x: shape.x, y: shape.y, rotation: shape.rotation, m: [t.a, t.b, t.c, t.d, t.e, t.f],
+                }
+                const color = colorOf(shape)
+                const parts = textToGlyphParts(font, { text, fontSize }, transform, color,
+                    spans ? { spans } : { width, align: props.textAlign })
+                if (styled) parts.unshift(...this.projectTextExtras(styled, font, fontSize, transform, color))
                 if (parts.length === 0) return null
                 return {
                     type: 'upsert-shape',
@@ -2807,7 +3047,11 @@ export class StudioController {
                 // LABEL: text typed inside a shape (a rectangle/arrow/line label)
                 // renders on the web but was dropped from the tablet entirely.
                 const label = extractPlainText(shape.props as { richText?: unknown; text?: string })
-                if (this.font && label.trim()) parts.push(...this.projectLabel(shape, label))
+                if (label.trim()) {
+                    const labelParts = this.projectLabel(shape, label)
+                    if (!labelParts) return RETRY_TEXT_PROJECTION
+                    parts.push(...labelParts)
+                }
                 if (parts.length === 0) return null
                 return {
                     type: 'upsert-shape',
@@ -2827,7 +3071,11 @@ export class StudioController {
                     strokes: [stroke],
                 }))
                 const label = extractPlainText(shape.props as { richText?: unknown; text?: string })
-                if (this.font && label.trim()) parts.push(...this.projectLabel(shape, label))
+                if (label.trim()) {
+                    const labelParts = this.projectLabel(shape, label)
+                    if (!labelParts) return RETRY_TEXT_PROJECTION
+                    parts.push(...labelParts)
+                }
                 if (parts.length === 0) return null
                 return {
                     type: 'upsert-shape',
@@ -2889,6 +3137,45 @@ export class StudioController {
             if (line.length >= 2) out.push({ points: polylineToPoints(line, { width }), color })
         }
         return out
+    }
+
+    private measureStyled(
+        shape: TLShape,
+        opts: { fontSize: number; scale: number; width: number; textAlign: string; font: ProjectionFamily; lineHeight?: number },
+    ) {
+        const rich = shapeRichText(shape)
+        if (!rich || !richProjection(rich, opts.font).styled) return undefined
+        return measureRichProjection(this.editor, this.fonts, rich, { ...opts, family: opts.font, align: opts.textAlign })
+    }
+
+    private projectTextExtras(
+        measured: NonNullable<ReturnType<typeof measureRichProjection>>,
+        font: NonNullable<ReturnType<ProjectionFontLoader['get']>>,
+        fontSize: number,
+        transform: ShapeTransform,
+        color: string,
+    ): GlyphPart[] {
+        const extra: GlyphPart[] = measured.highlight.map(({ x, y, w, h }, i) => {
+            // A native yellow mark is transparent over ink and can survive
+            // separate stroke reuse. Inset ends to account for the round caps.
+            const thickness = Math.min(h * 0.82, w)
+            const mid = y + h / 2
+            const points = mapToRmSpace([
+                { x: x + thickness / 2, y: mid },
+                { x: x + w - thickness / 2 + 0.01, y: mid },
+            ], transform)
+            return { partKey: `highlight:${i}`, strokes: [{
+                points: polylineToPoints(points, { width: tldrawWidthToRmMarkerWidth(thickness) }),
+                color: 'yellow', pen: Pen.HIGHLIGHTER_2,
+            }] }
+        })
+        for (const { text, sourceIndex, x, baseline } of measured.markers) {
+            const strokes = textToGlyphParts(font, { text, fontSize }, transform, color, {
+                spans: [{ text, x, y: 0, w: 0, h: 0, baseline }],
+            }).flatMap((part) => part.strokes)
+            if (strokes.length) extra.push({ partKey: `marker:${sourceIndex}`, strokes })
+        }
+        return extra
     }
 
     /** The browser's own text layout via tldraw's TextManager: the exact
@@ -2982,8 +3269,52 @@ export class StudioController {
      *  wrapped to the shape width and centered in its bounds like tldraw draws
      *  it. Local glyph coords are composed with the shape page transform so a
      *  grouped/rotated shape's label follows. */
-    private projectLabel(shape: TLShape, label: string): { partKey: string; strokes: InkStroke[] }[] {
-        if (!this.font) return []
+    private projectLabel(shape: TLShape, label: string): GlyphPart[] | null {
+        const font = this.fonts.get(projectionFamily(shape))
+        if (!font) return []
+        const rich = shapeRichText(shape)
+        if (rich && richProjection(rich, projectionFamily(shape)).styled &&
+            (shape.type === 'geo' || shape.type === 'arrow' || shape.type === 'note')) {
+            const util = this.editor.getShapeUtil(shape)
+            const geometry = util.getGeometry(shape)
+            const labelBox = ('children' in geometry
+                ? (geometry.children as { isLabel: boolean; bounds: typeof geometry.bounds }[]).find((child) => child.isLabel)
+                : undefined)?.bounds
+            if (!labelBox) return []
+            // Editor.getShapeUtil exposes base ShapeUtil options; the three
+            // built-in labelled utilities all implement these display methods.
+            const options = util.options as Parameters<typeof getDisplayValues>[0]['options']
+            const display = getDisplayValues({ editor: this.editor, options }, shape) as {
+                labelFontSize: number; labelLineHeight: number; labelPadding: number;
+                labelHorizontalAlign?: string;
+            }
+            const scale = (shape.props as { scale?: number }).scale ?? 1
+            const { labelFontSize, labelLineHeight, labelPadding } = display
+            const note = shape.type === 'note' && 'getLabelSize' in util
+                ? (util.getLabelSize as (shape: TLShape) => { fontSizeAdjustment?: number })(shape)
+                : undefined
+            const baseSize = labelFontSize * (note?.fontSizeAdjustment ?? 1)
+            const pad = labelPadding * scale
+            const measured = measureRichProjection(this.editor, this.fonts, rich, {
+                family: projectionFamily(shape), fontSize: baseSize, scale,
+                width: Math.max(1, (labelBox.w - 2 * pad) / scale),
+                align: shape.type === 'arrow' ? 'center' : display.labelHorizontalAlign ?? 'center',
+                lineHeight: labelLineHeight,
+            })
+            if (!measured) return null
+            const x = labelBox.x + pad
+            const y = labelBox.y + (labelBox.h - measured.height) / 2
+            const t = this.editor.getShapePageTransform(shape)
+            const transform: ShapeTransform = {
+                x: shape.x, y: shape.y, rotation: shape.rotation,
+                m: [t.a, t.b, t.c, t.d, t.a * x + t.c * y + t.e, t.b * x + t.d * y + t.f],
+            }
+            const fontSize = baseSize * scale
+            const color = colorOf(shape)
+            const parts = textToGlyphParts(font, { text: label, fontSize }, transform, color, { spans: measured.spans })
+            return [...this.projectTextExtras(measured, font, fontSize, transform, color), ...parts]
+                .map(({ partKey, strokes }) => ({ partKey: `label:${partKey}`, strokes }))
+        }
         const props = shape.props as {
             size?: string
             scale?: number
@@ -3014,18 +3345,11 @@ export class StudioController {
             props.align === 'end' || props.align === 'start' || props.align === 'middle'
                 ? props.align
                 : 'middle'
-        const spans = this.measureSpans(label, {
-            fontSize: LABEL_SIZES[size],
-            scale,
-            width: wrapW,
-            textAlign: align,
-            font: (shape.props as { font?: string }).font,
-        })
+        const measure = { fontSize: LABEL_SIZES[size], scale, width: wrapW, textAlign: align, font: projectionFamily(shape) }
+        const spans = this.measureSpans(label, measure)
         const blockH = spans?.length
             ? Math.max(...spans.map((s) => s.y + s.h)) - Math.min(...spans.map((s) => s.y))
-            : wrappedLineCount(this.font, { text: label, fontSize }, innerW) *
-              fontSize *
-              lineHeight
+            : wrappedLineCount(font, { text: label, fontSize }, innerW) * fontSize * lineHeight
         // top-left of the text block in shape-LOCAL px: horizontally inset by
         // the pad; vertical follows verticalAlign (default middle, as tldraw).
         const originX = bounds.x + pad
@@ -3046,7 +3370,7 @@ export class StudioController {
             t.b * originX + t.d * originY + t.f,
         ]
         return textToGlyphParts(
-            this.font,
+            font,
             { text: label, fontSize },
             { x: shape.x, y: shape.y, rotation: shape.rotation, m },
             colorOf(shape),
@@ -3412,11 +3736,17 @@ export class StudioController {
         // Re-project the repaired text so the overlay/projection converge.
         const updated = this.editor.getShape(shapeId as TLShapeId)
         if (updated) {
-            if (!this.font) {
-                if (!(await this.ensureFont()) || this.disposed || this.editor.getShape(updated.id) !== updated) return
+            if (!this.projectionReady(updated)) {
+                if (!(await this.ensureShapeFonts(updated)) || this.disposed || this.editor.getShape(updated.id) !== updated) return
             }
             const op = this.projectShape(updated, undefined, undefined, editVersion)
-            if (op) await this.session.apply([op])
+            if (op === RETRY_TEXT_PROJECTION) {
+                this.pendingShapeIds.add(updated.id)
+                if (!this.pendingShapeVersions.has(updated.id)) {
+                    this.pendingShapeVersions.set(updated.id, { stamp: editVersion })
+                }
+                this.schedule()
+            } else if (op) await this.session.apply([op])
         }
     }
 }
@@ -3585,11 +3915,33 @@ function collectSubpaths(
     return out
 }
 
+function projectionFamily(shape?: TLShape): ProjectionFamily {
+    const family = (shape?.props as { font?: string } | undefined)?.font
+    return family === 'sans' || family === 'serif' || family === 'mono' ? family : 'draw'
+}
+
 function needsProjectionFont(shape?: TLShape): boolean {
     if (!shape) return false
     if (shape.type === 'text') return true
     return (shape.type === 'geo' || shape.type === 'arrow' || shape.type === 'line' || shape.type === 'note') &&
         !!extractPlainText(shape.props as { richText?: unknown; text?: string }).trim()
+}
+
+function shapeRichText(shape: TLShape): TLRichText | undefined {
+    const value = (shape.props as { richText?: unknown }).richText
+    try {
+        const rich = typeof value === 'string' ? JSON.parse(value) : value
+        return rich?.type === 'doc' && Array.isArray(rich.content) ? rich as TLRichText : undefined
+    } catch {
+        return undefined
+    }
+}
+
+function projectionKeys(shape: TLShape): Iterable<ProjectionFontKey> {
+    if (!needsProjectionFont(shape)) return []
+    const family = projectionFamily(shape)
+    const rich = shapeRichText(shape)
+    return rich ? richProjection(rich, family).fonts : [family]
 }
 
 function extractPlainText(props: { richText?: unknown; text?: string }): string {
