@@ -225,7 +225,7 @@
                 </div>
             {/if}
             <div class="my-3 flex items-center gap-3">
-                <button type="button" class="wf-cta disabled:opacity-50" onclick={generate} disabled={minting || (hostedPairing && !acceptTerms)}>
+                <button type="button" class="wf-cta disabled:opacity-50" onclick={generate} disabled={minting || (hostedPairing && !acceptTerms)} data-testid="generate-setup">
                     {minting ? 'Generating…' : 'Generate my token'}
                 </button>
                 <span class="text-[13px]" style="color: var(--gray-7)">
