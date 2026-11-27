@@ -479,16 +479,14 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(
-            commit(
-                root.path(),
-                root.path(),
-                checkpoint(b"new", 2),
-                b"bad",
-                None
-            )
-            .is_err()
-        );
+        assert!(commit(
+            root.path(),
+            root.path(),
+            checkpoint(b"new", 2),
+            b"bad",
+            None
+        )
+        .is_err());
         assert_eq!(load(root.path()).unwrap().head.snapshot_seq, 1);
     }
 
@@ -510,16 +508,14 @@ mod tests {
         .unwrap();
         assert_eq!(budget.used, disk_bytes(root.path()).unwrap());
         budget.limit = budget.used;
-        assert!(
-            commit(
-                &dir,
-                root.path(),
-                checkpoint(b"new", 2),
-                b"new",
-                Some(&mut budget)
-            )
-            .is_err()
-        );
+        assert!(commit(
+            &dir,
+            root.path(),
+            checkpoint(b"new", 2),
+            b"new",
+            Some(&mut budget)
+        )
+        .is_err());
         assert_eq!(load(&dir).unwrap().head.snapshot_seq, 1);
         assert_eq!(
             std::fs::read(&previous_link).unwrap(),
