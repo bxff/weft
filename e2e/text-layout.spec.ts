@@ -475,3 +475,44 @@ test('layer visibility reaches native ink and images below a nested group', asyn
     await eye.click()
     await expect.poll(opacities).toEqual({ draw: 1, image: 1 })
 })
+
+test('native emoji compounds have one SVG position and preserve the following text origin', async ({ page, request }) => {
+    const { createRootText, insertText, RmDocument } = await import('../packages/rm-format/src/index')
+    const { RM_SCALE } = await import('../packages/rm-ink/src/pen')
+    const samples = ['😀', '❤️', '👍🏽', '👩‍💻', '🇮🇳']
+    const id = crypto.randomUUID()
+    const doc = RmDocument.empty(DEVICE_AUTHOR)
+    createRootText(doc)
+    insertText(doc, null, samples.map(emoji => 'A' + emoji + 'B').join('\n'), { authorUuid: DEVICE_AUTHOR })
+    expect((await request.put(`/api/documents/${DOC}/pages/${id}/rm`, {
+        data: Buffer.from(doc.serialize()),
+    })).ok()).toBe(true)
+    await page.goto(`/app/${DOC}/${id}`)
+    const text = page.locator('.tl-shape[data-shape-type="device-text"] svg text')
+    await expect(text).toHaveText(samples.flatMap(emoji => ['A', emoji, 'B']), { timeout: 30_000 })
+    await page.evaluate(() => document.fonts.ready)
+    const positions = await text.evaluateAll((nodes, scale) => {
+        const canvas = document.createElement('canvas').getContext('2d')!
+        const elements = nodes as SVGTextElement[]
+        return elements.filter((_, index) => index % 3 === 1).map((emoji, index) => {
+            const following = elements[index * 3 + 2]!
+            const fontSize = Number(emoji.getAttribute('font-size'))
+            const family = emoji.getAttribute('font-family')
+            canvas.font = `${emoji.getAttribute('font-weight') ?? 400} ${fontSize * scale}px ${family}`
+            const x = emoji.x.baseVal
+            return {
+                positions: x.numberOfItems,
+                width: canvas.measureText(emoji.textContent!).width / scale,
+                advance: following.x.baseVal.getItem(0).value - x.getItem(0).value,
+                baseline: following.y.baseVal.getItem(0).value - emoji.y.baseVal.getItem(0).value,
+                boundsWidth: emoji.getBBox().width,
+            }
+        })
+    }, RM_SCALE)
+    for (const position of positions) {
+        expect(position.positions).toBe(1)
+        expect(position.advance).toBeCloseTo(position.width, 3)
+        expect(position.baseline).toBe(0)
+        expect(position.boundsWidth).toBeGreaterThan(0)
+    }
+})

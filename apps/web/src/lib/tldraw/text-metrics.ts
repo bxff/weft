@@ -268,18 +268,20 @@ export function penPositions(
     m: StyleMetrics,
     span?: SpanStyle,
     measure?: MeasureFn,
-): { xs: number[]; end: number } {
+): { xs: number[]; units: string[]; end: number } {
     const xs: number[] = []
+    const units: string[] = []
     let pen = 0
     let previous = ''
     const kerning = nativeFontProfile?.kerning[spanFontKey(m, span)]
-    for (const ch of text) {
+    for (const ch of paintUnits(text)) {
+        units.push(ch)
         pen += pairKernInk(kerning, previous, ch, m.emInk)
         xs.push(pen)
         pen += glyphAdvanceInk(ch, m, span, measure)
         previous = ch
     }
-    return { xs, end: pen }
+    return { xs, units, end: pen }
 }
 
 export interface ParagraphLayout {
@@ -315,6 +317,43 @@ function* wrapUnits(text: string): Iterable<{ index: number; segment: string }> 
     yield* graphemes.segment(text)
 }
 
+/** Shape a grapheme as one unit while preserving its source UTF-16 range.
+ * No Segmenter: retain legacy glyph metrics and overflow on unknown wraps. */
+function paintUnits(text: string): Iterable<string> {
+    if (/^[ -~]*$/.test(text) || typeof Intl.Segmenter !== 'function') return text
+    return shapedUnits(text)
+}
+
+function* shapedUnits(text: string): Iterable<string> {
+    for (const { segment } of wrapUnits(text)) yield segment
+}
+
+type TextSpan = TextParagraph['spans'][number]
+
+/** A formatting mark inside a grapheme is not a shaping boundary: keep the
+ * cluster whole for display, with the style of its first code unit. Native
+ * source ranges and serialized formatting are left untouched. */
+export function graphemePaintSpans(spans: readonly TextSpan[]): readonly TextSpan[] {
+    if (spans.length < 2 || typeof Intl.Segmenter !== 'function') return spans
+    const text = spans.map(span => span.text).join('')
+    if (/^[ -~]*$/.test(text)) return spans
+    const edges = new Set<number>()
+    for (const { index } of wrapUnits(text)) edges.add(index)
+    edges.add(text.length)
+    const out: TextSpan[] = []
+    let from = 0
+    let end = 0
+    for (const span of spans) {
+        end += span.text.length
+        if (end <= from) continue
+        let to = end
+        while (!edges.has(to)) to++
+        if (to > from) out.push({ ...span, text: text.slice(from, to) })
+        from = to
+    }
+    return out
+}
+
 /** Measure the same styled segments the SVG paints. Prefix positions keep
  * the greedy wrapping pass linear, even for a long line with no breaks. */
 function wrapParagraph(
@@ -327,10 +366,10 @@ function wrapParagraph(
     const cumulative = new Float64Array(text.length + 1)
     const leadingKern = nativeFontProfile ? new Float64Array(text.length) : undefined
     let at = 0
-    for (const span of spans) {
+    for (const span of graphemePaintSpans(spans)) {
         const kerning = nativeFontProfile?.kerning[spanFontKey(m, span)]
         let previous = ''
-        for (const char of span.text) {
+        for (const char of paintUnits(span.text)) {
             const kern = pairKernInk(kerning, previous, char, m.emInk)
             const next = at + char.length
             if (leadingKern) leadingKern[at] = kern
