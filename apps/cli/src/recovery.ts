@@ -33,6 +33,20 @@ function readJson(root: string, parts: string[]): Record<string, unknown> {
     return object(JSON.parse(verifiedRead(root, parts).toString('utf8')))
 }
 
+function readCheckpoint(root: string, doc: string, page: string): Record<string, unknown> {
+    const bytes = verifiedRead(root, [doc, page, 'checkpoint.json'], maxRequestBytes)
+    // Must agree with the byte format in the tablet's recovery.rs. Hash the
+    // original serialized object, not a JS re-serialization of its fields.
+    const prefixLength = '{"checkpointSha256":"'.length + 64 + '",'.length
+    const prefix = /^\{"checkpointSha256":"([0-9a-f]{64})",$/.exec(bytes.subarray(0, prefixLength).toString('latin1'))
+    const rest = bytes.subarray(prefixLength)
+    if (!prefix || createHash('sha256').update('{').update(rest).digest('hex') !== prefix[1]) {
+        throw Error(`Recovery checkpoint checksum mismatch for page ${page}`)
+    }
+    const payload = new TextDecoder('utf-8', { fatal: true }).decode(rest)
+    return object(JSON.parse('{' + payload))
+}
+
 type Page = { id: string }
 
 /** This deliberately accepts only the current notebook catalog format, not a second native catalog parser. */
@@ -76,7 +90,7 @@ export function prepareNotebookRestore(opts: { notebookId: string; recoveryDirec
     const pageList = notebookPages(nativeContent)
     let bodyByteBudget = 0
     const pages = pageList.map(({ id: page }) => {
-        const c = readJson(recovery, [id, page, 'checkpoint.json'])
+        const c = readCheckpoint(recovery, id, page)
         const nativeSha256 = c.nativeSha256
         if (c.version !== 1 || typeof nativeSha256 !== 'string' || !digest.test(nativeSha256)) {
             throw Error(`Invalid recovery checkpoint for page ${page}`)

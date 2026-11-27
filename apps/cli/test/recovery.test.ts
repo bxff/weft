@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { prepareNotebookRestore, submitNotebookRestore } from '../src/recovery'
@@ -35,9 +35,12 @@ function fixture() {
     writeFileSync(join(nativeDirectory, doc, page, 'photo.png'), Buffer.from(image, 'latin1'))
     writeFileSync(join(checkpointDir, `${sha(base)}.rm`), base)
     const overlay = { shapes: [{ shapeId: 'shape:arrow', props: { weftArrowLinks: [{ toId: 'shape:text', props: {} }] } }] }
-    writeFileSync(join(checkpointDir, 'checkpoint.json'), JSON.stringify({
+    const payload = JSON.stringify({
         version: 1, overlay, nativeSha256: sha(base), assets: [{ name: 'photo.png', sha256: sha(image) }],
-    }))
+        etag: 'é🙂',
+    })
+    const checksum = createHash('sha256').update(payload).digest('hex')
+    writeFileSync(join(checkpointDir, 'checkpoint.json'), `{"checkpointSha256":"${checksum}",${payload.slice(1)}`)
     return { opts: { notebookId: doc, recoveryDirectory, nativeDirectory }, overlay, checkpointDir }
 }
 
@@ -71,6 +74,16 @@ test('fails closed on asset version mismatch, missing checkpoint or symlink', ()
     expect(() => prepareNotebookRestore(opts)).toThrow('must not be symlinks')
     rmSync(join(checkpointDir, 'checkpoint.json'))
     expect(() => prepareNotebookRestore(opts)).toThrow()
+})
+
+test('rejects valid JSON if the saved overlay bytes have changed', () => {
+    const { opts, checkpointDir } = fixture()
+    const path = join(checkpointDir, 'checkpoint.json')
+    const original = readFileSync(path, 'utf8')
+    const edited = original.replace('shape:arrow', 'shape:stale')
+    expect(JSON.parse(edited).overlay.shapes[0].shapeId).toBe('shape:stale')
+    writeFileSync(path, edited)
+    expect(() => prepareNotebookRestore(opts)).toThrow('checkpoint checksum mismatch')
 })
 
 test('can recover the prior generation only from a verified hash-named fallback', () => {
