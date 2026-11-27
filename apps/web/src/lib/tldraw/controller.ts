@@ -5,6 +5,8 @@
  */
 
 import { libraryCacheScope, readCachedDocumentList } from '../library-cache'
+import { guardedPageScope } from '../auth'
+import { watchRelayChange } from '../settings'
 import {
     AssetRecordType,
     createShapeId,
@@ -130,6 +132,7 @@ export interface ControllerOptions {
     transport: Transport
     // undefined = legacy build; null = guarded but the owner is not known.
     guardedScope?: string | null
+    revokeGuardedTransport?: () => void
     docId: string
     pageId: string
     clientId: string
@@ -256,6 +259,12 @@ export class StudioController {
     private assetUnsub: (() => void) | null = null
     private docListUnsub: (() => void) | null = null
 
+    private guardedScopeBlocked = false
+    private guardedScopeCurrent(): boolean {
+        return this.opts.guardedScope === undefined ||
+            (!this.guardedScopeBlocked && this.opts.guardedScope === guardedPageScope()?.key)
+    }
+
     constructor(private readonly opts: ControllerOptions) {}
 
     /**
@@ -347,6 +356,18 @@ export class StudioController {
         const scope = this.opts.guardedScope
         if (scope === null) throw new Error('Sign in to open a guarded notebook')
         const pageStorage = scope === undefined ? storage : guardedReplicaStorage(scope)
+        if (scope !== undefined) {
+            const fence = () => {
+                if (!this.guardedScopeBlocked && !this.guardedScopeCurrent()) {
+                    this.guardedScopeBlocked = true
+                    this.opts.revokeGuardedTransport?.()
+                    for (const pending of this.loadingNativeImages.values()) pending.abort()
+                }
+            }
+            watchRelayChange(fence, this.replicaUse.signal)
+            window.addEventListener('storage', fence, { signal: this.replicaUse.signal })
+            fence()
+        }
         // Device + document metadata (geometry convention, template, pdf index).
         // Not awaited: the session opens from the local replica and needs no
         // network. The cached doclist is adopted synchronously (template/pdf rect
@@ -355,7 +376,7 @@ export class StudioController {
         lap('meta-cache')
         const loadDocs = () => {
             void cachedDocuments(this.opts.transport).then((docs) => {
-                if (this.disposed) return
+                if (this.disposed || !this.guardedScopeCurrent()) return
                 this.adoptDocs(docs)
                 if (this.session) this.onMetaChanged?.()
                 lap('doclist (background)')
@@ -1480,6 +1501,7 @@ export class StudioController {
     private readonly loadingNativeImages = new Map<TLAssetId, AbortController>()
 
     private loadNativeImage(id: TLAssetId, filename: string, refresh = false): void {
+        if (!this.guardedScopeCurrent()) return
         const scope = libraryCacheScope()
         if (this.photoOwner && this.photoOwner !== scope) return
         this.photoOwner ??= scope
@@ -1496,7 +1518,7 @@ export class StudioController {
         this.loadingNativeImages.set(id, loading)
         const path = `/api/documents/${this.opts.docId}/pages/${this.opts.pageId}/assets/${encodeURIComponent(filename)}`
         const install = (url: string | null) => {
-            if (this.disposed || loading.signal.aborted || !url) return
+            if (this.disposed || !this.guardedScopeCurrent() || loading.signal.aborted || !url) return
             const live = this.editor.getAsset(id)
             if (live?.type === 'image' && live.props.name === filename && live.props.src !== url) {
                 this.remote(() => this.editor.updateAssets([{ ...live, props: { ...live.props, src: url } }]))

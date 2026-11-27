@@ -827,10 +827,11 @@ export function TldrawApp({ docId, pageId, onController }: TldrawAppProps) {
             const guarded = import.meta.env.PUBLIC_GUARDED_SAVES === '1'
             const scope = guarded ? guardedPageScope() : null
             const scopedTransport = scope ? guardedPageTransport(scope) : null
-            const sessionTransport = scopedTransport ?? transport()
+            const sessionTransport = scopedTransport?.transport ?? transport()
             const controller = new StudioController({
                 transport: sessionTransport,
                 ...(guarded ? { guardedScope: scope?.key ?? null } : {}),
+                ...(scopedTransport ? { revokeGuardedTransport: scopedTransport.revoke } : {}),
                 docId,
                 pageId,
                 clientId: clientId(),
@@ -854,7 +855,7 @@ export function TldrawApp({ docId, pageId, onController }: TldrawAppProps) {
             })
             return {
                 controller, relay: sessionTransport.baseUrl,
-                closeScopedTransport: scopedTransport ? () => scopedTransport.close() : undefined,
+                closeScopedTransport: scopedTransport?.revoke,
             }
         },
         [docId, pageId],

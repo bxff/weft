@@ -30,15 +30,23 @@ export function transport(): HttpTransport {
     return instance.transport
 }
 
-export function guardedPageTransport(scope: GuardedPageScope): HttpTransport {
-    return new HttpTransport({
+export function guardedPageTransport(scope: GuardedPageScope) {
+    let active = true
+    const transport = new HttpTransport({
         baseUrl: scope.relay,
         getAuthToken: async () => {
-            const bearer = await guardedBearer(scope)
-            if (!bearer) throw new EngineFailure({ _tag: 'Unauthorized' })
+            const bearer = active ? await guardedBearer(scope) : null
+            if (!active || !bearer) throw new EngineFailure({ _tag: 'Unauthorized' })
             return bearer
         },
     })
+    return {
+        transport,
+        revoke: () => {
+            active = false
+            transport.close()
+        },
+    }
 }
 
 /** Close the transport (and its WebSocket) and drop the singleton. Required on

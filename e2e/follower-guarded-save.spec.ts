@@ -104,9 +104,6 @@ for (const fault of ['lost acknowledgement', 'IndexedDB write abort', 'account s
         const nativeText = second.locator('.tl-shape[data-shape-type="device-text"]')
         await expect(nativeText).toContainText('Follower revision survived')
         await expect(page.locator('.tl-shape[data-shape-type="device-text"]')).toHaveCount(0)
-        await second.close()
-        await page.close()
-
         const switchOwner = async (owner: string) => {
             const switcher = await context.newPage()
             await switcher.goto('/')
@@ -116,6 +113,8 @@ for (const fault of ['lost acknowledgement', 'IndexedDB write abort', 'account s
         if (switchesWithPending) {
             const other = crypto.randomUUID()
             await switchOwner(other)
+            await expect(second.getByRole('button', { name: 'Reload to reopen' })).toBeVisible()
+            await expect(nativeText).not.toBeVisible()
             const wrongOwner = await context.newPage()
             const writes: string[] = []
             await wrongOwner.route('**/api/**', route => {
@@ -131,7 +130,13 @@ for (const fault of ['lost acknowledgement', 'IndexedDB write abort', 'account s
             expect(databases.map(db => db.name)).toContain(`weft-guarded-v1/${scope}`)
             await wrongOwner.close()
             await switchOwner(user)
+            // Returning the original owner is not permission to re-use the
+            // pre-switch editor instance while callbacks could still be alive.
+            await expect(second.getByRole('button', { name: 'Reload to reopen' })).toBeVisible()
+            await expect(nativeText).not.toBeVisible()
         }
+        await second.close()
+        await page.close()
 
         const reopened = await context.newPage()
         await reopened.route('**/api/**', route => route.abort('connectionfailed'))

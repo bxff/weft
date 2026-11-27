@@ -5,7 +5,7 @@
     import Editor from '$lib/Editor.svelte'
     import { cachedDocuments, resetTransport, transport } from '$lib/transport'
     import { readCachedDocumentList } from '$lib/library-cache'
-    import { getAuthToken, isKnownSignedOut, localPreferenceOwner } from '$lib/auth'
+    import { getAuthToken, guardedPageScope, isKnownSignedOut, localPreferenceOwner } from '$lib/auth'
     import { connection, watchRelayChange } from '$lib/settings'
     import type { DocumentInfo } from '@weft/sync-engine'
 
@@ -20,6 +20,9 @@
         ;(window as unknown as { __weftNavAt?: number }).__weftNavAt = performance.now()
     })
 
+    const guarded = import.meta.env.PUBLIC_GUARDED_SAVES === '1'
+    let guardedOwner: string | null = null
+    let guardedReloadRequired = $state(false)
     let notebookRelay: string | null = null
     let notebookOwner: string | null = null
     let ownerChanged = false
@@ -27,6 +30,12 @@
     let reconnectRequired = $state(false)
 
     function checkNotebookScope(): boolean {
+        if (guarded && guardedOwner && guardedPageScope()?.key !== guardedOwner) {
+            // A mounted guarded editor never changes account in place. Preserve
+            // its journal under the original scope and require a fresh open.
+            guardedReloadRequired = true
+        }
+        if (guardedReloadRequired) return true
         if (notebookOwner !== null) {
             const owner = localPreferenceOwner()
             if (owner !== null) ownerChanged = owner !== notebookOwner
@@ -60,6 +69,7 @@
     onMount(() => {
         notebookRelay = connection().cloudUrl
         notebookOwner = localPreferenceOwner()
+        guardedOwner = guarded ? guardedPageScope()?.key ?? null : null
         const listener = new AbortController()
         watchRelayChange(checkNotebookScope, listener.signal)
         window.addEventListener('storage', checkNotebookScope, { signal: listener.signal })
@@ -111,7 +121,7 @@
 
 <!-- top-center: tldraw owns top-left (toolbar) and top-right (style panel) -->
 <div
-    inert={scopeChanged}
+    inert={scopeChanged || guardedReloadRequired}
     class="fixed top-2 left-1/2 z-[250] flex max-w-[calc(100vw-16px)] -translate-x-1/2 flex-nowrap items-center gap-2 overflow-hidden border px-3 py-1.5 whitespace-nowrap sm:gap-3"
     style="border-color: var(--gray-3); border-radius: var(--radius); background: color-mix(in srgb, var(--gray-1) 96%, transparent)"
 >
@@ -147,16 +157,19 @@
 <!-- No {#key} here: a page/doc switch must not tear down and rebuild the tldraw
      editor (its mount is the dominant open cost). Editor persists across
      navigations and swaps only the page content on docId/pageId change. -->
-<div inert={scopeChanged || reconnectRequired} class:invisible={scopeChanged || reconnectRequired}>
+<div inert={scopeChanged || reconnectRequired || guardedReloadRequired} class:invisible={scopeChanged || reconnectRequired || guardedReloadRequired}>
     <Editor {docId} {pageId} />
 </div>
 
-{#if scopeChanged || reconnectRequired}
+{#if scopeChanged || reconnectRequired || guardedReloadRequired}
     <p role="status"
         class="fixed top-14 left-1/2 z-[250] w-max max-w-[calc(100vw-2rem)] -translate-x-1/2 border px-3 py-2 text-sm"
         style="border-color: var(--gray-3); background: var(--gray-1)"
     >
-        {#if scopeChanged}
+        {#if guardedReloadRequired}
+            Notebook paused because the connection changed.
+            <button type="button" class="underline" onclick={() => window.location.reload()}>Reload to reopen</button>
+        {:else if scopeChanged}
             Notebook paused because the connection changed.
             <a class="underline" href="/settings" target="_blank" rel="noopener">Open Settings in a new tab</a>
             to select the original relay and account.
