@@ -197,8 +197,8 @@ export function linearizeRootText(text: Text): TextParagraph[] {
 
 /** A live character's place in the linearized paragraphs — the lookup a
  *  text ANCHOR resolution needs (handwriting groups anchor to a char id and
- *  render relative to that char's laid-out line). `offset` is the index into
- *  the paragraph's visible text (spans concatenated); a '\n' (the id that
+ *  render relative to that char's laid-out line). `offset` is the UTF-16 index
+ *  into the paragraph's visible text (spans concatenated); a '\n' (the id that
  *  OPENS a paragraph) reports offset -1. Traversal mirrors linearizeRootText
  *  exactly so paragraphIndex always matches its output. */
 export interface CharPosition {
@@ -242,7 +242,7 @@ export function rootTextCharPositions(text: Text): CharPosition[] {
             }
             if (v === '\n') break
             out.push({ id: ids[i]!, paragraphIndex, offset })
-            offset++
+            offset += v.length
             i++
         }
         paragraphIndex++
