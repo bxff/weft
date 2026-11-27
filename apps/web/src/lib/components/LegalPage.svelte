@@ -13,7 +13,7 @@
 
 <div class="wf-docs-shell">
     <SiteHeader />
-    <main class="wf-docs-article">
+    <main class="wf-docs-article wf-reading-column">
         <h1 class="wf-docs-title">{data.title}</h1>
         <!-- Build-time HTML from repository Markdown, not user content. -->
         {@html data.html}
@@ -23,8 +23,6 @@
 
 <style>
     main {
-        width: min(100%, 68ch);
-        margin-inline: auto;
         overflow-wrap: anywhere;
     }
 </style>
