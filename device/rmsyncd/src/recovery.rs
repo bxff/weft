@@ -333,6 +333,12 @@ fn sync_directory(dir: &Path) -> io::Result<()> {
             return Err(io::Error::other("injected recovery directory sync failure"));
         }
     }
+    // A filename-only --cloud-config has an empty relative parent.
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
     std::fs::File::open(dir)?.sync_all()
 }
 
