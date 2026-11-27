@@ -95,6 +95,7 @@ jobs:
           test -s build/index.html
           test -s build/library.html
           node ../../scripts/prepare-pages-library.mjs
+          printf '%s\n' "$DEPLOY_SHA" > build/weft-build.txt
 
       - name: Install the pinned deploy tool without credentials
         run: npm install --prefix "$RUNNER_TEMP/weft-pages" --no-audit --no-fund wrangler@4.168.0
@@ -120,3 +121,21 @@ jobs:
           "$RUNNER_TEMP/weft-pages/node_modules/.bin/wrangler" pages deploy apps/web/build \
             --project-name="$CLOUDFLARE_PAGES_PROJECT" --branch="$CLOUDFLARE_PAGES_PRODUCTION_BRANCH" \
             --commit-hash="$DEPLOY_SHA"
+
+      - name: Verify the live Pages build and shell
+        run: |
+          set -euo pipefail
+          origin=https://weft.page
+          for attempt in {1..12}; do
+            live="$(curl --fail --silent --show-error --max-time 8 "$origin/weft-build.txt?rev=$DEPLOY_SHA" || true)"
+            [[ "$live" == "$DEPLOY_SHA" ]] && break
+            sleep 5
+          done
+          if [[ "$live" != "$DEPLOY_SHA" ]]; then
+            echo "The canonical site is not serving the expected commit." >&2
+            exit 1
+          fi
+          for route in / /library; do
+            html="$(curl --fail --silent --show-error --max-time 15 "$origin$route")"
+            grep -q '/_app/immutable/entry/' <<< "$html"
+          done
