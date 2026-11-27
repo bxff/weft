@@ -46,7 +46,7 @@ const put = (server: CloudServer, doc: string, bytes: Uint8Array) =>
 const get = (server: CloudServer, doc: string, headers = {}) =>
   fetch(file(server, doc), { headers: { ...auth, ...headers } });
 
-test.each(["ENOSPC", "EDQUOT", "sqlite"] as const)(
+test.each(["ENOSPC", "EDQUOT", "insert", "evict"] as const)(
   "failed replacement (%s) preserves bytes, ETag, residency and quota across a restart",
   (failure) => withRelay(async ({ server, restart, dir }) => {
     server().store.setUserQuota(user, "sources", 1024);
@@ -60,11 +60,14 @@ test.each(["ENOSPC", "EDQUOT", "sqlite"] as const)(
     expect(new Uint8Array(await original.arrayBuffer())).toEqual(old);
     const originalFiles = readdirSync(dir).sort();
 
-    if (failure === "sqlite") {
-      // Fail the eviction statement AFTER the SQL swap, not the stage write.
+    const capacity = failure === "ENOSPC" || failure === "EDQUOT";
+    if (!capacity) {
+      // Fail the replacement after its bytes are staged, or the victim
+      // delete after the row has been swapped. Both must roll back.
+      const clause = failure === "insert" ? "INSERT ON files WHEN NEW.doc = 'hot'" : "DELETE ON files WHEN OLD.doc = 'cold'";
       raw(server()).db.run(`
-        CREATE TEMP TRIGGER fail_eviction BEFORE DELETE ON files
-        WHEN OLD.doc = 'cold' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;
+        CREATE TEMP TRIGGER fail_publication BEFORE ${clause}
+        BEGIN SELECT RAISE(ABORT, 'injected failure'); END;
       `);
     } else {
       const sync = raw(server()).syncRecoveryPath.bind(server().store);
@@ -74,8 +77,8 @@ test.each(["ENOSPC", "EDQUOT", "sqlite"] as const)(
       };
     }
     const failed = await put(server(), "hot", next);
-    expect(failed.status).toBe(failure === "sqlite" ? 500 : 507);
-    if (failure !== "sqlite") {
+    expect(failed.status).toBe(capacity ? 507 : 500);
+    if (capacity) {
       expect(failed.headers.get("access-control-allow-origin")).toBe("*");
       expect(await failed.json()).toMatchObject({ reason: "capacity" });
     }
