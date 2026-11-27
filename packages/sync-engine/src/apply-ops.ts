@@ -24,6 +24,7 @@ import {
     type SceneLineItemBlock,
 } from '@weft/rm-format'
 import { tldrawColorToPenColor, type InkStroke } from '@weft/rm-ink/pure'
+import { Hash } from 'fast-sha256'
 import { RefResolver } from './refs'
 import { compareVersion, currentObjectVersion, idToOpRef, lineBlockToAddOp, mergeBrowserOrder, mergeShapeOpacity, type Op } from './ops'
 import type { ItemRef, OpVersion, OverlayDocument, OverlayShape, RenderedPart } from './types'
@@ -114,6 +115,8 @@ export type LocalOp =
           type: 'edit-root-text'
           /** Portable, journal-scoped identity of IDs minted by this edit. */
           textIntentId?: string
+          /** Rich plans are only valid against the complete text they were composed on. */
+          expectedTextBasis?: string
           /** Create the column first (pages with no text; device defaults). */
           create?: { posX?: number; posY?: number; width?: number }
           /** Either a text run or a chain of inline format codes (1/2 bold
@@ -128,6 +131,36 @@ export type LocalOp =
 export class NativeTextReferenceConflict extends Error {}
 
 export type RootTextEdit = Extract<LocalOp, { type: 'edit-root-text' }>
+
+export function nativeTextPlanBasis(doc: RmDocument): string {
+    const digest = new Hash()
+    const encoder = new TextEncoder()
+    // Each versioned record is unambiguously framed: JSON escapes newlines
+    // in text or IDs. Feed one record at a time rather than holding a
+    // duplicate of the whole pre-edit document in memory or in the journal.
+    const add = (record: unknown) => digest.update(encoder.encode(JSON.stringify(record) + '\n'))
+    add(['weft-native-text-plan-basis', 1])
+    const block = doc.rootTextBlock
+    if (block) {
+        const authors = doc.authorTable()
+        const ref = (id: CrdtId) => [
+            id.part1 === 0 ? 'system' : (authors.get(id.part1)?.toLowerCase() ?? `unmapped:${id.part1}`),
+            id.part2,
+        ] as const
+        const text = block.text
+        add(['layout', text.posX, text.posY, text.width])
+        for (const item of block.textItems) {
+            add(['item', ref(item.itemId), ref(item.leftId), ref(item.rightId), item.deletedLength, item.value])
+        }
+        const styles = [...text.styles].map(([key, style]) => {
+            const [slot, clock] = key.split(':').map(Number)
+            return [ref(crdtId(slot!, clock!)), ref(style.timestamp), style.value,
+                style.extra ? Array.from(style.extra) : null] as const
+        }).sort(([a], [b]) => (a[0] === b[0] ? a[1] - b[1] : a[0] < b[0] ? -1 : 1))
+        for (const style of styles) add(['style', ...style])
+    }
+    return 'sha256-v1:' + Array.from(digest.digest(), byte => byte.toString(16).padStart(2, '0')).join('')
+}
 
 export function mapRootTextReferences(
     edit: RootTextEdit,
@@ -612,6 +645,9 @@ function applyLocalOps(
             }
             case 'edit-root-text': {
                 complete = false // text ops have no op form yet (snapshot fallback)
+                if (op.expectedTextBasis !== undefined && nativeTextPlanBasis(doc) !== op.expectedTextBasis) {
+                    throw new NativeTextReferenceConflict('Native text changed before the complete formatting plan could publish')
+                }
                 const parseKey = op.textIntentId
                     ? indexTextReferences(doc, mintedText)
                     : (key: string): CrdtId => {

@@ -6,7 +6,7 @@
 
 import { encodePublicationBytes, newPublicationId, type BrowserPublication } from './browser-publication'
 import { RmDocument, type CrdtId } from '@weft/rm-format'
-import { NativeTextReferenceConflict, acceptedTextEdit, applyOps, captureTextReferences, mapRootTextReferences, publicationTextReferences, type ApplyOptions, type LocalOp, type RootTextEdit } from './apply-ops'
+import { NativeTextReferenceConflict, acceptedTextEdit, applyOps, captureTextReferences, mapRootTextReferences, nativeTextPlanBasis, publicationTextReferences, type ApplyOptions, type LocalOp, type RootTextEdit } from './apply-ops'
 import { diffPage, snapshotKnownState } from './differ'
 import {
     applyInkDeltas,
@@ -505,6 +505,36 @@ export class OfflineSession {
         return captured.textIntentId ? { ...source, textIntentId: captured.textIntentId } : source
     }
 
+    /** Build dependent text, paragraph and mark writes on an isolated page.
+     * The first write fences the entire semantic basis during later replay,
+     * including a remote head that arrives while the journal is being saved. */
+    planRootText(
+        compose: (doc: RmDocument, add: (edit: RootTextEdit, basis?: RootTextEdit) => void) => void,
+    ): RootTextEdit[] {
+        if (!this.opts.guardedSaves) throw new Error('Guarded native text planning is unavailable')
+        const view = this.buildView()
+        const doc = RmDocument.parse(view.doc.serialize())
+        const minted = new Map(view.mintedText)
+        const overlay = { shapes: [] }
+        const plan: RootTextEdit[] = []
+        const expectedTextBasis = nativeTextPlanBasis(doc)
+        try {
+            compose(doc, (edit, basis) => {
+                const fenced = !plan.length
+                    ? { ...edit, expectedTextBasis } : edit
+                const captured = basis ? this.captureRootTextEdit(fenced, basis)
+                    : captureTextReferences(doc, fenced, newPublicationId(), minted)
+                this.capturedRootText.set(captured.textIntentId!, captured)
+                plan.push(captured)
+                applyOps(doc, overlay, [captured], this.opts, minted)
+            })
+            return plan
+        } catch (error) {
+            for (const edit of plan) this.releaseCapturedRootText(edit)
+            throw error
+        }
+    }
+
     releaseCapturedRootText(edit: RootTextEdit): void {
         if (edit.textIntentId) this.capturedRootText.delete(edit.textIntentId)
     }
@@ -515,10 +545,20 @@ export class OfflineSession {
         try {
             await this.writePending(async () => {
                 beforeEnqueue?.()
-                this.pendingOps.push(...captured.map(op => op.type === 'edit-root-text' && op.textIntentId
-                    ? this.capturedRootText.get(op.textIntentId) ?? op : op))
-                this.pendingVersion++
-                await this.persistPending()
+                const next = captured.map(op => op.type === 'edit-root-text' && op.textIntentId
+                    ? this.capturedRootText.get(op.textIntentId) ?? op : op)
+                if (next.some(op => op.type === 'edit-root-text' && op.expectedTextBasis !== undefined)) {
+                    // A failed write must not leave a partially enqueued rich
+                    // plan in memory for the next commit to enqueue again.
+                    const pending = [...this.pendingOps, ...next]
+                    await this.storage.set(this.pendingKey(), encodePending(pending, this.publication))
+                    this.pendingOps = pending
+                    this.pendingVersion++
+                } else {
+                    this.pendingOps.push(...next)
+                    this.pendingVersion++
+                    await this.persistPending()
+                }
             })
         } finally {
             for (const op of captured) if (op.type === 'edit-root-text') this.releaseCapturedRootText(op)

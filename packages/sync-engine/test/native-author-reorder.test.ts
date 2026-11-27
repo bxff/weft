@@ -226,3 +226,99 @@ test('duplicated author slots with overlapping clocks refuse to target either ch
         session.dispose()
     }
 })
+
+function richPlan(session: OfflineSession) {
+    return session.planRootText((doc, add) => {
+        add({ type: 'edit-root-text', inserts: [{ afterKey: firstKey(doc), text: 'X' }] })
+        add({ type: 'edit-root-text', styles: [['0:0', 2, undefined]] })
+        add({ type: 'edit-root-text', inserts: [{ afterKey: firstKey(doc), codes: [1] }] })
+    })
+}
+
+test('a failed rich plan journal write leaves no partial local or remote changes and can retry', async () => {
+    const daemon = new GuardedDaemon()
+    await seed(daemon, native(A, 'A'))
+    const storage = new MemoryStorage()
+    const session = await open(daemon, storage)
+    try {
+        await session.reconcile()
+        const set = storage.set.bind(storage)
+        storage.set = async (key, bytes) => {
+            if (key.includes('/pending/')) throw new Error('injected write failure')
+            await set(key, bytes)
+        }
+        await expect(session.apply(richPlan(session))).rejects.toThrow('injected write failure')
+        expect(session.pendingCount).toBe(0)
+        expect(text(session.document)).toBe('A')
+        expect(daemon.requests).toHaveLength(0)
+        storage.set = set
+        await session.apply(richPlan(session))
+        await session.reconcile()
+        expect(daemon.requests).toHaveLength(1)
+        const remote = (await daemon.getSnapshot('d', 'p'))!
+        const [first] = linearizeRootText(RmDocument.parse(decodeSnapshot(remote.bytes).rm).rootTextBlock!.text)
+        expect(first!.style).toBe(2)
+        expect(first!.spans).toEqual([
+            { text: 'A', bold: false, italic: false },
+            { text: 'X', bold: true, italic: false },
+        ])
+    } finally {
+        session.dispose()
+    }
+})
+
+test('a same-text replacement with different native identity fences the whole formatted plan after persistence', async () => {
+    const daemon = new GuardedDaemon()
+    const storage = new MemoryStorage()
+    await seed(daemon, native(A, 'A'))
+    const session = await open(daemon, storage)
+    let writing!: () => void, release!: () => void
+    const ready = new Promise<void>(resolve => { writing = resolve })
+    const held = new Promise<void>(resolve => { release = resolve })
+    try {
+        await session.reconcile()
+        const set = storage.set.bind(storage)
+        storage.set = async (key, bytes) => {
+            if (key.includes('/pending/')) { writing(); await held }
+            return set(key, bytes)
+        }
+        const pending = session.apply(richPlan(session))
+        await ready
+        expect(session.pendingCount).toBe(0)
+        await seed(daemon, native(B, 'A'))
+        release()
+        await pending
+        await session.reconcile()
+        expect(session.pendingCount).toBe(3)
+        expect(daemon.requests).toHaveLength(0)
+        expect(await relayText(daemon)).toBe('A')
+    } finally {
+        release()
+        session.dispose()
+    }
+})
+
+test('a large existing formatted page is fenced by a fixed digest, not duplicated in the pending journal', async () => {
+    const daemon = new GuardedDaemon()
+    const storage = new MemoryStorage()
+    const privateFixture = 'previous document content is not a pending write'
+    await seed(daemon, native(A, privateFixture.repeat(48)))
+    const session = await open(daemon, storage)
+    try {
+        await session.reconcile()
+        const set = storage.set.bind(storage)
+        let firstQueue: string | undefined
+        storage.set = async (key, bytes) => {
+            if (!firstQueue && key.includes('/pending/')) firstQueue = new TextDecoder().decode(bytes)
+            return set(key, bytes)
+        }
+        const pending = richPlan(session)
+        expect(pending[0]?.expectedTextBasis).toMatch(/^sha256-v1:[0-9a-f]{64}$/)
+        await session.apply(pending)
+        expect(firstQueue).toBeDefined()
+        expect(firstQueue).not.toContain(privateFixture)
+        expect(firstQueue!.length).toBeLessThan(1024)
+    } finally {
+        session.dispose()
+    }
+})

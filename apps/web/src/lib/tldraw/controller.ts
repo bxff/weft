@@ -54,7 +54,7 @@ import {
     RM_SCALE,
     type InkStroke,
 } from '@weft/rm-ink'
-import { RefResolver, remapImagesByUuid, type LiveImage } from '@weft/sync-engine'
+import { nativeTextPlanBasis, RefResolver, remapImagesByUuid, type LiveImage } from '@weft/sync-engine'
 import {
     crdtIdKey,
     type Point,
@@ -65,6 +65,7 @@ import {
     END_MARKER,
     Pen,
     type Line,
+    type Text,
 } from '@weft/rm-format'
 import {
     nodeKindForParagraph,
@@ -236,6 +237,7 @@ export class StudioController {
     private deviceTextDraft: unknown = undefined
     private renderedDeviceText: {
         richText: ReturnType<typeof paragraphsToRichText>
+        nativeBasis: string
         anchorBasis: Extract<LocalOp, { type: 'edit-root-text' }>
     } | null = null
     /** Editor store listener unsubscribe. The editor outlives the controller,
@@ -1953,6 +1955,7 @@ export class StudioController {
         if (import.meta.env.PUBLIC_GUARDED_SAVES === '1') {
             this.renderedDeviceText = {
                 richText,
+                nativeBasis: this.nativeTextSignature(),
                 anchorBasis: this.session.captureRootTextBasis(rootTextCharPositions(text)
                     .filter(char => !char.deleted).map(char => crdtIdKey(char.id))),
             }
@@ -2017,8 +2020,7 @@ export class StudioController {
     }
 
     private nativeTextSignature(): string {
-        const text = this.session.document.tree().rootText
-        return JSON.stringify(text ? richTextToLines(paragraphsToRichText(linearizeRootText(text))) : [])
+        return nativeTextPlanBasis(this.session.document)
     }
 
     private nativeTextFence(): () => void {
@@ -2056,109 +2058,27 @@ export class StudioController {
     private async commitDeviceTextNow(richText: unknown): Promise<void> {
         try {
             const lines = richTextToLines(richText as never)
-            const draft = lines.map((l) => l.text).join('\n')
+            if (this.renderedDeviceText) {
+                await this.commitGuardedDeviceText(lines, this.renderedDeviceText)
+                return
+            }
+
+            // Keep the existing default-path save behavior unchanged. Its
+            // older queue format does not support immutable rich edit plans.
             const text = this.session.document.tree().rootText
-            const paragraphs = text ? linearizeRootText(text) : []
-            const basis = this.renderedDeviceText
-            const before = basis ? richTextToLines(basis.richText) : []
-            const current = basis ? before.map(line => line.text).join('\n')
-                : paragraphs.map(p => p.spans.map(span => span.text).join('')).join('\n')
-            const concurrent = !!basis && JSON.stringify(before) !==
-                JSON.stringify(text ? richTextToLines(paragraphsToRichText(paragraphs)) : [])
-            const plain = (lines: RichLine[]) => lines.every(line => line.kind === 'paragraph' &&
-                (line.deviceStyle === null || line.deviceStyle === 0 || line.deviceStyle === 1) &&
-                line.indentLevel === undefined && line.segments.every(segment => !segment.bold && !segment.italic))
-            const compatible = plain(before) && plain(lines) && before.length === lines.length
-            const fence = basis && !compatible ? this.nativeTextFence() : undefined
-            if (concurrent && JSON.stringify(before) === JSON.stringify(lines)) return
-            if (concurrent && !compatible) {
-                throw new Error('This text changed on the tablet while you were editing. The local draft was kept.')
-            }
-            if (draft !== current || !text) {
-                const positions = basis
-                    ? basis.anchorBasis.deleteKeys!.map(key => ({ key }))
-                    : text ? this.rootTextPositions() : []
-                // positions has one entry per VISIBLE code point of `current`
-                // (including the '\n' separators). Compare in code points, not
-                // UTF-16 units, so an emoji/astral char doesn't desync the map
-                // and drop the edit (#79). `current`'s only '\n' are separators.
-                const currentCp = [...current]
-                if (text && positions.length !== currentCp.length) {
-                    throw new Error('Device text position map is out of sync')
-                }
-                // Multi-region diff (Myers): touch ONLY the code points that
-                // changed, leaving untouched '\n' separators matched so their
-                // paragraph style + anchored ink survive an edit that spans two
-                // non-adjacent lines (#78). Each insert anchors after a
-                // surviving code point (never one being deleted).
-                const diff = diffCodePoints(currentCp, [...draft])
-                const deleteKeys = diff.deletes.map((i) => positions[i]!.key)
-                const inserts = diff.inserts.map((ins) => ({
-                    afterKey: ins.after >= 0 ? positions[ins.after]!.key : null,
-                    text: ins.text,
-                }))
-                await this.applyRootText({
-                    ...(text ? {} : { create: {} }),
-                    ...(inserts.length ? { inserts } : {}),
-                    ...(deleteKeys.length ? { deleteKeys } : {}),
-                }, basis?.anchorBasis, fence)
-            }
-            // A concurrent insertion is not in the editor draft. Never use that
-            // draft as the full paragraph or mark model for the merged text.
-            if (basis && compatible) return
-            // style pass: apply only where the node KIND differs from the
-            // stored style's kind. The deviceStyle attr (the style the node
-            // was BUILT from, carried through TipTap edits) breaks ties so
-            // BOLD/CHECKBOX/CHECKED survive splits and reorders.
+            const current = text ? linearizeRootText(text)
+                .map(p => p.spans.map(span => span.text).join('')).join('\n') : ''
+            const positions = text ? this.rootTextPositions().map(({ key }) => key) : []
+            const edit = this.planDeviceTextContent(current, positions, lines, !!text)
+            if (edit) await this.editRootText(edit)
             const after = this.session.document.tree().rootText
             if (!after) return
-            const paras = linearizeRootText(after)
-            const anchors: string[] = [crdtIdKey(END_MARKER)]
-            for (const c of rootTextCharPositions(after)) {
-                if (c.offset === -1 && !c.deleted) anchors.push(crdtIdKey(c.id))
-            }
-            // xochitl keys EACH paragraph's style to its opener id, which can be
-            // a TOMBSTONED char (restyle-then-retype leaves the old style on the
-            // dead opener — a first-char for para 0, a '\n' for later ones). A
-            // stale style on that shadow OVERRIDES the anchor the web writes to,
-            // so the device renders the wrong style forever even though our own
-            // read agrees with our write (no kind-diff fires). Reconcile every
-            // paragraph's shadow anchors to its target style (device-probed
-            // 2026-07-10/12, PROBE-v1..v4 / PROBE-nonfirst / PROBE-npfix).
-            const shadowsByPara = paragraphStyleShadows(after)
-            const styles: [string, number, number[] | undefined][] = []
-            for (let i = 0; i < Math.min(lines.length, paras.length); i++) {
-                const line = lines[i]!
-                const old = line.deviceStyle ?? paras[i]!.style
-                const write = styleForNodeKind(line.kind, old)
-                const extra = write.extra ? [...write.extra] : undefined
-                if (nodeKindForParagraph(paras[i]!) !== line.kind) {
-                    styles.push([anchors[i]!, write.value, extra])
-                }
-                // Reconcile this paragraph's shadow anchors. Fires independent of
-                // the kind-diff above, since the device can disagree with our
-                // anchor read while our model looks self-consistent.
-                for (const key of shadowsByPara.get(i) ?? []) {
-                    const cur = after.styles.get(key)
-                    // compare VALUE and the style EXTRA (size/indent): H2/H3 are
-                    // value 1 + a size extra, so a shadow already at value 1
-                    // (plain) still needs the extra or it renders as plain.
-                    const curExtra = cur?.extra
-                    const expected = paragraphStyleWriteExtra(curExtra, write.extra)
-                    const differs =
-                        !cur ||
-                        cur.value !== write.value ||
-                        (curExtra?.length ?? 0) !== (expected?.length ?? 0) ||
-                        (expected?.some((b, j) => b !== curExtra![j]) ?? false)
-                    if (differs) styles.push([key, write.value, extra])
-                }
-            }
-            if (styles.length) {
-                if (basis) await this.applyRootText({ styles }, undefined, this.nativeTextFence())
-                else await this.editRootText({ styles })
-            }
-            // marks pass: reconcile inline bold/italic (rm format codes 1-4)
-            await this.commitDeviceTextMarks(lines, !!basis)
+            const styles = this.planDeviceParagraphStyles(after, lines)
+            if (styles.length) await this.editRootText({ styles })
+            const formatted = this.session.document.tree().rootText
+            if (!formatted) return
+            const marks = this.planDeviceInlineMarks(formatted, lines, false)
+            if (marks) await this.editRootText(marks)
         } catch (err) {
             if (!this.disposed) this.opts.onStatus?.({ state: 'error', detail: String(err) })
             console.error('weft: device-text commit failed:', err)
@@ -2166,11 +2086,131 @@ export class StudioController {
         }
     }
 
-    /** Make the stored format codes produce the editor's bold/italic runs.
-     *  No-op when they already match (planFormatEdits is idempotent). */
-    private async commitDeviceTextMarks(lines: RichLine[], guard = false): Promise<void> {
-        const text = this.session.document.tree().rootText
-        if (!text) return
+    private async commitGuardedDeviceText(
+        lines: RichLine[],
+        basis: NonNullable<StudioController['renderedDeviceText']>,
+    ): Promise<void> {
+        const before = richTextToLines(basis.richText)
+        const current = before.map(line => line.text).join('\n')
+        const concurrent = basis.nativeBasis !== this.nativeTextSignature()
+        const plain = (lines: RichLine[]) => lines.every(line => line.kind === 'paragraph' &&
+            (line.deviceStyle === null || line.deviceStyle === 0 || line.deviceStyle === 1) &&
+            line.indentLevel === undefined && line.segments.every(segment => !segment.bold && !segment.italic))
+        const compatible = plain(before) && plain(lines) && before.length === lines.length
+        if (concurrent && JSON.stringify(before) === JSON.stringify(lines)) return
+        if (concurrent && !compatible) {
+            throw new Error('This text changed on the tablet while you were editing. The local draft was kept.')
+        }
+        const edit = this.planDeviceTextContent(current, basis.anchorBasis.deleteKeys!, lines,
+            !!this.session.document.rootTextBlock)
+        // A compatible plain change doesn't replace tablet paragraph or
+        // inline styles, and needs no extra planning clone.
+        if (compatible) {
+            if (edit) await this.applyRootText(edit, basis.anchorBasis)
+            return
+        }
+        const fence = this.nativeTextFence()
+        const plan = this.session.planRootText((doc, add) => {
+            if (edit) add({ type: 'edit-root-text', ...edit }, basis.anchorBasis)
+            const text = doc.rootTextBlock?.text
+            if (!text || linearizeRootText(text).length !== lines.length) {
+                throw new Error('Could not plan native paragraphs against the pinned edit')
+            }
+            const styles = this.planDeviceParagraphStyles(text, lines)
+            if (styles.length) add({ type: 'edit-root-text', styles })
+            const marks = this.planDeviceInlineMarks(text, lines, true)
+            if (marks) add({ type: 'edit-root-text', ...marks })
+        })
+        if (!plan.length) return
+        try {
+            if (this.debounce) clearTimeout(this.debounce)
+            await this.ensureFont()
+            if (this.disposed) return
+            this.editor.store._flushHistory()
+            await this.flush()
+            if (this.disposed) return
+            await this.applyLocal(plan, () => {
+                this.requestSceneRebuild()
+                this.onMetaChanged?.()
+            }, fence)
+        } finally {
+            for (const edit of plan) this.session.releaseCapturedRootText(edit)
+        }
+    }
+
+    private planDeviceTextContent(current: string, positions: readonly string[], lines: RichLine[], hasText: boolean) {
+        const draft = lines.map(line => line.text).join('\n')
+        if (draft === current && hasText) return null
+        // Native IDs are indexed by code points, including newline separators.
+        // Untouched separators keep their paragraph style and anchored ink.
+        const currentCp = [...current]
+        if (positions.length !== currentCp.length) throw new Error('Device text position map is out of sync')
+        const diff = diffCodePoints(currentCp, [...draft])
+        const deleteKeys = diff.deletes.map(index => positions[index]!)
+        const inserts = diff.inserts.map(ins => ({
+            afterKey: ins.after >= 0 ? positions[ins.after]! : null,
+            text: ins.text,
+        }))
+        return {
+            ...(hasText ? {} : { create: {} }),
+            ...(inserts.length ? { inserts } : {}),
+            ...(deleteKeys.length ? { deleteKeys } : {}),
+        }
+    }
+
+    private planDeviceParagraphStyles(
+        after: Text,
+        lines: RichLine[],
+    ) {
+        const paras = linearizeRootText(after)
+        const anchors: string[] = [crdtIdKey(END_MARKER)]
+        for (const c of rootTextCharPositions(after)) {
+            if (c.offset === -1 && !c.deleted) anchors.push(crdtIdKey(c.id))
+        }
+        // xochitl keys EACH paragraph's style to its opener id, which can be
+        // a TOMBSTONED char (restyle-then-retype leaves the old style on the
+        // dead opener — a first-char for para 0, a '\n' for later ones). A
+        // stale style on that shadow OVERRIDES the anchor the web writes to,
+        // so the device renders the wrong style forever even though our own
+        // read agrees with our write (no kind-diff fires). Reconcile every
+        // paragraph's shadow anchors to its target style (device-probed
+        // 2026-07-10/12, PROBE-v1..v4 / PROBE-nonfirst / PROBE-npfix).
+        const shadowsByPara = paragraphStyleShadows(after)
+        const styles: [string, number, number[] | undefined][] = []
+        for (let i = 0; i < Math.min(lines.length, paras.length); i++) {
+            const line = lines[i]!
+            const old = line.deviceStyle ?? paras[i]!.style
+            const write = styleForNodeKind(line.kind, old)
+            const extra = write.extra ? [...write.extra] : undefined
+            if (nodeKindForParagraph(paras[i]!) !== line.kind) {
+                styles.push([anchors[i]!, write.value, extra])
+            }
+            // Reconcile this paragraph's shadow anchors. Fires independent of
+            // the kind-diff above, since the device can disagree with our
+            // anchor read while our model looks self-consistent.
+            for (const key of shadowsByPara.get(i) ?? []) {
+                const cur = after.styles.get(key)
+                // compare VALUE and the style EXTRA (size/indent): H2/H3 are
+                // value 1 + a size extra, so a shadow already at value 1
+                // (plain) still needs the extra or it renders as plain.
+                const curExtra = cur?.extra
+                const expected = paragraphStyleWriteExtra(curExtra, write.extra)
+                const differs =
+                    !cur ||
+                    cur.value !== write.value ||
+                    (curExtra?.length ?? 0) !== (expected?.length ?? 0) ||
+                    (expected?.some((b, j) => b !== curExtra![j]) ?? false)
+                if (differs) styles.push([key, write.value, extra])
+            }
+        }
+        return styles
+    }
+
+    private planDeviceInlineMarks(
+        text: Text,
+        lines: RichLine[],
+        strict: boolean,
+    ) {
         const target: { bold: boolean; italic: boolean }[] = []
         for (const line of lines) {
             for (const seg of line.segments) {
@@ -2184,6 +2224,7 @@ export class StudioController {
         }
         const plan = planFormatEdits(text, target)
         if (!plan) {
+            if (strict) throw new Error('Could not plan native marks against the pinned edit')
             console.error('weft: mark reconcile skipped (text diff not settled)')
             return
         }
@@ -2201,8 +2242,7 @@ export class StudioController {
                   }
                 : {}),
         }
-        if (guard) await this.applyRootText(edits, undefined, this.nativeTextFence())
-        else await this.editRootText(edits)
+        return edits
     }
 
     // ----- layers -----
