@@ -1109,6 +1109,9 @@ export function startCloud(
           if (error instanceof Response) return error;
           throw error;
         }
+        if (result === "unverified") {
+          return json({ error: "existing recovery cannot be verified; no data was changed" }, 503);
+        }
         if (result === "not-empty") {
           return json({ error: "restore requires an empty account without paired devices" }, 409);
         }

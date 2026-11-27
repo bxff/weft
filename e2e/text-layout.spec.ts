@@ -387,8 +387,8 @@ test('a text edit reapplies native layer visibility without replacing the ink', 
     expect(opacity).toBe(1)
 })
 
-test('a tablet END-anchor uses the heading baseline, then reflows to a blank final line without rewriting ink', async ({ page, request }) => {
-    const { RmDocument, crdtId, setParagraphStyle } = await import('../packages/rm-format/src/index')
+test('a tablet END-anchor follows the last explicit line without rewriting ink', async ({ page, request }) => {
+    const { RmDocument, crdtId, linearizeRootText, setParagraphStyle } = await import('../packages/rm-format/src/index')
     const { RM_SCALE } = await import('../packages/rm-ink/src/pen')
     const id = crypto.randomUUID()
     const endpoint = `/api/documents/${DOC}/pages/${id}/rm`
@@ -409,15 +409,24 @@ test('a tablet END-anchor uses the heading baseline, then reflows to a blank fin
         await page.goto(`/app/${DOC}/${id}`)
         await expect(page.getByTestId('sync-status')).toHaveText('synced', { timeout: 30_000 })
     }
+    const readWire = async () => RmDocument.parse(new Uint8Array(await (await request.get(endpoint)).body()) as never)
+    const paragraphs = async () => linearizeRootText((await readWire()).tree().rootText!).length
+    const headingY = (rawY + rootY + 63.203125) * RM_SCALE
+    const firstBlankY = (rawY + rootY + 100 + 33.59375) * RM_SCALE
     await open()
-    await expect.poll(y).toBeCloseTo((rawY + rootY + 63.203125) * RM_SCALE, 1)
+    await expect.poll(y).toBeCloseTo(headingY, 1)
     await appendToDeviceText(page, '\n')
-    await expect.poll(y).toBeCloseTo((rawY + rootY + 100) * RM_SCALE, 1)
+    await expect.poll(paragraphs).toBe(2)
+    await expect.poll(y).toBeCloseTo(headingY, 1)
+    await appendToDeviceText(page, '\n')
+    await expect.poll(paragraphs).toBe(3)
+    await expect.poll(y).toBeCloseTo(firstBlankY, 1)
     await expect(page.getByTestId('sync-status')).toHaveText('synced')
-    const after = RmDocument.parse(new Uint8Array(await (await request.get(endpoint)).body()) as never)
+    const after = await readWire()
     expect(native(after)).toEqual(initial)
+    expect(after.anchoredGroups()).toEqual(seeded.anchoredGroups())
     await open()
-    await expect.poll(y).toBeCloseTo((rawY + rootY + 100) * RM_SCALE, 1)
+    await expect.poll(y).toBeCloseTo(firstBlankY, 1)
 })
 
 test('layer visibility reaches native ink and images below a nested group', async ({ page, request }) => {
@@ -474,4 +483,45 @@ test('layer visibility reaches native ink and images below a nested group', asyn
     await page.getByTestId('layers-toggle').click()
     await eye.click()
     await expect.poll(opacities).toEqual({ draw: 1, image: 1 })
+})
+
+test('native emoji compounds have one SVG position and preserve the following text origin', async ({ page, request }) => {
+    const { createRootText, insertText, RmDocument } = await import('../packages/rm-format/src/index')
+    const { RM_SCALE } = await import('../packages/rm-ink/src/pen')
+    const samples = ['😀', '❤️', '👍🏽', '👩‍💻', '🇮🇳']
+    const id = crypto.randomUUID()
+    const doc = RmDocument.empty(DEVICE_AUTHOR)
+    createRootText(doc)
+    insertText(doc, null, samples.map(emoji => 'A' + emoji + 'B').join('\n'), { authorUuid: DEVICE_AUTHOR })
+    expect((await request.put(`/api/documents/${DOC}/pages/${id}/rm`, {
+        data: Buffer.from(doc.serialize()),
+    })).ok()).toBe(true)
+    await page.goto(`/app/${DOC}/${id}`)
+    const text = page.locator('.tl-shape[data-shape-type="device-text"] svg text')
+    await expect(text).toHaveText(samples.flatMap(emoji => ['A', emoji, 'B']), { timeout: 30_000 })
+    await page.evaluate(() => document.fonts.ready)
+    const positions = await text.evaluateAll((nodes, scale) => {
+        const canvas = document.createElement('canvas').getContext('2d')!
+        const elements = nodes as SVGTextElement[]
+        return elements.filter((_, index) => index % 3 === 1).map((emoji, index) => {
+            const following = elements[index * 3 + 2]!
+            const fontSize = Number(emoji.getAttribute('font-size'))
+            const family = emoji.getAttribute('font-family')
+            canvas.font = `${emoji.getAttribute('font-weight') ?? 400} ${fontSize * scale}px ${family}`
+            const x = emoji.x.baseVal
+            return {
+                positions: x.numberOfItems,
+                width: canvas.measureText(emoji.textContent!).width / scale,
+                advance: following.x.baseVal.getItem(0).value - x.getItem(0).value,
+                baseline: following.y.baseVal.getItem(0).value - emoji.y.baseVal.getItem(0).value,
+                boundsWidth: emoji.getBBox().width,
+            }
+        })
+    }, RM_SCALE)
+    for (const position of positions) {
+        expect(position.positions).toBe(1)
+        expect(position.advance).toBeCloseTo(position.width, 3)
+        expect(position.baseline).toBe(0)
+        expect(position.boundsWidth).toBeGreaterThan(0)
+    }
 })

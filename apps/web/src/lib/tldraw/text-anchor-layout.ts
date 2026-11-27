@@ -67,8 +67,6 @@ export function computeAnchorOffsets(
 
     // Device PDF regressions: Mako's START uses the second paragraph's
     // line-box top, not its baseline (a 33.59375-unit difference).
-    // Mako and InterSync END groups follow a trailing empty paragraph, so
-    // they use its line top.
     const p0 = paras[0]
     const p1 = paras[1]
     const startY =
@@ -77,15 +75,24 @@ export function computeAnchorOffsets(
             : p1 === undefined
               ? p0.firstBaselineInk + PARA_STRIDE_INK
               : p1.topInk
-    // Preserve the existing fallback for a missing second paragraph;
-    // the device regression above covers the multi-paragraph case.
-    // The device export verifies the baseline for a single, unwrapped
-    // heading. Keep existing placement for other styles and wrapped lines
-    // until their device behavior is measured.
-    const heading = paragraphs.length === 1 && p0?.style === 2 &&
-        p0.lineStarts.length === 1 && paragraphs[0]?.spans.some((span) => /\S/.test(span.text))
     const endY = lastLineTopInk
-    const headingEndY = heading ? endY + p0.baselineOffsetInk : endY
+    // END type 2 attaches to the baseline of the last explicit source
+    // position, not the top of the implicit final blank paragraph. A live LF
+    // opens the next paragraph in the CRDT map but occupies the end of the
+    // previous paragraph in the layout. Tombstones consume no source position.
+    let lastIndex = chars.length - 1
+    while (lastIndex >= 0 && chars[lastIndex]!.deleted) lastIndex--
+    const last = chars[lastIndex]
+    let baselineEndY = endY
+    if (last) {
+        const pIdx = last.paragraphIndex - (last.offset === -1 ? 1 : 0)
+        const para = paras[pIdx]
+        if (para) {
+            baselineEndY = last.offset === -1
+                ? para.firstBaselineInk + (para.lineStarts.length - 1) * para.lineStrideInk
+                : lineTopOf(paras, pIdx, last.offset, endY) + para.baselineOffsetInk
+        }
+    }
     const charAt = new Map(chars.map((c) => [crdtIdKey(c.id), c]))
 
     for (const g of groups) {
@@ -95,7 +102,7 @@ export function computeAnchorOffsets(
             dy = posY + startY
             dx = g.originX ?? posX
         } else if (crdtIdEquals(g.anchorId, ANCHOR_TEXT_END)) {
-            dy = posY + (g.anchorType === 2 ? headingEndY : endY)
+            dy = posY + (g.anchorType === 2 ? baselineEndY : endY)
             dx = g.originX ?? posX
         } else {
             const pos = charAt.get(crdtIdKey(g.anchorId))

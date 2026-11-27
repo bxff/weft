@@ -95,6 +95,7 @@ jobs:
           test -s build/index.html
           test -s build/library.html
           node ../../scripts/prepare-pages-library.mjs
+          node ../../scripts/pages-smoke.mjs stamp build "$DEPLOY_SHA"
 
       - name: Install the pinned deploy tool without credentials
         run: npm install --prefix "$RUNNER_TEMP/weft-pages" --no-audit --no-fund wrangler@4.168.0
@@ -120,3 +121,6 @@ jobs:
           "$RUNNER_TEMP/weft-pages/node_modules/.bin/wrangler" pages deploy apps/web/build \
             --project-name="$CLOUDFLARE_PAGES_PROJECT" --branch="$CLOUDFLARE_PAGES_PRODUCTION_BRANCH" \
             --commit-hash="$DEPLOY_SHA"
+
+      - name: Verify the live Pages routes and their entry modules
+        run: node scripts/pages-smoke.mjs verify apps/web/build "$DEPLOY_SHA"

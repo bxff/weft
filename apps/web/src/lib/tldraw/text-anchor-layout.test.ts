@@ -7,7 +7,7 @@
 import { expect, test } from 'bun:test'
 import { layoutText, metricsFor, penPositions, PARA_STRIDE_INK, type MeasureFn } from './text-metrics'
 import { paragraphsToRichText } from './device-text-richtext'
-import { buildSvgLines } from './device-text-svg'
+import { buildSvgLines, svgContentBounds } from './device-text-svg'
 import { computeAnchorOffsets, lineTopOf } from './text-anchor-layout'
 import {
     ANCHOR_TEXT_START,
@@ -15,9 +15,12 @@ import {
     RmDocument,
     createRootText,
     insertText,
+    deleteText,
+    insertFormatCode,
     setParagraphStyle,
     crdtId,
     crdtIdKey,
+    rootTextCharPositions,
     lww,
     type TextParagraph,
 } from '@weft/rm-format'
@@ -79,11 +82,13 @@ test('first paragraph line box sits at the column top for every size', () => {
     }
 })
 
+const sentinelAuthor = 'aaaa0000-0000-4000-a000-000000000001'
+
 function sentinelDocument(anchor = ANCHOR_TEXT_START, firstStyle = 2, text = '\n') {
-    const author = 'aaaa0000-0000-4000-a000-000000000001'
+    const author = sentinelAuthor
     const doc = RmDocument.empty(author)
     createRootText(doc)
-    insertText(doc, null, text, { authorUuid: author })
+    if (text) insertText(doc, null, text, { authorUuid: author })
     setParagraphStyle(doc, crdtId(0, 0), firstStyle, { authorUuid: author })
     const group = doc.blocks.find((b) => b.type === 'treeNode' && b.nodeId.part2 === 11)!
     if (group.type !== 'treeNode') throw new Error('missing layer')
@@ -113,10 +118,74 @@ test('body/body START follows the second paragraph top without adding its baseli
     expect(computeAnchorOffsets(doc, measure).get('0:11')?.dy).toBe(303.546875)
 })
 
-test('type-2 END still uses the line top for a trailing empty paragraph', () => {
-    const doc = sentinelDocument(ANCHOR_TEXT_END)
-    expect(doc.anchoredGroups()[0]!.anchorType).toBe(2)
-    expect(computeAnchorOffsets(doc, measure).get('0:11')?.dy).toBe(334)
+// Native vectors in the synthetic notebook export agree on the baseline of
+// the last explicit source position. A final LF is on the preceding line.
+const wrapped = `ALPHA ${'MMMM '.repeat(14)}OMEGA`
+test.each([
+    ['no trailing LF', 'ALPHA marker', 1, 267.59375],
+    ['one trailing LF', 'ALPHA marker\n', 1, 267.59375],
+    ['two trailing LF', 'ALPHA marker\n\n', 1, 337.140625],
+    ['three trailing LF', 'ALPHA marker\n\n\n', 1, 406.6875],
+    ['one blank LF', '\n', 1, 267.59375],
+    ['20 blank LF', '\n'.repeat(20), 1, 1588.984375],
+    ['wrapped body', wrapped, 1, 358.6875],
+    ['wrapped heading', wrapped, 2, 677.1875],
+] as const)('type-2 END follows its native baseline with %s', (_, text, style, dy) => {
+    const doc = sentinelDocument(ANCHOR_TEXT_END, style, text)
+    const bytes = doc.serialize()
+    const offset = computeAnchorOffsets(doc, measure).get('0:11')!
+    expect(offset.dx).toBe(-464)
+    // The independently measured heading baseline differs from the shared
+    // heading layout by one 1/64-ink quantization unit.
+    expect(Math.abs(offset.dy - dy)).toBeLessThanOrEqual(1 / 64)
+    expect(doc.serialize()).toEqual(bytes)
+})
+
+test.each([1, 20])('type-2 END ignores a deleted last LF after %i live LF', (count) => {
+    const doc = sentinelDocument(ANCHOR_TEXT_END, 1, '\n'.repeat(count + 1))
+    const before = doc.rootTextBlock!.text
+    const final = rootTextCharPositions(before).at(-1)!
+    expect(final.offset).toBe(-1)
+    deleteText(doc, [final.id])
+    const read = RmDocument.parse(doc.serialize())
+    expect(rootTextCharPositions(read.rootTextBlock!.text).at(-1)?.deleted).toBe(true)
+    const group = read.blocks.find((block) => block.type === 'treeNode' && block.anchorId)
+    if (group?.type !== 'treeNode') throw new Error('missing anchored group')
+    group.anchorOriginX = lww(crdtId(1, 1000), -253.859375)
+    expect(computeAnchorOffsets(read, measure).get('0:11')).toEqual({
+        dx: -253.859375,
+        dy: count === 1 ? 267.59375 : 1588.984375,
+    })
+})
+
+test.each([false, true])('long blank END survives tombstones and formatting (mixed styles: %s)', (mixed) => {
+    const doc = sentinelDocument(ANCHOR_TEXT_END, mixed ? 2 : 1, '\n'.repeat(20))
+    const text = doc.rootTextBlock!.text
+    const openers = rootTextCharPositions(text).map((pos) => pos.id)
+    const opts = { authorUuid: sentinelAuthor }
+    if (mixed) setParagraphStyle(doc, openers[1]!, 3, opts)
+    for (const [pIdx, count] of [[1, 15], [2, 14], [9, 16], [17, 17], [18, 18], [20, 2]] as const) {
+        const open = insertFormatCode(doc, openers[pIdx - 1]!, 1, opts)
+        const first = insertText(doc, open, 'x'.repeat(count), opts)
+        const removed = Array.from({ length: count }, (_, i) => crdtId(first.part1, first.part2 + i))
+        insertFormatCode(doc, removed.at(-1)!, 2, opts)
+        deleteText(doc, removed)
+    }
+    const bytes = doc.serialize()
+    const round = RmDocument.parse(bytes)
+    expect(rootTextCharPositions(round.rootTextBlock!.text).filter((pos) => pos.deleted)).toHaveLength(82)
+    expect(computeAnchorOffsets(round, measure).get('0:11')).toEqual({
+        dx: -464,
+        dy: mixed ? 1632.890625 : 1588.984375,
+    })
+    expect(round.serialize()).toEqual(bytes)
+})
+
+test('type-2 END without explicit source positions retains its fallback', () => {
+    const doc = sentinelDocument(ANCHOR_TEXT_END, 1, '')
+    expect(computeAnchorOffsets(doc, measure).get('0:11')).toEqual({ dx: -464, dy: 234 })
+    doc.blocks.splice(doc.blocks.findIndex((block) => block.type === 'rootText'), 1)
+    expect(computeAnchorOffsets(doc, measure).size).toBe(0)
 })
 
 test('single-paragraph START retains its existing fallback', () => {
@@ -217,4 +286,68 @@ test('unsupported glyph geometry stays deterministic without a browser canvas', 
     svg.forEach((line, i) =>
         expect(line.endX - line.startX).toBeCloseTo(layout.lineWidthsInk[i]!, 10),
     )
+})
+
+test('compound emoji advances are measured as one grapheme and use UTF-16 wraps', () => {
+    const samples = ['❤️', '👍🏽', '👩‍💻', '🇮🇳']
+    for (const emoji of samples) {
+        const requested: string[] = []
+        const measureCluster: MeasureFn = (s) => {
+            requested.push(s)
+            return 20
+        }
+        const text = 'A' + emoji + 'B'
+        const m = metricsFor(1)
+        const line = penPositions(text, m, undefined, measureCluster)
+        const throughEmoji = penPositions(text.slice(0, -1), m, undefined, measureCluster).end
+        const layout = layoutText([para(text)], throughEmoji + 8.1, measureCluster)
+        expect(line.units).toEqual(['A', emoji, 'B'])
+        expect(line.xs[2]).toBeCloseTo(throughEmoji, 8)
+        expect(layout.paras[0]!.lineStarts).toEqual([0, 1 + emoji.length])
+        expect(layout.paras[0]!.lineWidthsInk[0]).toBeCloseTo(throughEmoji, 8)
+        expect(requested).toEqual([emoji, emoji, emoji])
+    }
+})
+
+test('emoji formatting boundaries cannot split a shaping cluster or move the next glyph', () => {
+    const full = 'A👍🏽B'
+    const styled = { ...para(full), spans: [
+        { text: 'A👍', bold: false, italic: false },
+        { text: '🏽B', bold: true, italic: false },
+    ] }
+    const rendered = buildSvgLines(paragraphsToRichText([styled]), 400)[0]!
+    expect(rendered.runs.map((run) => [run.text, run.xs.length, run.bold])).toEqual([
+        ['A', 1, false], ['👍🏽', 1, false], ['B', 1, true],
+    ])
+    const m = metricsFor(1)
+    expect(rendered.runs[2]!.xs[0]).toBe(rendered.startX + penPositions('A👍🏽', m).end)
+    expect(rendered.endX).toBe(rendered.startX + penPositions('A👍🏽', m).end
+        + penPositions('B', m, { bold: true }).end)
+})
+
+test('a native anchor after a shaped emoji follows the wrapped baseline and the SVG bounds', () => {
+    const author = 'aaaa0000-0000-4000-a000-000000000001'
+    const text = 'A👩‍💻B'
+    const m = metricsFor(1)
+    // No browser-canvas dependency: one unsupported cluster gets one fallback
+    // advance. This width leaves room for the cluster but not the final B.
+    const width = 8.1 + penPositions(text.slice(0, -1), m).end
+    const doc = RmDocument.empty(author)
+    createRootText(doc, { width })
+    insertText(doc, null, text, { authorUuid: author })
+    const group = doc.blocks.find((b) => b.type === 'treeNode' && b.nodeId.part2 === 11)
+    if (group?.type !== 'treeNode') throw new Error('missing layer')
+    const target = rootTextCharPositions(doc.tree().rootText!).at(-1)!
+    expect(target.offset).toBe(text.length - 1)
+    const stamp = crdtId(1, 1000)
+    group.anchorId = lww(stamp, target.id)
+    group.anchorType = lww(stamp, 2)
+    group.anchorThreshold = lww(stamp, 0)
+    group.anchorOriginX = lww(stamp, -464)
+    const lines = buildSvgLines(paragraphsToRichText([para(text)]), width)
+    expect(lines.map((line) => line.runs.map((run) => run.text).join(''))).toEqual(['A👩‍💻', 'B'])
+    expect(computeAnchorOffsets(RmDocument.parse(doc.serialize())).get('0:11')?.dy).toBeCloseTo(234 + lines[1]!.y, 5)
+    const bounds = svgContentBounds(lines)!
+    expect(bounds.x1).toBeCloseTo(lines[0]!.startX + penPositions('A👩‍💻', m).end, 8)
+    expect(bounds.y1).toBe(lines[1]!.bottom)
 })
