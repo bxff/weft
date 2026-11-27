@@ -232,6 +232,12 @@ export class CloudStore {
                 created_at INTEGER NOT NULL,
                 last_used_at INTEGER
             );
+            CREATE TABLE IF NOT EXISTS hosted_terms_acceptance (
+                user_id TEXT NOT NULL,
+                version TEXT NOT NULL,
+                accepted_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, version)
+            );
             CREATE TABLE IF NOT EXISTS config (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -2887,12 +2893,24 @@ export class CloudStore {
     return secret;
   }
 
-  mintDeviceToken(userId: string, label: string): string {
+  hasAcceptedHostedTerms(userId: string, version: string): boolean {
+    return !!this.db.query("SELECT 1 FROM hosted_terms_acceptance WHERE user_id=? AND version=?")
+      .get(userId, version);
+  }
+
+  mintDeviceToken(userId: string, label: string, termsVersion?: string): string {
     const token = `chd_${crypto.randomUUID().replaceAll("-", "")}`;
-    this.db.run(
-      "INSERT INTO device_tokens (token, id, user_id, label, created_at) VALUES (?,?,?,?,?)",
-      [token, crypto.randomUUID(), userId, label, Date.now()],
-    );
+    const now = Date.now();
+    this.db.transaction(() => {
+      if (termsVersion) this.db.run(
+        "INSERT OR IGNORE INTO hosted_terms_acceptance (user_id, version, accepted_at) VALUES (?,?,?)",
+        [userId, termsVersion, now],
+      );
+      this.db.run(
+        "INSERT INTO device_tokens (token, id, user_id, label, created_at) VALUES (?,?,?,?,?)",
+        [token, crypto.randomUUID(), userId, label, now],
+      );
+    })();
     return token;
   }
 
