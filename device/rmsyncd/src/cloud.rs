@@ -39,8 +39,8 @@ async fn ws_wake_loop(
     wake_docs: Arc<Notify>,
     wake_assets: Arc<Notify>,
 ) {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let base = config.url.trim_end_matches('/');
     let ws_url = if let Some(rest) = base.strip_prefix("https") {
@@ -1596,6 +1596,8 @@ async fn pull_page_inner(
     }
     let key = format!("{doc}/{page}");
     let dir = capture.then(|| recovery_dir(cloud, doc, page)).flatten();
+    // recovery_dir builds state/recovery-v1/relay/document/page.
+    let durable_parent = dir.as_deref().and_then(|dir| dir.ancestors().nth(4));
     let saved = dir.as_deref().and_then(recovery::load);
     let (local_bytes, local_rev) = state.store.read_page(doc, page).unwrap_or_default();
     let verified = saved.as_ref().filter(|saved| {
@@ -1622,7 +1624,8 @@ async fn pull_page_inner(
         return false;
     };
     if r.status().as_u16() == 304 {
-        let (Some(saved), Some(dir)) = (verified, dir.as_deref()) else {
+        let (Some(saved), Some(dir), Some(boundary)) = (verified, dir.as_deref(), durable_parent)
+        else {
             return false;
         };
         if cloud.revisions.get(&key) != Some(&saved.head.revision)
@@ -1636,17 +1639,15 @@ async fn pull_page_inner(
         {
             return false;
         }
-        if let Err(error) = recovery::sync_manifest_directory(dir) {
+        let marker = (saved.head.revision.clone(), saved.asset_revision.clone());
+        if let Err(error) = recovery::certify_checkpoint(dir, boundary) {
             eprintln!("cloud: recovery durability check for {doc}/{page} failed: {error}");
             return false;
         }
         cloud
             .pulled_asset_revisions
             .insert(key.clone(), saved.asset_revision.clone());
-        cloud.protected.insert(
-            key,
-            (saved.head.revision.clone(), saved.asset_revision.clone()),
-        );
+        cloud.protected.insert(key, marker);
         return true;
     }
     if r.status().as_u16() != 200 {
@@ -1720,7 +1721,9 @@ async fn pull_page_inner(
         )
     };
     let native_changed = fetched_rev != local_rev;
-    if let (Some(checkpoint), Some(dir)) = (checkpoint, dir.as_deref()) {
+    if let (Some(checkpoint), Some(dir), Some(boundary)) =
+        (checkpoint, dir.as_deref(), durable_parent)
+    {
         // Recovery only protects an accepted native revision. Never write the
         // live page, advance the regular cursor, or acknowledge local assets.
         if native_changed || cloud.revisions.get(&key) != Some(&cloud_rev) || missing_assets {
@@ -1750,7 +1753,13 @@ async fn pull_page_inner(
                 checkpoint.head.revision.clone(),
                 checkpoint.asset_revision.clone(),
             );
-            match recovery::commit(dir, checkpoint, &bytes, cloud.recovery_budget.as_mut()) {
+            match recovery::commit(
+                dir,
+                boundary,
+                checkpoint,
+                &bytes,
+                cloud.recovery_budget.as_mut(),
+            ) {
                 Ok(()) => {
                     cloud
                         .pulled_asset_revisions
@@ -2318,7 +2327,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_acknowledgment_leaves_page_pending_for_a_retry() {
-        use axum::{extract::Request, response::IntoResponse, routing::put, Router};
+        use axum::{Router, extract::Request, response::IntoResponse, routing::put};
         use std::sync::{Arc, Mutex};
 
         let captures = Arc::new(Mutex::new(Vec::new()));
@@ -2384,10 +2393,10 @@ mod tests {
 
     #[tokio::test]
     async fn failed_feed_page_does_not_block_an_unrelated_page_or_advance_the_cursor() {
-        use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
         use std::sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         };
 
         let doc = "11111111-1111-4111-a111-111111111111";
@@ -2480,10 +2489,10 @@ mod tests {
     #[tokio::test]
     async fn recovery_sweep_keeps_same_name_assets_in_sidecar_and_never_changes_local_bytes() {
         use axum::{
+            Router,
             http::{HeaderMap, StatusCode},
             response::IntoResponse,
             routing::get,
-            Router,
         };
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -2581,9 +2590,11 @@ mod tests {
             model: String::new(),
             templates_dir: disk.path().to_path_buf(),
         };
-        assert!(state
-            .store
-            .create_notebook(STAMP_DOC, "Recovery", "", STAMP_PAGE, ""));
+        assert!(
+            state
+                .store
+                .create_notebook(STAMP_DOC, "Recovery", "", STAMP_PAGE, "")
+        );
         state
             .store
             .write_page(STAMP_DOC, STAMP_PAGE, "", native)
@@ -2710,7 +2721,7 @@ mod tests {
         std::fs::remove_dir(blocked).unwrap();
         // Fail after the new manifest is visible, but before its directory
         // entry is confirmed durable. Until repair, only generation 1 is protected.
-        recovery::fail_next_manifest_sync(&path);
+        recovery::fail_next_directory_sync(&path);
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
         assert_eq!(recovery::load(&path).unwrap().etag, "\"checkpoint-2\"");
         assert_eq!(cloud.protected[&key].1, "assets-1");
@@ -2719,7 +2730,7 @@ mod tests {
         let not_modified_before = page_not_modified.load(Ordering::Relaxed);
         // A real 304 must not acknowledge the renamed manifest if the
         // repairing fsync also fails. On the next 304 repair and acknowledge.
-        recovery::fail_next_manifest_sync(&path);
+        recovery::fail_next_directory_sync(&path);
         reconcile_pulls(&state, &client, &config, &mut cloud, &docs, &mut etag).await;
         assert_eq!(
             page_not_modified.load(Ordering::Relaxed),
