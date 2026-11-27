@@ -89,6 +89,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22.22.3"
+      - run: node --test scripts/pages-smoke.test.mjs
       - run: bun install --frozen-lockfile
       - run: node node_modules/@playwright/test/cli.js install --with-deps chromium
       - run: bun run build
