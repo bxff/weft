@@ -1,15 +1,15 @@
 <script lang="ts">
     import { onMount } from 'svelte'
-    import { connection, docsUrl } from '$lib/settings'
+    import { docsUrl } from '$lib/settings'
     import { currentUserLabel, clerkEnabled, joinWaitlist } from '$lib/auth'
 
     let userLabel = $state<string | null>(null)
     let ready = $state(false)
 
     onMount(() => {
-        if (connection().mode === 'cloud') {
+        if (clerkEnabled()) {
             void currentUserLabel()
-                .then((l) => (userLabel = l))
+                .then((l) => (userLabel = l), () => (userLabel = null))
                 .finally(() => (ready = true))
         } else {
             ready = true
@@ -30,7 +30,7 @@
         {:else if showSignIn}
             <!-- routes to the waitlist page, which links to sign-in for approved users -->
             <button type="button" class="wf-nav" style="cursor: pointer" onclick={() => void joinWaitlist()}>Sign in</button>
-        {:else}
+        {:else if ready}
             <a href="/library" class="wf-link">Open notes</a>
         {/if}
     </nav>

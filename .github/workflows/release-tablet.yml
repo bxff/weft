@@ -1,0 +1,113 @@
+name: Build Weft tablet binaries
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release-tablet.yml'
+      - 'device/**'
+  workflow_dispatch:
+  push:
+    tags: ['tablet-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Validate release tag
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^tablet-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git merge-base --is-ancestor HEAD origin/main
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.15.2
+
+      - name: Build and check both ARM executables
+        working-directory: device
+        run: |
+          set -euo pipefail
+          rust=1.97.1
+          targets=(aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf)
+          rustup toolchain install "$rust" --profile minimal --target "${targets[0]}" --target "${targets[1]}"
+          cargo "+$rust" install --locked cargo-zigbuild --version 0.20.1
+          cargo "+$rust" test --locked
+          mkdir -p release
+          for target in "${targets[@]}"; do
+            cargo "+$rust" zigbuild --locked --release --target "$target"
+            binary="release/rmsyncd-${target%%-*}"
+            cp "target/$target/release/rmsyncd" "$binary"
+            header="$(readelf -h "$binary")"
+            case "$target" in
+              aarch64-*) grep -q 'Machine:.*AArch64' <<< "$header" ;;
+              armv7-*) grep -q 'Machine:.*ARM' <<< "$header"
+                       grep -q 'hard-float ABI' <<< "$header" ;;
+            esac
+            headers="$(readelf -l "$binary")"
+            if grep -q INTERP <<< "$headers"; then
+              echo "Unexpected dynamic interpreter in $binary" >&2
+              exit 1
+            fi
+          done
+          (cd release; sha256sum rmsyncd-aarch64 rmsyncd-armv7 > SHA256SUMS)
+
+      - name: Attest the binaries built from the release tag
+        if: github.event_name == 'push'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: 'device/release/rmsyncd-*'
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: weft-tablet-binaries
+          path: device/release/
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: weft-tablet-binaries
+          path: release
+
+      - name: Verify the source and publish the exact built assets
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source_commit="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA" --jq .sha)"
+          refs="$(git ls-remote --exit-code "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$GITHUB_REF" "$GITHUB_REF^{}")"
+          tag_commit="$(awk '/\^\{\}$/ {print $1; found=1} NR==1 {first=$1} END {if (!found) print first}' <<< "$refs")"
+          [[ "$tag_commit" == "$source_commit" ]]
+          sha256sum -c SHA256SUMS
+          for binary in rmsyncd-aarch64 rmsyncd-armv7; do
+            gh attestation verify "$binary" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-tablet.yml" \
+              --source-ref "$GITHUB_REF" --source-digest "$source_commit" --deny-self-hosted-runners
+          done
+          gh release create "$GITHUB_REF_NAME" rmsyncd-aarch64 rmsyncd-armv7 SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --latest=false --title "Weft $GITHUB_REF_NAME" \
+            --notes "Built by [GitHub Actions](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) from commit \`$source_commit\`."

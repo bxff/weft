@@ -63,7 +63,7 @@
       "dest": "/index.html"
     },
     {
-      "src": "^(/docs(?:/[a-zA-Z0-9_-]+)*)/?$",
+      "src": "^(/(?:docs(?:/[a-zA-Z0-9_-]+)*|privacy|terms))/?$",
       "methods": [
         "GET",
         "HEAD"

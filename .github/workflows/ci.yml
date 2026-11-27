@@ -31,7 +31,7 @@ jobs:
           test "$(cat apps/web/src/lib/tldraw/native-font-profile.generated.json)" = null
           test "$(cat apps/web/src/native-font-profile.generated.css)" = '/* Deployment font profile not staged. */'
           test -z "$(git ls-files 'apps/web/static/fonts/native-profile/**')"
-      - run: bun test scripts/pages-library-proxy.test.mjs scripts/stage-native-font-profile.test.mjs
+      - run: bun test scripts/pages-library-proxy.test.mjs scripts/stage-native-font-profile.test.mjs scripts/home-hero.test.mjs
       - run: bunx tsc -b --force
       - run: bun run check
         working-directory: apps/web
