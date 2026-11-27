@@ -5,6 +5,7 @@ on:
 permissions:
   contents: read
   actions: read
+
 concurrency:
   group: deploy-vps-production
   cancel-in-progress: false
@@ -12,41 +13,38 @@ concurrency:
 jobs:
   preflight:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
       - run: bash scripts/test-deploy.sh
-      - name: Require a green CI run for this commit
+      - name: Require a successful push CI run for this exact commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
-            --commit "$GITHUB_SHA" --branch main --event push --limit 10 \
-            --json conclusion --jq 'any(.[]; .conclusion == "success")' | grep -qx true
+          set -euo pipefail
+          green=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event push \
+            --branch main --commit "$GITHUB_SHA" --status success --limit 1 --json headSha \
+            --jq '.[0].headSha // ""')
+          [[ "$green" == "$GITHUB_SHA" ]] || { echo "CI has not passed on this exact main commit."; exit 1; }
 
   vps:
+    if: github.ref == 'refs/heads/main'
     needs: preflight
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Restrict this protected environment to main in GitHub settings.
     environment: vps-production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl, armv7-unknown-linux-musleabihf
-      - uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: '0.15.2'
-      - run: cargo install cargo-zigbuild --locked
-      - run: |
-          cargo zigbuild --manifest-path device/Cargo.toml --locked --release --target aarch64-unknown-linux-musl
-          cargo zigbuild --manifest-path device/Cargo.toml --locked --release --target armv7-unknown-linux-musleabihf
-      - name: Preflight SSH and deploy prebuilt release
+      - name: Stage and deploy the relay
         env:
+          GH_TOKEN: ${{ github.token }}
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_PORT: ${{ vars.VPS_PORT }}
