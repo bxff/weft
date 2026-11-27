@@ -206,3 +206,97 @@ test("file-backed recovery rolls back a durability fault and verifies the edited
     else process.env.HOST = host;
   }
 });
+
+test.each(["acknowledged", "before-commit"] as const)(
+  "recovery survives relay process loss: %s",
+  async (phase) => {
+    const { existsSync, mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "weft-restore-process-loss-"));
+    const db = join(dir, "restore.sqlite");
+    const ready = join(dir, "ready");
+    const blocked = join(dir, "blocked");
+    const body = JSON.stringify(fixture());
+    const subprocess = Bun.spawn(
+      [process.execPath, "--eval", `
+        import { startCloud } from ${JSON.stringify(import.meta.resolve("../src/server"))};
+        import { writeFileSync, renameSync } from "node:fs";
+        const cloud = startCloud({ port: 0, db: ${JSON.stringify(db)} });
+        if (${phase === "before-commit"}) {
+          const original = cloud.store.syncRecoveryPath.bind(cloud.store);
+          cloud.store.syncRecoveryPath = path => {
+            original(path);
+            if (!path.endsWith("/snapshots")) return;
+            writeFileSync(${JSON.stringify(blocked)}, "before commit");
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15000);
+            throw Error("test failed to kill the paused relay");
+          };
+        }
+        const key = cloud.store.mintApiKey("process-test", "restore").key;
+        const ready = ${JSON.stringify(ready)};
+        writeFileSync(ready + ".tmp", JSON.stringify({ port: cloud.port, key }));
+        renameSync(ready + ".tmp", ready);
+      `],
+      { cwd: dir, env: { HOST: "127.0.0.1" }, stdout: "ignore", stderr: "inherit" },
+    );
+    let reopened: ReturnType<typeof startCloud> | undefined;
+    const waitFor = async (path: string) => {
+      const until = Date.now() + 5000;
+      while (!existsSync(path)) {
+        if (subprocess.exitCode !== null || Date.now() >= until) throw Error("relay did not reach test rendezvous");
+        await Bun.sleep(15);
+      }
+    };
+    try {
+      await waitFor(ready);
+      const { port, key } = JSON.parse(readFileSync(ready, "utf8")) as { port: number; key: string };
+      const headers = { "x-api-key": key, "content-type": "application/json" };
+      const post = (port: number) => fetch(`http://127.0.0.1:${port}/api/recovery/notebook`, {
+        method: "POST", headers, body, signal: AbortSignal.timeout(5000),
+      });
+      if (phase === "acknowledged") {
+        const result = await post(port);
+        expect(result.status).toBe(201);
+        expect(await result.json()).toEqual({ ok: true, notebookId });
+        subprocess.kill("SIGKILL");
+        await subprocess.exited;
+      } else {
+        const pending = post(port).then(response => response.status, () => "disconnected");
+        await waitFor(blocked);
+        subprocess.kill("SIGKILL");
+        await subprocess.exited;
+        expect(await pending).toBe("disconnected");
+      }
+      expect(subprocess.signalCode).toBe("SIGKILL");
+      const host = process.env.HOST;
+      try {
+        process.env.HOST = "127.0.0.1";
+        reopened = startCloud({ port: 0, db });
+      } finally {
+        if (host === undefined) delete process.env.HOST;
+        else process.env.HOST = host;
+      }
+      const url = `http://127.0.0.1:${reopened.port}/api/documents/${notebookId}/pages/${pageId}`;
+      if (phase === "before-commit") {
+        expect(JSON.parse(reopened.store.getDocuments("process-test"))).toEqual({ documents: [] });
+        expect((await fetch(url + "/rm", { headers })).status).toBe(404);
+        expect((await post(reopened.port)).status).toBe(201);
+      }
+      expect((await post(reopened.port)).status).toBe(200);
+      const native = await fetch(url + "/rm", { headers });
+      expect(native.status).toBe(200);
+      expect([...RmDocument.parse(await native.arrayBuffer()).tree().walk()]
+        .filter(([, item]) => item.kind === "line")
+        .map(([, item]) => item.kind === "line" ? item.points[0]?.x : 0)).toEqual([200]);
+      const image = await fetch(url + "/assets/" + filename, { headers });
+      expect(Buffer.from(await image.arrayBuffer())).toEqual(checkpointImage);
+    } finally {
+      if (subprocess.exitCode === null && subprocess.signalCode === null) subprocess.kill("SIGKILL");
+      await subprocess.exited;
+      reopened?.stop();
+      (reopened?.store as unknown as { db: import("bun:sqlite").Database } | undefined)?.db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 18000,
+);
