@@ -8,6 +8,7 @@
 import {
   BelowFloorError,
   CloudStore,
+  SnapshotUnavailable,
   type SnapshotPublication,
   type StorageClass,
   type StoredFailureReport,
@@ -1921,7 +1922,7 @@ export function startCloud(
           // lazy blob->snapshot migration (5d): an op-mode client bootstrapping
           // a legacy blob page must receive its content, not a 404-empty page.
           store.seedSnapshotFromBlob(user, doc, page);
-          const snap = store.latestSnapshotReference(user, doc, page);
+          const snap = store.latestSnapshotReference(user, doc, page, true);
           // 204, not 404: "no snapshot yet" is the NORMAL bootstrap answer
           // for ops-only and empty pages — a 404 makes the browser log a
           // console error on every page open (owner-reported noise)
@@ -2294,6 +2295,9 @@ export function startCloud(
     // request lands here — report to GlitchTip (telemetry.ts) and answer a
     // clean 500 instead of Bun's default HTML error page.
     error(err) {
+      if (err instanceof SnapshotUnavailable) {
+        return json({ error: "Current page checkpoint is unavailable" }, 503);
+      }
       if (err instanceof RootTextAuthorConflict) {
         // A legacy tablet treats 409 as permission to fetch a different page.
         return json({ error: "unresolved-text-author" }, 422);

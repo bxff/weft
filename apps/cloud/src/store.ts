@@ -6,6 +6,8 @@
 import { Database } from "bun:sqlite";
 import { publishBackup } from "./backup";
 import {
+  accessSync,
+  constants as fsConstants,
   mkdirSync,
   mkdtempSync,
   writeFileSync,
@@ -138,6 +140,10 @@ function sha256hex(bytes: Uint8Array): string {
 export interface SnapshotPublication {
   id: string;
   baseSeq: number;
+}
+
+export class SnapshotUnavailable extends Error {
+  constructor() { super("Current page checkpoint is unavailable"); }
 }
 
 type SnapshotPublicationResult<T> =
@@ -1466,12 +1472,12 @@ export class CloudStore {
          WHERE user_id=? AND doc=? AND page=? AND batch_id=?`,
       ).get(...key);
       if (prior) {
-        return prior.request_hash === hash
-          ? { kind: "accepted", range: { firstSeq: prior.first_seq, lastSeq: prior.last_seq }, duplicate: true }
-          : { kind: "reused" };
+        if (prior.request_hash !== hash) return { kind: "reused" };
+        this.latestSnapshotReference(user, doc, page, true);
+        return { kind: "accepted", range: { firstSeq: prior.first_seq, lastSeq: prior.last_seq }, duplicate: true };
       }
       if (baseSeq !== undefined) {
-        const currentSeq = this.latestSnapshotSeq(user, doc, page);
+        const currentSeq = this.latestSnapshotReference(user, doc, page, true)?.seq ?? 0;
         if (currentSeq !== baseSeq) return { kind: "stale", currentSeq };
       }
       const range = append();
@@ -1509,9 +1515,12 @@ export class CloudStore {
           if (receipt.request_hash !== requestHash || receipt.base_seq !== publication.baseSeq) {
             return { kind: "reused" };
           }
+          // The receipt’s own checkpoint may have been pruned; the current
+          // head must still be readable to acknowledge the publication.
+          this.latestSnapshotReference(user, doc, page, true);
           return { kind: "accepted", seq: receipt.seq, merged: receipt.merged === 1, duplicate: true };
         }
-        const currentSeq = this.latestSnapshotSeq(user, doc, page);
+        const currentSeq = this.latestSnapshotReference(user, doc, page, true)?.seq ?? 0;
         if (publication.baseSeq !== currentSeq) return { kind: "stale", currentSeq };
       }
 
@@ -1640,7 +1649,9 @@ export class CloudStore {
    * always minted against the seeded blob base with non-colliding clocks.)
    */
   seedSnapshotFromBlob(user: string, doc: string, page: string): boolean {
-    if (this.latestSnapshotReference(user, doc, page)) return false; // already op-regime
+    // A missing file does not make a page legacy again. Never seed an old
+    // blob over a newer checkpoint that temporarily cannot be read.
+    if (this.latestSnapshotSeq(user, doc, page) > 0) return false;
     if (this.latestOpSeq(user, doc, page) > 0) return false; // op content stands
     const blob = this.getPage(user, doc, page);
     if (!blob) return false; // nothing to migrate (fresh/op-born page)
@@ -2687,11 +2698,24 @@ export class CloudStore {
     user: string,
     doc: string,
     page: string,
+    requireAvailable = false,
   ): { seq: number; opSeq: number; revert: boolean; complete: boolean; readBytes: () => Uint8Array } | null {
     const row = this.latestSnapshotRow(user, doc, page);
     if (!row) return null;
     const path = this.existingSnapshotPath(row.path);
-    if (!path) return null;
+    if (!path) {
+      if (requireAvailable) throw new SnapshotUnavailable();
+      return null;
+    }
+    if (requireAvailable) {
+      try {
+        accessSync(path, fsConstants.R_OK);
+        const stat = statSync(path);
+        if (!stat.isFile() || stat.size !== row.size) throw new SnapshotUnavailable();
+      } catch {
+        throw new SnapshotUnavailable();
+      }
+    }
     return {
       seq: row.seq,
       opSeq: row.op_seq,
@@ -2707,10 +2731,10 @@ export class CloudStore {
   private latestSnapshotRow(user: string, doc: string, page: string) {
     return this.db
       .query<
-        { seq: number; op_seq: number; revert: number; path: string; complete: number },
+        { seq: number; op_seq: number; revert: number; path: string; size: number; complete: number },
         [string, string, string]
       >(
-        `SELECT s.seq, s.op_seq, s.revert, s.path,
+        `SELECT s.seq, s.op_seq, s.revert, s.path, s.size,
            (s.op_seq >= COALESCE((SELECT floor_seq FROM page_floors
              WHERE user_id=?1 AND doc=?2 AND page=?3), 0)
             AND NOT EXISTS (SELECT 1 FROM page_ops

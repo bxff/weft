@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite'
 import { expect, spyOn, test } from 'bun:test'
-import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, truncateSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRootText, crdtId, insertText, Pen, PenColor, RmDocument } from '@weft/rm-format'
@@ -644,4 +644,121 @@ test('a snapshot receipt reports overlay-only changes folded in by the relay', (
     const current = store.latestSnapshot(...PAGE_KEY)!
     expect(store.publishSnapshot(...PAGE_KEY, current.bytes, { id: crypto.randomUUID(), baseSeq: current.seq }, () => null))
         .toMatchObject({ kind: 'accepted', merged: false })
+})
+
+
+test.each(['missing', 'truncated'] as const)(
+    'file-backed relay refuses a receipt and a read when the live checkpoint is %s', async (fault) => {
+        const dir = mkdtempSync(join(tmpdir(), 'weft-receipt-restart-'))
+        const db = join(dir, 'relay.sqlite')
+        const start = async () => {
+            const child = Bun.spawn([process.execPath, join(import.meta.dir, '../src/server.ts'),
+                '--port', '0', '--db', db], {
+                env: { ...process.env, CLOUD_DEV_USER: '1' },
+                stdout: 'pipe', stderr: 'inherit',
+            })
+            const reader = child.stdout.getReader()
+            const stop = async () => {
+                child.kill('SIGKILL')
+                await child.exited
+            }
+            const timer = setTimeout(() => child.kill('SIGKILL'), 5_000)
+            try {
+                let output = ''
+                for (;;) {
+                    const { done, value } = await reader.read()
+                    if (done) throw new Error('Relay did not start: ' + output)
+                    output += new TextDecoder().decode(value)
+                    const port = /listening on :(\d+)/.exec(output)?.[1]
+                    if (port) return { stop, url: `http://localhost:${port}/api/documents/${DOC}/pages/${PAGE}` }
+                }
+            } catch (error) {
+                await stop()
+                throw error
+            } finally {
+                clearTimeout(timer)
+                reader.releaseLock()
+            }
+        }
+        let relay: Awaited<ReturnType<typeof start>> | undefined
+        try {
+            relay = await start()
+            const auth = { authorization: `Bearer ${TOKEN}` }
+            const checkpoint = encodeSnapshot(tabletFile(), overlay)
+            const id = crypto.randomUUID()
+            const publish = () => fetch(relay!.url + '/snapshot', {
+                method: 'POST', body: checkpoint, headers: {
+                    ...auth, 'x-snapshot-publication-id': id, 'x-snapshot-base-seq': '0',
+                },
+            })
+            const snapshot = () => fetch(relay!.url + '/snapshot', { headers: auth })
+            const initial = await publish()
+            expect(initial.status).toBe(200)
+            const received = await initial.json() as { seq: number; merged: boolean }
+            const opsId = crypto.randomUUID()
+            const append = () => fetch(relay!.url + '/ops-batch', {
+                method: 'POST',
+                body: JSON.stringify({
+                    baseSeq: received.seq,
+                    batch: { author: AUTHOR, ops: [Buffer.from(operation).toString('base64')] },
+                }),
+                headers: { ...auth, 'x-op-batch-id': opsId },
+            })
+            const appended = await append()
+            expect(appended.status).toBe(200)
+            const range = await appended.json()
+            await relay.stop()
+            relay = await start()
+
+            // Replay the original requests, as if their replies had been lost.
+            expect(await (await publish()).json()).toEqual(received)
+            expect(await (await append()).json()).toEqual(range)
+            const fresh = await snapshot()
+            expect(fresh.status).toBe(200)
+            expect(new Uint8Array(await fresh.arrayBuffer())).toEqual(checkpoint)
+
+            const snapshots = db + '-files/snapshots'
+            const files = readdirSync(snapshots)
+            expect(files).toHaveLength(1)
+            const path = join(snapshots, files[0]!)
+            if (fault === 'missing') rmSync(path)
+            else truncateSync(path, 0)
+
+            for (const action of [publish, append, snapshot]) {
+                const response = await action()
+                expect(response.status).toBe(503)
+                expect(await response.json()).toMatchObject({ error: 'Current page checkpoint is unavailable' })
+            }
+
+            // Repair from the known good file. It is the same publication,
+            // not a license to re-append the operation or create a new head.
+            writeFileSync(path, checkpoint)
+            expect(await (await publish()).json()).toEqual(received)
+            expect(await (await append()).json()).toEqual(range)
+        } finally {
+            await relay?.stop()
+            rmSync(dir, { recursive: true, force: true })
+        }
+    },
+    20_000,
+)
+
+test('a missing current checkpoint cannot re-seed an obsolete legacy page', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'weft-receipt-legacy-'))
+    const db = join(dir, 'relay.sqlite')
+    const store = new CloudStore(db)
+    const inspect = new Database(db)
+    try {
+        const seq = store.putSnapshot(...PAGE_KEY, encodeSnapshot(tabletFile(), overlay))
+        inspect.run('INSERT INTO pages (user_id, doc, page, bytes, revision, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+            [...PAGE_KEY, blank, 'obsolete-legacy-page', 0])
+        const { path } = inspect.query<{ path: string }, [number]>('SELECT path FROM page_snapshots WHERE seq=?').get(seq)!
+        rmSync(path)
+        expect(store.seedSnapshotFromBlob(...PAGE_KEY)).toBe(false)
+        expect(store.latestSnapshotSeq(...PAGE_KEY)).toBe(seq)
+        expect(store.getSnapshotBytes(...PAGE_KEY, seq)).toBeNull()
+    } finally {
+        inspect.close()
+        rmSync(dir, { recursive: true, force: true })
+    }
 })
