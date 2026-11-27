@@ -1,4 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 
@@ -45,6 +45,9 @@ const shells = await Promise.all(routes.map(async ([route, file]) => {
     if (!paths.length || !html.includes('</head>')) throw new Error(`Missing build shell at ${route}`)
     if (mode === 'stamp') {
         await writeFile(path, html.replace('</head>', `${marker(sha, route)}\n</head>`))
+        // Svelte's precompressed shells predate the stamp. Pages can compress
+        // the stamped HTML itself; leave all other precompressed assets intact.
+        await Promise.all(['br', 'gz'].map(ext => rm(`${path}.${ext}`, { force: true })))
     } else if (!hasMarker(html, sha, route)) {
         throw new Error(`Missing expected deployment marker in the local shell at ${route}`)
     }

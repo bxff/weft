@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -37,7 +37,11 @@ test('smoke requires the right live route, SHA, entry references and JavaScript'
     try {
         await writeFile(join(build, 'index.html'), shell)
         await writeFile(join(build, 'library.html'), shell)
+        for (const file of ['index.html.br', 'index.html.gz', 'library.html.br', 'library.html.gz', 'other.html.br']) {
+            await writeFile(join(build, file), 'pre-stamp data')
+        }
         await run('stamp', build, sha)
+        assert.deepEqual((await readdir(build)).sort(), ['index.html', 'library.html', 'other.html.br'])
         home = await readFile(join(build, 'index.html'), 'utf8')
         library = await readFile(join(build, 'library.html'), 'utf8')
         assert.notEqual(home, library)
