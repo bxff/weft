@@ -305,6 +305,88 @@ pub(crate) fn discard_staged_assets(
     };
 }
 
+/// Lazily reclaim completed files left by a stopped process. Never walk
+/// outside this page, remove unknown or temporary names, or guess what an
+/// absent, invalid or incomplete manifest might have protected.
+pub(crate) fn reclaim_interrupted_page(dir: &Path, budget: &mut Budget) -> io::Result<()> {
+    const MAX_ENTRIES: usize = 512;
+    const MAX_HASH_BYTES: u64 = 32 * 1024 * 1024;
+    let manifest = dir.join("checkpoint.json");
+    if !dir.symlink_metadata()?.is_dir() || !manifest.symlink_metadata()?.is_file() {
+        return Ok(());
+    }
+    let Some(saved) = load(dir) else {
+        return Ok(());
+    };
+    // Include the retained generation in this pass's byte cap. The caller
+    // serializes captures and reclaims for this page under one daemon; none of
+    // these files are in the live editor's tree.
+    let retained_bytes = std::iter::once(format!("{}.rm", saved.head.native_sha256))
+        .chain(
+            saved
+                .head
+                .assets
+                .iter()
+                .map(|asset| format!("{}.asset", asset.sha256)),
+        )
+        .try_fold(0_u64, |total, name| {
+            let meta = dir.join(name).symlink_metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let total = total.saturating_add(meta.len());
+            (total <= MAX_HASH_BYTES).then_some(total)
+        });
+    let Some(retained_bytes) = retained_bytes else {
+        return Ok(());
+    };
+    let mut left_to_hash = MAX_HASH_BYTES - retained_bytes;
+    let mut candidates = Vec::new();
+    for (i, entry) in std::fs::read_dir(dir)?.enumerate() {
+        if i >= MAX_ENTRIES {
+            return Ok(());
+        }
+        let entry = entry?;
+        let file = entry.file_name();
+        let Some(file) = file.to_str() else { continue };
+        let orphan = file
+            .strip_suffix(".rm")
+            .filter(|hash| *hash != saved.head.native_sha256)
+            .or_else(|| {
+                file.strip_suffix(".asset")
+                    .filter(|hash| !saved.head.assets.iter().any(|asset| asset.sha256 == *hash))
+            });
+        if let Some(hash) = orphan.filter(|hash| is_digest(hash)) {
+            let path = entry.path();
+            let meta = path.symlink_metadata()?;
+            if meta.is_file() && meta.len() <= left_to_hash {
+                left_to_hash -= meta.len();
+                if file_has_digest(&path, hash) {
+                    candidates.push((path, meta.len()));
+                }
+            }
+        }
+    }
+    if candidates.is_empty() || !verify_files(dir, &saved) {
+        return Ok(());
+    }
+    // If the prior process failed after rename, force the still-visible
+    // manifest to be durable before removing files an earlier one may need.
+    let folder = std::fs::File::open(dir)?;
+    folder.sync_all()?;
+    let mut removed_bytes = 0_u64;
+    for (path, len) in candidates {
+        std::fs::remove_file(path)?;
+        removed_bytes += len;
+    }
+    folder.sync_all()?;
+    // Credit only successfully unlinked, durably absent files. Failure
+    // overcounts until restart rather than risking extra writes, and does
+    // not require a recursive rescan of unknown children.
+    budget.used = budget.used.saturating_sub(removed_bytes);
+    Ok(())
+}
+
 pub(crate) fn commit(
     dir: &Path,
     checkpoint: Checkpoint,
@@ -530,6 +612,59 @@ mod tests {
         save_asset(&dir, &asset_hash, new_asset, Some(&mut budget)).unwrap();
         commit(&dir, next(), new_native, Some(&mut budget)).unwrap();
         assert!(verify_files(&dir, &load(&dir).unwrap()));
+    }
+
+    #[test]
+    fn restart_reclaims_quota_without_touching_saved_or_unknown_files() {
+        let disk = tempfile::tempdir().unwrap();
+        let dir = disk.path().join("page-a");
+        let page_b = disk.path().join("page-b");
+        let old_hash = sha256_hex(b"old image");
+        let mut saved = checkpoint(b"old native", 1);
+        saved.head.assets.push(AssetDigest {
+            name: "image.png".into(),
+            sha256: old_hash.clone(),
+        });
+        save_asset(&dir, &old_hash, b"old image", None).unwrap();
+        commit(&dir, saved, b"old native", None).unwrap();
+        let abandoned_hash = sha256_hex(b"orphan image");
+        save_asset(&dir, &abandoned_hash, b"orphan image", None).unwrap();
+        let abandoned_native = vec![7; 1024];
+        let orphan_native = dir.join(format!("{}.rm", sha256_hex(&abandoned_native)));
+        write_recovery_file(
+            &dir,
+            orphan_native.file_name().unwrap().to_str().unwrap(),
+            &abandoned_native,
+        )
+        .unwrap();
+        let unknown = dir.join(format!("{}.asset", sha256_hex(b"other data")));
+        std::fs::write(&unknown, b"not a matching digest").unwrap();
+        let mut budget = Budget::open(disk.path()).unwrap();
+        budget.limit = budget.used;
+        let unused_hash = sha256_hex(b"next image");
+        assert!(save_asset(&page_b, &unused_hash, b"next image", Some(&mut budget)).is_err());
+        let saved = load(&dir).unwrap();
+        let manifest = dir.join("checkpoint.json");
+        let good_manifest = std::fs::read(&manifest).unwrap();
+        std::fs::write(&manifest, b"unreadable checkpoint").unwrap();
+        reclaim_interrupted_page(&dir, &mut budget).unwrap();
+        assert!(orphan_native.exists());
+        assert!(has_asset(&dir, &abandoned_hash));
+        std::fs::write(&manifest, good_manifest).unwrap();
+        reclaim_interrupted_page(&dir, &mut budget).unwrap();
+        assert!(verify_files(&dir, &saved));
+        assert!(!orphan_native.exists());
+        assert!(!has_asset(&dir, &abandoned_hash));
+        assert!(unknown.exists());
+        save_asset(&page_b, &unused_hash, b"next image", Some(&mut budget)).unwrap();
+        let mut next = checkpoint(b"next native", 2);
+        next.head.assets.push(AssetDigest {
+            name: "next.png".into(),
+            sha256: unused_hash,
+        });
+        commit(&page_b, next, b"next native", Some(&mut budget)).unwrap();
+        assert!(verify_files(&page_b, &load(&page_b).unwrap()));
+        assert!(verify_files(&dir, &saved));
     }
 
     #[test]
