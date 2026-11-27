@@ -28,6 +28,15 @@ Three screens answer "is everything working":
 3. **Usage counters** — `GET /api/admin/stats` (admin users only): request /
    429 / 507 counters, per-user storage, doc counts.
 
+The desktop installer verifies official tablet binaries with GitHub's
+provenance service. Install [GitHub CLI](https://cli.github.com/) from a
+trusted source and run `gh auth login --hostname github.com` first.
+`weft setup` selects the highest stable tablet release; pass
+`--release tablet-vMAJOR.MINOR.PATCH` to request a specific verified release.
+If no such release is published or verification fails, setup stops before
+installing anything. For a source build you trust, pass `--local-daemon PATH`
+explicitly; the relay is not an installer download source.
+
 Update newer tablets by rerunning the desktop installer. They do not
 auto-install binaries from the relay: a checksum sent by the same server is
 not release authorization. Older installed builds are unchanged; migrate them

@@ -14,11 +14,10 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
+import { stageTabletDaemon } from './tablet-release'
 
 const command = process.argv[2]
 const flags = (() => {
@@ -30,6 +29,8 @@ const flags = (() => {
                 password: { type: 'string' },
                 cloud: { type: 'string' },
                 token: { type: 'string' },
+                release: { type: 'string' },
+                'local-daemon': { type: 'string' },
                 notebook: { type: 'string' },
                 'recovery-dir': { type: 'string' },
                 'native-dir': { type: 'string' },
@@ -53,46 +54,6 @@ const DRY = flags['dry-run']
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '../../..')
 const DAEMON_BIN = join(REPO_ROOT, 'device/target/aarch64-unknown-linux-musl/release/rmsyncd')
-
-/** Daemon binary for `arch`: a local source-tree build if present, otherwise
- *  downloaded from the cloud's release endpoint (the file tablets self-update
- *  from). */
-async function daemonBinary(arch: 'aarch64' | 'armv7'): Promise<string> {
-    const target = arch === 'armv7' ? 'armv7-unknown-linux-musleabihf' : 'aarch64-unknown-linux-musl'
-    const local = join(REPO_ROOT, `device/target/${target}/release/rmsyncd`)
-    if (existsSync(local)) return local
-    if (!CLOUD || !TOKEN) {
-        console.error(
-            'no daemon binary: not in a source tree and no --cloud/--token to download from.\n' +
-                'Use the setup page (it fills both in), or build from source:\n' +
-                `  cd device && cargo zigbuild --release --target ${target}`,
-        )
-        process.exit(1)
-    }
-    process.stdout.write(`  downloading daemon (${arch}) from ${CLOUD} ... `)
-    const r = await fetch(`${CLOUD}/api/daemon/release?arch=${arch}`, {
-        headers: { 'x-device-token': TOKEN },
-    }).catch((e: unknown) => {
-        console.error(`\ncouldn't reach ${CLOUD}: ${e instanceof Error ? e.message : e}`)
-        return process.exit(1)
-    })
-    if (!r.ok) {
-        console.error(
-            `\ndaemon download failed (${r.status})${r.status === 401 ? ' — bad or expired token' : ''}` +
-                `${r.status === 404 && arch === 'armv7' ? ' — the server has no armv7 release yet' : ''}`,
-        )
-        process.exit(1)
-    }
-    const bytes = new Uint8Array(await r.arrayBuffer())
-    if (bytes.length < 1024 * 1024 || bytes[0] !== 0x7f || bytes[1] !== 0x45) {
-        console.error('\ndownloaded file does not look like the daemon binary')
-        process.exit(1)
-    }
-    const path = join(tmpdir(), `weft-rmsyncd-${process.pid}`)
-    writeFileSync(path, bytes)
-    console.log(`ok (${(bytes.length / 1024 / 1024).toFixed(1)} MB)`)
-    return path
-}
 
 const INSTALL_DIR = '/home/root/weft'
 
@@ -399,9 +360,25 @@ async function setup(): Promise<void> {
         process.exit(1)
     }
     step('check firmware compatibility', ssh(firmwarePreflight))
-    const daemonBin = DRY ? DAEMON_BIN : await daemonBinary(isArm32 ? 'armv7' : 'aarch64')
-    step('create install dir', ssh(`mkdir -p ${INSTALL_DIR}`))
-    step('deploy daemon', scp(daemonBin, `${INSTALL_DIR}/rmsyncd.new`))
+    if (DRY) {
+        step('create install dir', ssh(`mkdir -p ${INSTALL_DIR}`))
+        step('deploy daemon', scp(DAEMON_BIN, `${INSTALL_DIR}/rmsyncd.new`))
+    } else {
+        const daemon = stageTabletDaemon(isArm32 ? 'armv7' : 'aarch64', {
+            tag: flags.release,
+            local: flags['local-daemon'],
+        })
+        if (daemon.tag) console.log(`  verified GitHub release ${daemon.tag}`)
+        else console.log('  using the explicitly supplied trusted local build')
+        process.once('exit', daemon.remove)
+        try {
+            step('create install dir', ssh(`mkdir -p ${INSTALL_DIR}`))
+            step('deploy daemon', scp(daemon.path, `${INSTALL_DIR}/rmsyncd.new`))
+        } finally {
+            process.removeListener('exit', daemon.remove)
+            daemon.remove()
+        }
+    }
     // file contents travel via stdin, never heredocs inside joined commands
     console.log(
         `  config: store-timeout=${STORE_TIMEOUT}ms, auto-reinstall=${AUTO_REINSTALL ? 'on' : 'off'}, ` +
@@ -571,7 +548,8 @@ async function restoreNotebook(): Promise<void> {
 
 switch (command) {
     case 'setup':
-        await setup()
+        try { await setup() }
+        catch (e) { console.error(e instanceof Error ? e.message : 'Setup failed'); process.exitCode = 1 }
         break
     case 'doctor':
         doctor()
@@ -587,6 +565,6 @@ switch (command) {
         catch (e) { console.error(e instanceof Error ? e.message : 'Restore failed'); process.exitCode = 1 }
         break
     default:
-        console.log('usage: weft <setup [--store-timeout ms] [--no-auto-reinstall] [--experimental-rm2] [--cloud URL --token chd_...]|doctor|uninstall|link|restore-notebook> --host root@10.11.99.1 [--password X] [--dry-run]')
+        console.log('usage: weft <setup [--release tablet-vMAJOR.MINOR.PATCH | --local-daemon PATH] [--store-timeout ms] [--no-auto-reinstall] [--experimental-rm2] [--cloud URL --token chd_...]|doctor|uninstall|link|restore-notebook> --host root@10.11.99.1 [--password X] [--dry-run]')
         process.exit(command && command !== '--help' && command !== '-h' ? 1 : 0)
 }

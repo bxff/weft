@@ -14,7 +14,14 @@ test.each(['success', 'mask', 'stop', 'restart', 'health', 'upgrade'])('manual s
         ]) mkdirSync(path(name), { recursive: true })
         const cli = path('apps/cli/src/cli.ts')
         copyFileSync(join(import.meta.dir, '../src/cli.ts'), cli)
-        writeFileSync(path('device/target/aarch64-unknown-linux-musl/release/rmsyncd'), '')
+        copyFileSync(join(import.meta.dir, '../src/tablet-release.ts'), path('apps/cli/src/tablet-release.ts'))
+        const local = path('device/target/aarch64-unknown-linux-musl/release/rmsyncd')
+        const elf = Buffer.alloc(64)
+        elf.writeUInt32BE(0x7f454c46, 0)
+        elf[4] = 2
+        elf[5] = elf[6] = 1
+        elf.writeUInt16LE(183, 18)
+        writeFileSync(local, elf)
         writeFileSync(path('usr/bin/rm-sync'), 'signal name="documentFinished"\n type="(ay)"\n type="a(ay)"\n type="a(ay)"')
         writeFileSync(path('home/root/weft/cloud.json'), 'original config')
         writeFileSync(path('home/root/weft/rmsyncd'), 'original daemon')
@@ -72,7 +79,7 @@ case "$*" in
 esac
 `)
         const run = Bun.spawnSync([
-            process.execPath, cli, 'setup', '--no-auto-reinstall', '--cloud', 'https://relay.example', '--token', 'sample',
+            process.execPath, cli, 'setup', '--no-auto-reinstall', '--local-daemon', local, '--cloud', 'https://relay.example', '--token', 'sample',
         ], {
             env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, TABLET: dir, FAILURE: failure, RM_SSH_PASS: '' },
         })
