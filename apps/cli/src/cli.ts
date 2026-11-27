@@ -558,5 +558,5 @@ switch (command) {
         break
     default:
         console.log('usage: weft <setup [--store-timeout ms] [--no-auto-reinstall] [--experimental-rm2] [--cloud URL --token chd_...]|doctor|uninstall|link> --host root@10.11.99.1 [--password X] [--dry-run]')
-        process.exit(command ? 1 : 0)
+        process.exit(command && command !== '--help' && command !== '-h' ? 1 : 0)
 }
