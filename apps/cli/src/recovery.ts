@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { join, relative, resolve } from 'node:path'
 
-const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
+const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 const digest = /^[0-9a-f]{64}$/
 const assetName = /^[a-zA-Z0-9_-]{1,64}\.(?:png|jpe?g)$/
 const maxFileBytes = 32 * 1024 * 1024
@@ -45,15 +45,15 @@ function notebookPages(content: Record<string, unknown>): Page[] {
         const page = object(p)
         if ('deleted' in page) continue
         const id = page.id
-        if (typeof id !== 'string' || !uuid.test(id) || seen.has(id.toLowerCase())) throw Error('Invalid or duplicate native page ID')
-        seen.add(id.toLowerCase())
+        if (typeof id !== 'string' || !uuid.test(id) || seen.has(id)) throw Error('Invalid or duplicate native page ID')
+        seen.add(id)
         const template = page.template == null ? undefined : object(page.template).value
         if (template != null && template !== '' && template !== 'Blank') {
             throw Error('This restore command currently supports blank-template notebooks only')
         }
         pages.push({ id })
     }
-    if (!pages.length) throw Error('No live native pages to restore')
+    if (!pages.length || pages.length > 256) throw Error('Restore requires 1–256 live native pages')
     return pages
 }
 
@@ -72,7 +72,7 @@ export function prepareNotebookRestore(opts: { notebookId: string; recoveryDirec
         throw Error('PDF and EPUB restore are outside this notebook-only command')
     }
     const name = nativeMetadata.visibleName
-    if (typeof name !== 'string' || !name.trim()) throw Error('Missing native notebook name')
+    if (typeof name !== 'string' || !name.trim() || name.length > 256) throw Error('Invalid native notebook name')
     const pageList = notebookPages(nativeContent)
     let bodyByteBudget = 0
     const pages = pageList.map(({ id: page }) => {
