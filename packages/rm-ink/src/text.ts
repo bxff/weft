@@ -9,7 +9,8 @@
 import type { Font, Path } from 'opentype.js'
 import type { Xy } from './points'
 import { polylineToPoints, type InkStroke } from './points'
-import { tldrawWidthToRmMarkerWidth, RM_SCALE } from './pen'
+import { tldrawWidthToRmMarkerWidth, rmMarkerWidthToRadius, RM_SCALE } from './pen'
+import { insetGlyphFill } from './glyph-fill'
 import { mapToRmSpace, type ShapeTransform } from './transform'
 
 export interface TextLayout {
@@ -180,8 +181,8 @@ export function fillContours(contours: Xy[][], pitch: number): Xy[][] {
 /**
  * Project a text run to contour strokes, one GlyphPart per glyph.
  * Coordinates are produced in RM page space using `shape`'s transform.
- * Glyph interiors are FILLED (scanline serpentine; fillContours) — the
- * outline alone renders hollow letterforms on the device.
+ * Glyph interiors are filled with inset marker strokes, rather than thickening
+ * the letter by tracing a marker centered on its outer and inner boundaries.
  */
 export interface TextBox {
     /** Wrap width in the SAME units as fontSize (shape-local px, scale folded
@@ -290,7 +291,9 @@ export function textToGlyphParts(
     const lineBox = fontSize * lineHeight
     const baselineOf = (line: number) => line * lineBox + (lineBox - (asc + desc)) / 2 + asc
     const strokeWidth = Math.max(0.3, fontSize * 0.04)
-    const rmWidth = tldrawWidthToRmMarkerWidth(strokeWidth)
+    const width = tldrawWidthToRmMarkerWidth(strokeWidth)
+    const widths = [...new Set([width, Math.max(1, Math.floor(width / 2)), 1])]
+    const radii = widths.map(rmMarkerWidthToRadius)
     const advanceOf = (ch: string) => glyphAdvance(font, fontSize, ch)
     const wrapW = box.width && box.width > 0 ? box.width : Infinity
     const align = box.align ?? 'start'
@@ -302,18 +305,13 @@ export function textToGlyphParts(
             const glyph = font.charToGlyph(ch)
             const path = glyph.getPath(x, baseline, fontSize)
             const contours = extractContours(path).filter((c) => c.length >= 4)
-            for (const contour of contours) {
-                strokes.push({
-                    points: polylineToPoints(mapToRmSpace(contour, shape), { width: rmWidth }),
-                    color: rmColor,
-                })
-            }
-            // fill the interior: outline alone is hollow on the device.
-            for (const fill of fillContours(contours, strokeWidth * 0.8)) {
-                strokes.push({
-                    points: polylineToPoints(mapToRmSpace(fill, shape), { width: rmWidth }),
-                    color: rmColor,
-                })
+            for (const { paths, widthIndex } of insetGlyphFill(contours, radii)) {
+                for (const path of paths) {
+                    strokes.push({
+                        points: polylineToPoints(mapToRmSpace(path, shape), { width: widths[widthIndex]! }),
+                        color: rmColor,
+                    })
+                }
             }
         } catch {
             // unknown glyph: advance only

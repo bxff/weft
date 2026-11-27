@@ -146,6 +146,7 @@ test('the native column keeps tablet-compatible marks across shortcuts and paste
     request,
     baseURL,
 }) => {
+    await page.setViewportSize({ width: 1440, height: 900 })
     const doc = crypto.randomUUID()
     const sheet = crypto.randomUUID()
     await openNotebook(context, page, baseURL!, doc, sheet)
@@ -159,11 +160,35 @@ test('the native column keeps tablet-compatible marks across shortcuts and paste
             create: {},
             inserts: [{ afterKey: null, text: 'Test' }],
         })
-        window.__weftEditor.setEditingShape('shape:device-text' as TLShapeId)
+        const editor = window.__weftEditor
+        const timers = editor.timers
+        const setTimeout = timers.setTimeout
+        // Release the SDK retry after selection instead of racing the 100 ms timer.
+        timers.setTimeout = (callback, delay, ...args) => {
+            if (typeof callback !== 'function' || delay !== 100 || editor.getEditingShapeId() !== 'shape:device-text')
+                return setTimeout.call(timers, callback, delay, ...args)
+            timers.setTimeout = setTimeout
+            Object.assign(window, { releaseNativeEntryFocus: () => callback(...args) })
+            return setTimeout.call(timers, () => {}, delay)
+        }
     })
+    const deviceText = page.getByTestId('tools.device-text')
+    await deviceText.click()
     const column = page.locator('[data-shape-type="device-text"] .ProseMirror')
     await expect(column).toBeFocused()
-    await page.evaluate(() => window.__weftEditor.getRichTextEditor()!.commands.selectAll())
+    await expect.poll(() => page.evaluate(() => !!window.__weftEditor.getRichTextEditor())).toBe(true)
+    const selection = await page.evaluate(async () => {
+        const editor = window.__weftEditor.getRichTextEditor()!
+        editor.commands.selectAll()
+        const text = () => editor.state.doc.textBetween(editor.state.selection.from, editor.state.selection.to)
+        const before = text()
+        const release = (window as Window & { releaseNativeEntryFocus?: () => void }).releaseNativeEntryFocus
+        if (!release) throw new Error('Missing native edit-entry focus retry')
+        release()
+        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+        return [before, text()]
+    })
+    expect(selection).toEqual(['Test', 'Test'])
     const modifier = await page.evaluate(() =>
         /Mac/.test(navigator.platform) ? 'Meta' : 'Control',
     )
@@ -238,6 +263,17 @@ test('the native column keeps tablet-compatible marks across shortcuts and paste
             ],
             [['#### body', false, false]],
         ])
+    // A normal re-entry without a selection change still focuses the end.
+    await deviceText.click()
+    await expect(column).toBeFocused()
+    await expect
+        .poll(() => page.evaluate(() => {
+            const editor = window.__weftEditor.getRichTextEditor()
+            if (!editor) return false
+            const { doc, selection } = editor.state
+            return selection.empty && selection.from === doc.content.size - 1
+        }))
+        .toBe(true)
 })
 
 test('native HTML paste preserves mark precedence and break spacing', async ({

@@ -5,6 +5,7 @@ const worker = self as unknown as ServiceWorkerGlobalScope
 const cachePrefix = `weft-shell:${worker.registration.scope}:`
 const cacheName = cachePrefix + version
 const shell = `${base}/app/shell/shell.html`
+const cleanShell = `${base}/app/shell/shell`
 const environment = `${base}/_app/env.js`
 const immutable = new Set(build.filter((path) => path.startsWith(`${base}/_app/immutable/`)))
 const fonts = files.filter((path) => path.startsWith(`${base}/fonts/`) && /\.(?:[ot]tf|woff2?)$/.test(path))
@@ -13,7 +14,16 @@ const publicAssets = new Set([environment, ...immutable, ...fonts])
 async function fetchPublicFile(path: string, alreadyRequested = false): Promise<Response> {
     const cache = alreadyRequested || immutable.has(path) ? 'force-cache'
         : path === shell || path === environment ? 'reload' : 'default'
-    const response = await fetch(path, { credentials: 'omit', redirect: 'error', cache })
+    const options: RequestInit = { credentials: 'omit', redirect: 'error', cache }
+    let response: Response
+    try {
+        response = await fetch(path, options)
+    } catch (error) {
+        if (path !== shell) throw error
+        // Pages redirects .html URLs. Fetch the known same-origin clean URL
+        // directly so the cached response itself isn't a redirected response.
+        response = await fetch(cleanShell, options)
+    }
     const type = response.headers.get('content-type')?.split(';')[0]?.trim()
     const usable = path === shell ? type === 'text/html'
         : /\.m?js$/.test(path) ? /^(?:text|application)\/(?:java|ecma)script$/.test(type ?? '')

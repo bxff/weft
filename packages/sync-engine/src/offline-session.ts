@@ -4,6 +4,7 @@
  * KeyValueStorage; reconcile() syncs with the tablet as a peer, tolerant of any offline duration.
  */
 
+import { encodePublicationBytes, newPublicationId, type BrowserPublication } from './browser-publication'
 import { RmDocument } from '@weft/rm-format'
 import { applyOps, type ApplyOptions, type LocalOp } from './apply-ops'
 import { diffPage, snapshotKnownState } from './differ'
@@ -17,7 +18,7 @@ import {
     type Op,
     type TombstoneOp,
 } from './ops'
-import { decodeSnapshot, encodeSnapshot } from './snapshot'
+import { decodeSnapshot, encodeSnapshot, encodeSnapshotBatch } from './snapshot'
 import { applyMoveRewrites, auditOverlay, reconcile as reconcilePolicy } from './reconciler'
 import type { KeyValueStorage } from './storage'
 import type { OpRecord, PageEvent, Transport } from './transport'
@@ -28,6 +29,26 @@ import {
     type OverlayShape,
     type ViewPatch,
 } from './types'
+
+function decodePending(bytes: Uint8Array): { ops: LocalOp[]; publication: BrowserPublication | undefined } {
+    const saved = JSON.parse(new TextDecoder().decode(bytes))
+    const ops = Array.isArray(saved) ? saved : saved?.version === 1 ? saved.ops : null
+    if (!Array.isArray(ops) || !ops.every(op => op && typeof op.type === 'string')) {
+        throw new Error('Invalid pending save queue')
+    }
+    const publication = Array.isArray(saved) ? undefined : saved.publication as BrowserPublication
+    if (publication && (
+        typeof publication.id !== 'string' || typeof publication.payload !== 'string' ||
+        (publication.kind !== 'ops' && publication.kind !== 'snapshot') ||
+        !Number.isSafeInteger(publication.count) || publication.count < 1 || publication.count > ops.length ||
+        !Number.isSafeInteger(publication.baseSeq) || publication.baseSeq < 0
+    )) throw new Error('Invalid prepared save')
+    return { ops, publication }
+}
+
+function encodePending(ops: LocalOp[], publication?: BrowserPublication): Uint8Array {
+    return new TextEncoder().encode(JSON.stringify(publication ? { version: 1, ops, publication } : ops))
+}
 
 interface PersistedState {
     baseRevision: string
@@ -93,12 +114,17 @@ export interface OfflineSessionOptions extends ApplyOptions {
      * never set it (third-party apps should pass their app name).
      */
     historyAuthor?: string
+    /** Enable only after the relay supports guarded save receipts. */
+    guardedSaves?: boolean
 }
 
 export class OfflineSession {
     private baseDoc!: RmDocument
     private baseRevision = ''
     private pendingOps: LocalOp[] = []
+    private publication: BrowserPublication | undefined
+    private confirmedPrefix = 0
+    private deferredOrphan = false
     private checkpointDirty = false
     private pendingWrites = Promise.resolve()
     private overlay: OverlayDocument = { shapes: [] }
@@ -147,7 +173,10 @@ export class OfflineSession {
         if (session.bootstrapped || session.pendingOps.length) opts.onPageAvailable?.()
         session.unsubscribe = transport.subscribe((event) => void session.onRemote(event), () => void session.reconcile())
         session.retryTimer = setInterval(
-            () => void session.reconcile(),
+            () => {
+                if (session.opts.guardedSaves && session.cachePrimary) session.deferredOrphan = true
+                void session.reconcile()
+            },
             opts.retryIntervalMs ?? 15_000,
         )
         // first reconcile in the background; local state is usable immediately
@@ -164,17 +193,18 @@ export class OfflineSession {
         // per-author key: two tabs can never clobber each other's unflushed ops
         const pendingRaw = await this.storage.get(this.pendingKey())
         if (pendingRaw) {
-            try {
-                this.pendingOps = JSON.parse(new TextDecoder().decode(pendingRaw)) as LocalOp[]
-            } catch {
-                this.pendingOps = [] // corrupt queue: nothing safe to replay
-            }
+            const saved = decodePending(pendingRaw)
+            this.pendingOps = saved.ops
+            this.publication = saved.publication
         }
         if (baseBytes && stateRaw) {
             // local replica exists: offline-capable immediately
             this.baseDoc = RmDocument.parse(baseBytes)
             const state = JSON.parse(new TextDecoder().decode(stateRaw)) as PersistedState
             this.baseRevision = state.baseRevision
+            this.overlay = state.overlay
+            this.opCursor = state.opCursor ?? 0
+            this.lastSnapshotSeq = state.lastSnapshotSeq ?? 0
             // LEGACY migration: pending ops used to live in the state blob.
             // Only the cache primary adopts them (a second tab adopting too
             // would double-flush; each applyOps run mints fresh ids, so the
@@ -185,9 +215,6 @@ export class OfflineSession {
                 await this.persistPending()
                 await this.persist()
             }
-            this.overlay = state.overlay
-            this.opCursor = state.opCursor ?? 0
-            this.lastSnapshotSeq = state.lastSnapshotSeq ?? 0
             // a persisted replica is already bootstrapped (it has a cursor +
             // base); pull resumes from opCursor.
             this.bootstrapped = true
@@ -203,13 +230,7 @@ export class OfflineSession {
         this.opCursor = 0
     }
 
-    private async persist(gen = this.generation, nativeBytes?: Uint8Array): Promise<void> {
-        // one maintainer per page across tabs (the cache primary); a second
-        // writer would interleave a base from one tab with a cursor from
-        // another. Pending ops live under per-author keys (persistPending).
-        const active = () => gen === this.generation && (!this.disposed || this.drainingWrites) && this.cachePrimary
-        if (this.disposed || !active()) return
-        this.checkpointDirty = true
+    private checkpointEntries(nativeBytes?: Uint8Array) {
         const base = nativeBytes ?? this.baseDoc.serialize()
         const state: PersistedState = {
             baseRevision: this.baseRevision,
@@ -218,7 +239,18 @@ export class OfflineSession {
             lastSnapshotSeq: this.lastSnapshotSeq,
         }
         const stateBytes = new TextEncoder().encode(JSON.stringify(state))
-        const write = this.storage.setPair([this.key('base'), base], [this.key('state'), stateBytes], active)
+        return [[this.key('base'), base], [this.key('state'), stateBytes]] as const
+    }
+
+    private async persist(gen = this.generation, nativeBytes?: Uint8Array): Promise<void> {
+        // one maintainer per page across tabs (the cache primary); a second
+        // writer would interleave a base from one tab with a cursor from
+        // another. Pending ops live under per-author keys (persistPending).
+        const active = () => gen === this.generation && (!this.disposed || this.drainingWrites) && this.cachePrimary
+        if (this.disposed || !active()) return
+        this.checkpointDirty = true
+        const [base, state] = this.checkpointEntries(nativeBytes)
+        const write = this.storage.setPair(base, state, active)
         this.checkpointWrites.add(write)
         try {
             await write
@@ -246,7 +278,7 @@ export class OfflineSession {
         }
         await this.storage.set(
             this.pendingKey(),
-            new TextEncoder().encode(JSON.stringify(this.pendingOps)),
+            encodePending(this.pendingOps, this.publication),
         )
     }
 
@@ -258,6 +290,7 @@ export class OfflineSession {
     private async adoptOrphanPending(): Promise<void> {
         const transfer = this.storage.setAndDelete?.bind(this.storage)
         if (!this.cachePrimary || !this.opts.adoptOrphanAuthor || !transfer) return
+        this.deferredOrphan = false
         const prefix = this.key('pending/')
         for (const key of await this.storage.keys(prefix)) {
             if (this.disposed) return
@@ -266,25 +299,25 @@ export class OfflineSession {
             await this.opts.adoptOrphanAuthor(author, async () => {
                 const raw = await this.storage.get(key)
                 if (!raw) return
-                let ops: LocalOp[]
-                try {
-                    ops = JSON.parse(new TextDecoder().decode(raw)) as LocalOp[]
-                } catch {
-                    return // preserve unreadable source bytes
-                }
-                if (!Array.isArray(ops) || !ops.every((op) => op && typeof op.type === 'string')) {
-                    return
-                }
+                let saved: ReturnType<typeof decodePending>
+                try { saved = decodePending(raw) } catch { return } // keep unreadable bytes
+                const { ops, publication } = saved
                 await this.writePending(async () => {
                     if (this.disposed) return
                     if (ops.length === 0) {
                         await this.storage.delete(key)
                         return
                     }
+                    // An immutable prefix cannot be inserted behind other edits.
+                    if (publication && this.pendingOps.length) {
+                        this.deferredOrphan = true
+                        return
+                    }
                     const combined = [...this.pendingOps, ...ops]
-                    const bytes = new TextEncoder().encode(JSON.stringify(combined))
-                    await transfer(this.pendingKey(), bytes, key)
+                    const adopted = publication ?? this.publication
+                    await transfer(this.pendingKey(), encodePending(combined, adopted), key)
                     this.pendingOps = combined
+                    this.publication = adopted
                     this.pendingVersion++
                 })
             })
@@ -344,6 +377,7 @@ export class OfflineSession {
     }
 
     private buildView(): { doc: RmDocument; overlay: OverlayDocument } {
+        const pending = this.confirmedPrefix ? this.pendingOps.slice(this.confirmedPrefix) : this.pendingOps
         const key = this.viewKey
         if (this.viewCache && this.viewCache.key === key) return this.viewCache
         // Fast path: with no pending local ops, the view IS the base — return
@@ -355,7 +389,7 @@ export class OfflineSession {
         // which can't be frozen, but freezing the block array stops the main
         // add/remove/replace vector. Safe because base is only ever read or
         // replaced wholesale, never mutated in place.
-        if (this.pendingOps.length === 0) {
+        if (pending.length === 0) {
             if (!Object.isFrozen(this.baseDoc)) {
                 Object.freeze(this.baseDoc.blocks)
                 Object.freeze(this.baseDoc)
@@ -374,23 +408,23 @@ export class OfflineSession {
             incr &&
             incr.base === this.baseDoc &&
             incr.overlayVersion === this.overlayVersion &&
-            incr.applied.length <= this.pendingOps.length &&
-            incr.applied.every((op, i) => op === this.pendingOps[i])
+            incr.applied.length <= pending.length &&
+            incr.applied.every((op, i) => op === pending[i])
         ) {
-            applyOps(incr.doc, incr.overlay, this.pendingOps.slice(incr.applied.length), this.opts)
-            incr.applied = [...this.pendingOps]
+            applyOps(incr.doc, incr.overlay, pending.slice(incr.applied.length), this.opts)
+            incr.applied = [...pending]
             this.viewCache = { key, doc: incr.doc, overlay: incr.overlay }
             return this.viewCache
         }
         const doc = RmDocument.parse(this.baseDoc.serialize())
         const overlay = structuredClone(this.overlay)
-        applyOps(doc, overlay, this.pendingOps, this.opts)
+        applyOps(doc, overlay, pending, this.opts)
         this.viewIncr = {
             doc,
             overlay,
             base: this.baseDoc,
             overlayVersion: this.overlayVersion,
-            applied: [...this.pendingOps],
+            applied: [...pending],
         }
         this.viewCache = { key, doc, overlay }
         return this.viewCache
@@ -513,6 +547,29 @@ export class OfflineSession {
             // to record its acknowledgement behind a storage transfer.
             await this.pendingWrites
             if (gen !== this.generation || this.disposed) return
+            // A saved request may already have committed. Resolve it before
+            // observing new state and minting more IDs from raw actions.
+            if (this.publication || this.opts.guardedSaves) {
+                if (!this.transport.publishBrowserSave || !this.storage.commitSave) {
+                    throw new Error('Guarded save support unavailable')
+                }
+                if (!this.pendingOps.length && this.deferredOrphan) await this.adoptOrphanPending()
+                if (!this.publication) {
+                    const skipped = await this.pullOps(gen)
+                    await this.pendingWrites
+                    if (skipped && this.pendingOps.length && gen === this.generation && !this.disposed) {
+                        await this.pullOps(gen, true)
+                    }
+                    await this.preparePublication(gen)
+                }
+                const retry = await this.deliverPublication(gen)
+                if (gen !== this.generation || this.disposed) return
+                this.status(this.pendingOps.length ? { state: 'pending', ops: this.pendingOps.length } : { state: 'synced' })
+                if (retry) this.scheduleQuickRetry()
+                else if (this.pendingOps.length || this.deferredOrphan) void this.reconcile()
+                else this.quickRetryBackoff = 1_000
+                return
+            }
             // pull BEFORE push: caught up to the head first means a snapshot we
             // publish for an incomplete op reflects all foreign state, and the
             // common case (foreign changes, no local pending) is one round-trip.
@@ -561,6 +618,76 @@ export class OfflineSession {
             this.quickRetryTimer = null
             void this.reconcile()
         }, delay)
+    }
+
+    private async preparePublication(gen: number): Promise<void> {
+        await this.writePending(async () => {
+            if (this.disposed || gen !== this.generation || !this.pendingOps.length || this.publication) return
+            const doc = RmDocument.parse(this.baseDoc.serialize())
+            const overlay = structuredClone(this.overlay)
+            const { deltas, complete } = applyOps(doc, overlay, this.pendingOps, this.opts)
+            const blobs = deltas.map(encodeOp)
+            const baseSeq = this.lastSnapshotSeq
+            const author = this.opts.historyAuthor ?? this.opts.authorUuid
+            const isOps = complete && blobs.length > 0
+            const publication: BrowserPublication = {
+                id: newPublicationId(), baseSeq, count: this.pendingOps.length,
+                kind: isOps ? 'ops' : 'snapshot',
+                payload: isOps ? JSON.stringify({ baseSeq, batch: { ops: blobs.map(encodePublicationBytes), author } })
+                    : encodePublicationBytes(encodeSnapshotBatch({ snapshot: encodeSnapshot(doc.serialize(), overlay), deltas: blobs, author })),
+            }
+            await this.storage.set(this.pendingKey(), encodePending(this.pendingOps, publication))
+            this.publication = publication
+        })
+    }
+
+    /** true means retry with backoff; only an explicit unaccepted stale
+     * response permits throwing away wire bytes or preparing a new request. */
+    private async deliverPublication(gen: number): Promise<boolean> {
+        const publication = this.publication
+        const active = () => !this.disposed && gen === this.generation && this.publication === publication
+        if (!publication || !active()) return false
+        const receipt = await this.transport.publishBrowserSave!(this.docId, this.pageId, publication)
+        if (!active()) return false
+        if (receipt.kind === 'stale' && this.pendingOps.some(op =>
+            op.type === 'edit-root-text' && (
+                op.inserts?.some(insert => insert.afterKey !== null) ||
+                op.deleteKeys?.length || op.styles?.length
+            )
+        )) {
+            // These intents still contain file-local author indexes. A
+            // replacement can reorder authors; do not write to a wrong anchor.
+            throw new Error('Cannot yet rebase pending native text anchors safely')
+        }
+        if (receipt.kind !== 'stale') {
+            await this.pullOps(gen, true, (seq, cursor) => {
+                const present = receipt.kind === 'ops' ? cursor >= receipt.lastSeq : seq >= receipt.seq
+                if (!present) throw new Error('Relay save is not yet readable')
+                // Apply the authoritative checkpoint without replaying the
+                // acknowledged prefix in the optimistic editor view.
+                this.confirmedPrefix = publication.count
+                this.pendingVersion++
+            }, false)
+        }
+        await this.writePending(async () => {
+            if (!active()) return
+            const rest = receipt.kind === 'stale' ? this.pendingOps : this.pendingOps.slice(publication.count)
+            const queue = rest.length ? encodePending(rest) : null
+            if (receipt.kind === 'stale') {
+                if (queue) await this.storage.set(this.pendingKey(), queue)
+            } else {
+                const commit = this.storage.commitSave?.bind(this.storage)
+                if (!commit) throw new Error('Atomic save storage unavailable')
+                const checkpoint = this.cachePrimary ? this.checkpointEntries() : []
+                if (!await commit(checkpoint, this.pendingKey(), queue, active)) return
+                if (this.cachePrimary && checkpoint.length) this.checkpointDirty = false
+            }
+            this.pendingOps = rest
+            this.publication = undefined
+            this.confirmedPrefix = 0
+            this.pendingVersion++
+        })
+        return receipt.kind === 'stale'
     }
 
     /** Push pending local ops as commutative deltas. opCursor is NOT advanced
@@ -623,7 +750,12 @@ export class OfflineSession {
     }
 
     /** Stage the snapshot and its operation tail before replacing the current page. */
-    private async pullOps(gen: number): Promise<boolean> {
+    private async pullOps(
+        gen: number,
+        forceTail = false,
+        beforeFold?: (snapshotSeq: number, cursor: number) => void,
+        persistCheckpoint = true,
+    ): Promise<boolean> {
         const active = () => gen === this.generation && !this.disposed
         const connection = this.transport.pageEventsConnection
         const sinceSnapshot = this.bootstrapped ? this.lastSnapshotSeq : undefined
@@ -631,7 +763,7 @@ export class OfflineSession {
         if (!active()) return false
         if (snap && sinceSnapshot !== undefined && snap.seq <= sinceSnapshot) snap = null
         // A live socket covers edits accepted after this checkpoint was read.
-        const skipTail = sinceSnapshot === undefined && snap?.complete === true &&
+        const skipTail = !forceTail && sinceSnapshot === undefined && snap?.complete === true &&
             connection !== undefined && connection === this.transport.pageEventsConnection &&
             this.pendingOps.length === 0
         let records: OpRecord[]
@@ -648,6 +780,9 @@ export class OfflineSession {
         if (!active()) return false
 
         const batch = records.map((r) => decodeOp(r.op))
+        const replacement = snap ? decodeSnapshot(snap.bytes) : null
+        const replacementDoc = replacement ? RmDocument.parse(replacement.rm) : null
+        beforeFold?.(snap?.seq ?? this.lastSnapshotSeq, records.at(-1)?.seq ?? snap?.opSeq ?? this.opCursor)
         // A replacement paints the final checkpoint and tail together. Keep
         // follow-up repairs separate, after the source shapes are installed.
         const publishReplacement = snap ? this.opts.onPatchBatch : undefined
@@ -658,9 +793,9 @@ export class OfflineSession {
         } : undefined
         const previous = snap && !snap.revert && this.bootstrapped ? this.baseDoc : null
         let nativeBytes: Uint8Array | undefined
-        if (snap) {
-            const { rm, overlay } = decodeSnapshot(snap.bytes)
-            this.baseDoc = RmDocument.parse(rm)
+        if (snap && replacement && replacementDoc) {
+            const { rm, overlay } = replacement
+            this.baseDoc = replacementDoc
             nativeBytes = rm
             // The explicit revert can rewind versions. Ordinary checkpoints merge
             // with the existing overlay to retain already-known newer records.
@@ -695,7 +830,7 @@ export class OfflineSession {
             for (const repair of repairs) this.opts.onPatch(repair)
         }
         const first = !this.bootstrapped
-        if (first || snap || records.length || this.checkpointDirty) {
+        if (persistCheckpoint && (first || snap || records.length || this.checkpointDirty)) {
             await this.persist(gen, records.length || repaired ? undefined : nativeBytes)
         }
         if (!active()) return false

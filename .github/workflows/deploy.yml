@@ -1,0 +1,65 @@
+name: Deploy Weft VPS
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/deploy.yml'
+      - 'scripts/deploy-vps-ci.sh'
+      - 'scripts/test-deploy.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: deploy-vps-production
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - run: bash scripts/test-deploy.sh
+      - name: Require a successful push CI run for this exact commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          green=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event push \
+            --branch main --commit "$GITHUB_SHA" --status success --limit 1 --json headSha \
+            --jq '.[0].headSha // ""')
+          [[ "$green" == "$GITHUB_SHA" ]] || { echo "CI has not passed on this exact main commit."; exit 1; }
+
+  vps:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Restrict this protected environment to main in GitHub settings.
+    environment: vps-production
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Stage and deploy the relay
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ vars.VPS_PORT }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          VPS_DEPLOY_ENABLED: ${{ vars.VPS_DEPLOY_ENABLED }}
+        run: |
+          if [[ "$VPS_DEPLOY_ENABLED" != true ]]; then
+            echo "VPS deployment is disabled. Verify the dedicated production environment before enabling."
+            exit 1
+          fi
+          bash scripts/deploy-vps-ci.sh

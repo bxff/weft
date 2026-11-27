@@ -3,6 +3,8 @@
  * Reconnecting WebSocket with backoff; typed EngineFailure errors.
  */
 
+import { decodePublicationBytes, type BrowserPublication, type BrowserReceipt } from './browser-publication'
+import { SNAPSHOT_BATCH_CONTENT_TYPE } from './snapshot'
 import { EngineFailure, type OverlayDocument } from './types'
 import type { DocumentInfo, OpRecord, PageEvent, PutResult, Transport } from './transport'
 
@@ -22,6 +24,8 @@ function b64ToBytes(b64: string): Uint8Array {
 export interface HttpTransportOptions {
     /** e.g. "http://10.11.99.1:9000" — defaults to same-origin. */
     baseUrl?: string
+    /** Alternate same-origin gateway for the browser's read-only manifest. */
+    documentListBaseUrl?: string
     /** Bearer token supplier (Clerk JWT) for hosted mode. */
     getAuthToken?: () => Promise<string | null> | string | null
 }
@@ -119,7 +123,7 @@ export class HttpTransport implements Transport {
         ws.onerror = () => ws.close()
     }
 
-    private async fetchOk(path: string, init: RequestInit = {}): Promise<Response> {
+    private async fetchOk(path: string, init: RequestInit = {}, baseUrl = this.base): Promise<Response> {
         const lifetime = this.lifetime.signal
         lifetime.throwIfAborted()
         // One deadline covers credential refresh, the request, and its response body.
@@ -154,7 +158,7 @@ export class HttpTransport implements Transport {
         }
         let response: Response
         try {
-            response = await fetch(this.base + path, { ...init, signal })
+            response = await fetch(baseUrl + path, { ...init, signal })
         } catch (e) {
             lifetime.throwIfAborted()
             throw new EngineFailure({ _tag: 'DeviceUnreachable', cause: String(e) })
@@ -169,7 +173,10 @@ export class HttpTransport implements Transport {
     }
 
     async listDocuments(): Promise<DocumentInfo[]> {
-        const r = await this.fetchOk('/api/documents')
+        const r = await this.fetchOk('/api/documents', {
+            cache: 'no-store',
+            ...(this.opts.documentListBaseUrl !== undefined && { credentials: 'omit' }),
+        }, this.opts.documentListBaseUrl)
         if (!r.ok) {
             throw new EngineFailure({ _tag: 'DeviceUnreachable', cause: `GET /api/documents ${r.status}` })
         }
@@ -343,6 +350,34 @@ export class HttpTransport implements Transport {
         const opSeq = cursor('x-snapshot-op-seq', 0)
         const revert = r.headers.get('x-snapshot-revert') === '1'
         return { seq, opSeq, revert, complete, bytes: new Uint8Array(await r.arrayBuffer()) }
+    }
+
+    async publishBrowserSave(doc: string, page: string, save: BrowserPublication): Promise<BrowserReceipt> {
+        const isSnapshot = save.kind === 'snapshot'
+        const r = await this.fetchOk(`/api/documents/${doc}/pages/${page}/${isSnapshot ? 'snapshot-batch' : 'ops-batch'}`, {
+            method: 'POST',
+            headers: isSnapshot ? {
+                'content-type': SNAPSHOT_BATCH_CONTENT_TYPE,
+                'x-snapshot-publication-id': save.id,
+                'x-snapshot-base-seq': String(save.baseSeq),
+            } : {
+                'content-type': 'application/json',
+                'x-op-batch-id': save.id,
+            },
+            body: isSnapshot ? decodePublicationBytes(save.payload) as BodyInit : save.payload,
+        })
+        if (r.status === 409) {
+            const rejection = await r.json().catch(() => null) as { reason?: string } | null
+            if (rejection?.reason === 'snapshot-base') return { kind: 'stale' }
+        }
+        if (r.ok) {
+            const receipt = await r.json() as { seq?: number; lastSeq?: number }
+            const seq = isSnapshot ? receipt.seq : receipt.lastSeq
+            if (typeof seq === 'number' && Number.isSafeInteger(seq) && seq > 0) {
+                return isSnapshot ? { kind: 'snapshot', seq } : { kind: 'ops', lastSeq: seq }
+            }
+        }
+        throw new EngineFailure({ _tag: 'DeviceUnreachable', cause: `Unconfirmed browser save (${r.status})` })
     }
 
     async putSnapshot(doc: string, page: string, bytes: Uint8Array): Promise<{ seq: number; merged?: boolean }> {

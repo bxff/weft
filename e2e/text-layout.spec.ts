@@ -327,7 +327,7 @@ test('a rotated and locked group receives the reflow in page coordinates', async
     expect(after[1]!.y).toBeCloseTo(state[1]!.y)
 })
 
-test('changed font metrics reflow the existing anchored stroke', async ({ page, request }) => {
+test('changed fallback glyph widths reflow visible text, hitboxes and anchored ink together', async ({ page, request }) => {
     const { first } = await anchoredReflowPushes()
     const { RmDocument, insertText } = await import('../packages/rm-format/src/index')
     const doc = RmDocument.parse(first as never)
@@ -342,10 +342,28 @@ test('changed font metrics reflow the existing anchored stroke', async ({ page, 
         const shape = ed.getCurrentPageShapes().find(shape => shape.type === 'draw')!
         return { id: shape.id, x: shape.x, y: shape.y }
     })
+    const { RM_SCALE } = await import('../packages/rm-ink/src/pen')
+    const layout = () => page.evaluate(() => {
+        const ed = (window as unknown as { __weftEditor: Editor }).__weftEditor
+        const column = ed.getCurrentPageShapes().find((shape) => shape.type === 'device-text')
+        const svg = document.querySelectorAll('.tl-shape[data-shape-type="device-text"] svg text')
+        return {
+            lastBaseline: Math.max(...Array.from(svg, (node) => Number(node.getAttribute('y')))),
+            lastHitbox: column?.type === 'device-text' ? column.props.lines.at(-1)?.y ?? 0 : 0,
+        }
+    })
+    await expect.poll(async () => Number.isFinite((await layout()).lastBaseline)).toBe(true)
     const before = await stroke()
+    const beforeLayout = await layout()
     await page.evaluate(() => window.releaseDeviceFonts())
     await expect.poll(async () => (await stroke()).y).toBeGreaterThan(before.y)
-    expect(await stroke()).toMatchObject({ id: before.id, x: before.x })
+    await expect.poll(async () => (await layout()).lastBaseline).toBeGreaterThan(beforeLayout.lastBaseline)
+    const after = await stroke()
+    const afterLayout = await layout()
+    expect(after).toMatchObject({ id: before.id, x: before.x })
+    const delta = after.y - before.y
+    expect((afterLayout.lastBaseline - beforeLayout.lastBaseline) * RM_SCALE).toBeCloseTo(delta, 2)
+    expect(afterLayout.lastHitbox - beforeLayout.lastHitbox).toBeCloseTo(delta, 1)
 })
 
 test('a text edit reapplies native layer visibility without replacing the ink', async ({ page, request }) => {
@@ -367,4 +385,93 @@ test('a text edit reapplies native layer visibility without replacing the ink', 
         return ed.getShape(id)?.opacity
     }, shapeId)
     expect(opacity).toBe(1)
+})
+
+test('a tablet END-anchor uses the heading baseline, then reflows to a blank final line without rewriting ink', async ({ page, request }) => {
+    const { RmDocument, crdtId, setParagraphStyle } = await import('../packages/rm-format/src/index')
+    const { RM_SCALE } = await import('../packages/rm-ink/src/pen')
+    const id = crypto.randomUUID()
+    const endpoint = `/api/documents/${DOC}/pages/${id}/rm`
+    const { first } = await anchoredReflowPushes()
+    const seeded = RmDocument.parse(first as never)
+    setParagraphStyle(seeded, crdtId(0, 0), 2, { authorUuid: DEVICE_AUTHOR })
+    const native = (doc: InstanceType<typeof RmDocument>) => doc.blocks.flatMap(b =>
+        b.type === 'sceneLineItem' && b.line && b.deletedLength === 0 ? [b.line.points] : [])
+    const initial = native(seeded)
+    const rawY = Math.min(...initial[0]!.map(p => p.y))
+    const rootY = seeded.tree().rootText!.posY
+    expect((await request.put(endpoint, { data: Buffer.from(seeded.serialize()) })).ok()).toBe(true)
+    const y = () => page.evaluate(() => {
+        const ed = (window as unknown as { __weftEditor: Editor }).__weftEditor
+        return ed?.getCurrentPageShapes().find(shape => shape.type === 'draw')?.y
+    })
+    const open = async () => {
+        await page.goto(`/app/${DOC}/${id}`)
+        await expect(page.getByTestId('sync-status')).toHaveText('synced', { timeout: 30_000 })
+    }
+    await open()
+    await expect.poll(y).toBeCloseTo((rawY + rootY + 63.203125) * RM_SCALE, 1)
+    await appendToDeviceText(page, '\n')
+    await expect.poll(y).toBeCloseTo((rawY + rootY + 100) * RM_SCALE, 1)
+    await expect(page.getByTestId('sync-status')).toHaveText('synced')
+    const after = RmDocument.parse(new Uint8Array(await (await request.get(endpoint)).body()) as never)
+    expect(native(after)).toEqual(initial)
+    await open()
+    await expect.poll(y).toBeCloseTo((rawY + rootY + 100) * RM_SCALE, 1)
+})
+
+test('layer visibility reaches native ink and images below a nested group', async ({ page, request }) => {
+    await page.setViewportSize({ width: 1600, height: 900 })
+    const { RmDocument, crdtId, crdtIdEquals, lww, uuidToBytesLE } = await import('../packages/rm-format/src/index')
+    const opts = { authorUuid: DEVICE_AUTHOR }
+    const doc = RmDocument.empty(DEVICE_AUTHOR)
+    const layer = doc.layers()[0]!.nodeId
+    const group = doc.createLayer('Nested group', opts)
+    const link = doc.blocks.find(block =>
+        block.type === 'sceneGroupItem' && block.nodeId && crdtIdEquals(block.nodeId, group))
+    if (link?.type !== 'sceneGroupItem') throw new Error('missing nested group link')
+    link.parentId = layer
+    const { first } = await anchoredReflowPushes()
+    const stroke = RmDocument.parse(first as never).blocks.find(block => block.type === 'sceneLineItem')
+    if (stroke?.type !== 'sceneLineItem' || !stroke.line) throw new Error('missing stroke')
+    doc.appendLine(stroke.line, { ...opts, parentId: group })
+    const uuid = crypto.randomUUID()
+    const filename = `${uuid}.png`
+    const stamp = crdtId(doc.resolveAuthor(DEVICE_AUTHOR), doc.maxClock() + 1)
+    doc.appendImage({
+        kind: 'image', uuid: lww(stamp, uuidToBytesLE(uuid)), timestamp: stamp,
+        vertices: [10, 20, 0, 0, 110, 20, 1, 0, 110, 100, 1, 1, 10, 100, 0, 1],
+        indices: [0, 1, 2, 2, 3, 0], filename: null,
+    }, { ...opts, parentId: group })
+    doc.blocks.push({
+        type: 'sceneImageInfo', version: { min: 3, current: 3 }, extraData: new Uint8Array(),
+        images: [{ uuid, filename: lww(stamp, filename), flags: lww(stamp, new Uint8Array([17, 0])) }],
+    })
+    const id = crypto.randomUUID()
+    const endpoint = `/api/documents/${DOC}/pages/${id}`
+    expect((await request.put(`${endpoint}/assets/${filename}`, { data: await readFile('fixtures/test-photo.png') })).ok()).toBe(true)
+    expect((await request.put(`${endpoint}/rm`, { data: Buffer.from(doc.serialize()) })).ok()).toBe(true)
+    await page.goto(`/app/${DOC}/${id}`)
+    await expect(page.getByTestId('sync-status')).toHaveText('synced')
+    const opacities = () => page.evaluate(() => {
+        const ed = (window as unknown as { __weftEditor: Editor }).__weftEditor
+        return Object.fromEntries(ed.getCurrentPageShapes()
+            .filter(shape => shape.type === 'draw' || shape.type === 'image')
+            .map(shape => [shape.type, shape.opacity]))
+    })
+    await expect.poll(opacities).toEqual({ draw: 1, image: 1 })
+    await page.getByTestId('layers-toggle').click()
+    const eye = page.getByTestId('layer-eye-Layer 1')
+    await eye.click()
+    await expect.poll(opacities).toEqual({ draw: 0, image: 0 })
+    await expect.poll(async () => {
+        const saved = await request.get(`${endpoint}/rm`)
+        return RmDocument.parse(new Uint8Array(await saved.body()) as never).layers()[0]?.visible
+    }).toBe(false)
+    await page.reload()
+    await expect(page.getByTestId('sync-status')).toHaveText('synced')
+    await expect.poll(opacities).toEqual({ draw: 0, image: 0 })
+    await page.getByTestId('layers-toggle').click()
+    await eye.click()
+    await expect.poll(opacities).toEqual({ draw: 1, image: 1 })
 })

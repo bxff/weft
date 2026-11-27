@@ -1,7 +1,7 @@
 /** Transport singleton. The app always talks to a cloud server (hosted or
  *  self-hosted) with a bearer token; the tablet is a sync agent, not an app server. */
 import { HttpTransport, EngineFailure, type DocumentInfo, type Transport } from '@weft/sync-engine'
-import { connection, watchRelayChange } from './settings'
+import { connection, isSelfHosted, watchRelayChange } from './settings'
 import { getAuthToken } from './auth'
 import { cacheDocumentList, clearCachedDocumentList, libraryCacheScope, readCachedDocumentList } from './library-cache'
 
@@ -16,6 +16,8 @@ export function transport(): HttpTransport {
         watchRelayChange(resetTransport, relayWatcher.signal)
         const transport = new HttpTransport({
             baseUrl: relay,
+            documentListBaseUrl: !isSelfHosted() && window.location.origin === import.meta.env.PUBLIC_WEFT_PAGES_ORIGIN
+                ? window.location.origin : undefined,
             getAuthToken: async () => {
                 if (connection().cloudUrl !== relay) throw new EngineFailure({ _tag: 'Unauthorized' })
                 const token = await getAuthToken()

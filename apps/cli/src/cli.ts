@@ -5,6 +5,7 @@
  *   weft setup     --host root@10.11.99.1 [--cloud URL --token chd_...] [--password X] [--dry-run]
  *   weft doctor    --host root@10.11.99.1 [--password X]
  *   weft uninstall --host root@10.11.99.1 [--password X]
+ *   weft restore-notebook --cloud URL --notebook UUID --recovery-dir DIR --native-dir DIR
  *   weft link      --cloud URL --token chd_... [--host root@10.11.99.1]
  *
  * Everything installs into /home/root/weft (survives firmware updates);
@@ -29,8 +30,12 @@ const flags = (() => {
                 password: { type: 'string' },
                 cloud: { type: 'string' },
                 token: { type: 'string' },
+                notebook: { type: 'string' },
+                'recovery-dir': { type: 'string' },
+                'native-dir': { type: 'string' },
                 'store-timeout': { type: 'string' },
                 'dry-run': { type: 'boolean' },
+                'include-newer-native': { type: 'boolean' },
                 'two-way': { type: 'boolean' },
                 'no-auto-reinstall': { type: 'boolean' },
                 'experimental-rm2': { type: 'boolean' },
@@ -543,6 +548,27 @@ function link(): void {
     console.log('\nLinked. The tablet now mirrors to your hosted store.')
 }
 
+async function restoreNotebook(): Promise<void> {
+    if (!flags.notebook || !flags['recovery-dir'] || !flags['native-dir'] || !CLOUD) {
+        throw Error('Usage: weft restore-notebook --cloud URL --notebook UUID --recovery-dir DIR --native-dir DIR [--include-newer-native] [--dry-run]')
+    }
+    const { prepareNotebookRestore, submitNotebookRestore } = await import('./recovery')
+    const restore = prepareNotebookRestore({
+        notebookId: flags.notebook,
+        recoveryDirectory: flags['recovery-dir'],
+        nativeDirectory: flags['native-dir'],
+        includeNewerNative: flags['include-newer-native'],
+    })
+    if (DRY) {
+        console.log(`Verified ${restore.pages.length} page(s). Nothing uploaded or changed.`)
+        return
+    }
+    const key = process.env.WEFT_RESTORE_API_KEY
+    if (!key) throw Error('Set WEFT_RESTORE_API_KEY to the new relay account’s API key')
+    await submitNotebookRestore({ cloud: CLOUD, apiKey: key, restore })
+    console.log(`Restored ${restore.pages.length} page(s) to the new relay. The tablet is unchanged.`)
+}
+
 switch (command) {
     case 'setup':
         await setup()
@@ -556,7 +582,11 @@ switch (command) {
     case 'link':
         link()
         break
+    case 'restore-notebook':
+        try { await restoreNotebook() }
+        catch (e) { console.error(e instanceof Error ? e.message : 'Restore failed'); process.exitCode = 1 }
+        break
     default:
-        console.log('usage: weft <setup [--store-timeout ms] [--no-auto-reinstall] [--experimental-rm2] [--cloud URL --token chd_...]|doctor|uninstall|link> --host root@10.11.99.1 [--password X] [--dry-run]')
+        console.log('usage: weft <setup [--store-timeout ms] [--no-auto-reinstall] [--experimental-rm2] [--cloud URL --token chd_...]|doctor|uninstall|link|restore-notebook> --host root@10.11.99.1 [--password X] [--dry-run]')
         process.exit(command ? 1 : 0)
 }

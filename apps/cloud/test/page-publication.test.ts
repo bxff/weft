@@ -629,3 +629,19 @@ test('a guarded mixed snapshot accepts or rejects its history deltas with the sn
         rmSync(dir, { recursive: true, force: true })
     }
 })
+
+test('a snapshot receipt reports overlay-only changes folded in by the relay', () => {
+    const store = new CloudStore(':memory:')
+    const base = encodeSnapshot(blank, overlay)
+    const seq = store.putSnapshot(...PAGE_KEY, base)
+    store.appendOps(...PAGE_KEY, [operation], 'peer')
+    const publication = { id: crypto.randomUUID(), baseSeq: seq }
+    const accepted = store.publishSnapshot(...PAGE_KEY, base, publication, () => null)
+    expect(accepted).toMatchObject({ kind: 'accepted', merged: true, duplicate: false })
+    expect(store.overlayAtHead(...PAGE_KEY)).toMatchObject({ tombstones: { 'shape:gone': { ts: 1 } } })
+    expect(store.publishSnapshot(...PAGE_KEY, base, publication, () => null))
+        .toMatchObject({ kind: 'accepted', merged: true, duplicate: true })
+    const current = store.latestSnapshot(...PAGE_KEY)!
+    expect(store.publishSnapshot(...PAGE_KEY, current.bytes, { id: crypto.randomUUID(), baseSeq: current.seq }, () => null))
+        .toMatchObject({ kind: 'accepted', merged: false })
+})

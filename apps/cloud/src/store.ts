@@ -17,6 +17,8 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve, win32 } from "node:path";
 import { tmpdir } from "node:os";
+import { isDeepStrictEqual } from "node:util";
+import type { RecoveryImport } from "./recovery-import";
 import { RmDocument, RootTextAuthorConflict } from "@weft/rm-format";
 import {
   reconstructRm,
@@ -212,8 +214,14 @@ export class CloudStore {
             );
             CREATE TABLE IF NOT EXISTS assets (
                 user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
-                file TEXT NOT NULL, bytes BLOB NOT NULL,
+                file TEXT NOT NULL, bytes BLOB NOT NULL, etag TEXT,
                 PRIMARY KEY (user_id, doc, page, file)
+            );
+            CREATE TABLE IF NOT EXISTS recovery_epochs (
+                user_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recovery_imports (
+                user_id TEXT PRIMARY KEY, digest TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS thumbnails (
                 user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
@@ -411,6 +419,24 @@ export class CloudStore {
     this.db.run(
       "CREATE INDEX IF NOT EXISTS device_tokens_user ON device_tokens(user_id)",
     );
+    if (!(this.db.query<{ name: string }, []>("PRAGMA table_info(assets)").all())
+      .some((column) => column.name === "etag")) {
+      this.db.run("ALTER TABLE assets ADD COLUMN etag TEXT");
+    }
+    // Existing change sequence covers normal page writes. Track independent
+    // changes transactionally (including DELETE and same-name replacement), so
+    // an unchanged recovery sweep does not have to scan a user's library.
+    for (const table of ["assets", "overlays", "page_snapshots"]) {
+      for (const [event, row] of [["INSERT", "NEW"], ["UPDATE", "NEW"], ["DELETE", "OLD"]]) {
+        this.db.run(`
+          CREATE TRIGGER IF NOT EXISTS recovery_epoch_${table}_${event}
+          AFTER ${event} ON ${table} BEGIN
+            INSERT INTO recovery_epochs (user_id, epoch) VALUES (${row}.user_id, 1)
+            ON CONFLICT(user_id) DO UPDATE SET epoch=epoch+1;
+          END;
+        `);
+      }
+    }
     this.initUsageTracking();
   }
 
@@ -972,6 +998,51 @@ export class CloudStore {
     );
   }
 
+  /** Publish a validated restore to an empty account under one writer lock.
+   * New checkpoint files are retired on rollback by the normal publisher. */
+  restoreRecoveryNotebook(
+    user: string, data: RecoveryImport, digest: string,
+    storageCheck: (stage: "before" | "after") => void,
+  ): "created" | "replay" | "not-empty" {
+    const { notebook, pages } = data;
+    return this.publishPage(user, notebook.id, pages[0]!.id, () => {
+      const receipt = this.db.query<{ digest: string }, [string]>(
+        "SELECT digest FROM recovery_imports WHERE user_id=?",
+      ).get(user);
+      const list = JSON.parse(this.getDocuments(user)) as { documents?: { id?: unknown; deleted?: unknown }[] };
+      if (!Array.isArray(list.documents)) return "not-empty";
+      if (receipt?.digest === digest && list.documents.some(d => d.id === notebook.id && d.deleted !== true)) {
+        return "replay";
+      }
+      const hasRows = USAGE_TABLES.some(([table]) =>
+        !!this.db.query(`SELECT 1 FROM ${table} WHERE user_id=? LIMIT 1`).get(user));
+      if (receipt || list.documents.length || hasRows ||
+          this.db.query("SELECT 1 FROM device_tokens WHERE user_id=? LIMIT 1").get(user)) {
+        return "not-empty";
+      }
+      storageCheck("before");
+      const timestamp = Date.now();
+      this.putDocuments(user, JSON.stringify({
+        documents: [{ ...notebook, type: "notebook", parent: "", createdTime: timestamp, lastModified: timestamp }],
+      }));
+      for (const page of pages) {
+        for (const { name, bytes } of page.assets) {
+          this.putAsset(user, notebook.id, page.id, name, bytes);
+        }
+        this.putSnapshot(user, notebook.id, page.id, encodeSnapshot(page.native, page.overlay), false, 0);
+        if (page.currentNative) {
+          const base = this.deviceRevision(user, notebook.id, page.id);
+          const { changed } = this.applyDevicePut(user, notebook.id, page.id, page.currentNative, base, "recovery");
+          if (changed) continue; // the existing merge already recorded the head
+        }
+        this.recordOpChange(user, notebook.id, page.id, "recovery");
+      }
+      storageCheck("after");
+      this.db.run("INSERT INTO recovery_imports (user_id, digest) VALUES (?,?)", [user, digest]);
+      return "created";
+    });
+  }
+
   /** Run a synchronous page write under SQLite's write lock. New snapshot
    * files are removed on rollback, and old files are pruned only after commit. */
   publishPage<T>(user: string, doc: string, page: string, write: () => T): T {
@@ -1529,7 +1600,12 @@ export class CloudStore {
       // reads merged=false and never churns.
       // The merge already validated these bytes. Identical drawings cannot
       // add visible content, so avoid decoding them again to prove that.
-      merged = Buffer.compare(snap.rm, mergedRm) !== 0 && contentBeyond(snap.rm, mergedRm);
+      const byId = (shapes: typeof snap.overlay.shapes) =>
+        new Map(shapes.map((shape) => [shape.shapeId, shape]));
+      merged =
+        (Buffer.compare(snap.rm, mergedRm) !== 0 && contentBeyond(snap.rm, mergedRm)) ||
+        !isDeepStrictEqual(byId(snap.overlay.shapes), byId(mergedOverlay.shapes)) ||
+        !isDeepStrictEqual(snap.overlay.tombstones ?? {}, mergedOverlay.tombstones ?? {});
     } catch (error) {
       if (requireMerge || error instanceof RootTextAuthorConflict) throw error;
       // the snapshot channel is contractually OPAQUE: anything we cannot
@@ -1592,9 +1668,121 @@ export class CloudStore {
     bytes: Uint8Array,
   ): void {
     this.db.run(
-      "INSERT OR REPLACE INTO assets (user_id, doc, page, file, bytes) VALUES (?, ?, ?, ?, ?)",
-      [user, doc, page, file, bytes],
+      "INSERT OR REPLACE INTO assets (user_id, doc, page, file, bytes, etag) VALUES (?, ?, ?, ?, ?, ?)",
+      [user, doc, page, file, bytes, sha256hex(bytes)],
     );
+  }
+
+  /** Existing rows may lack a hash after upgrade. Their marker changes on
+   * the first subsequent PUT, and remains stable until the bytes are replaced. */
+  private recoveryAssetMarker(
+    rows: { file: string; etag: string | null }[], legacyOverlay: string | null = null,
+  ): string {
+    if (!rows.length && legacyOverlay === null) return "";
+    return sha256hex(Buffer.from(JSON.stringify([rows.map(({ file, etag }) => [file, etag]), legacyOverlay])));
+  }
+
+  /** A separate marker per page lets an asset-only overwrite wake the tablet
+   * even if the native revision and the retained change feed did not change.
+   * Legacy blob overlays can change independently of the native revision too. */
+  recoveryAssetRevisions(user: string): Record<string, string> {
+    const rows = this.db.query<
+      { doc: string; page: string; file: string; etag: string | null }, [string]
+    >("SELECT doc, page, file, etag FROM assets WHERE user_id=? ORDER BY doc, page, file").all(user);
+    const groups = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const key = `${row.doc}/${row.page}`;
+      const group = groups.get(key);
+      if (group) group.push(row);
+      else groups.set(key, [row]);
+    }
+    const legacy = this.db.query<{ doc: string; page: string; json: string }, [string]>(`
+      SELECT o.doc, o.page, o.json FROM overlays o
+      WHERE o.user_id=?1
+        AND NOT EXISTS (SELECT 1 FROM page_ops p WHERE p.user_id=?1 AND p.doc=o.doc AND p.page=o.page)
+        AND NOT EXISTS (SELECT 1 FROM page_snapshots s WHERE s.user_id=?1 AND s.doc=o.doc AND s.page=o.page)
+    `).all(user);
+    const legacyByPage = new Map(legacy.map(({ doc, page, json }) => [`${doc}/${page}`, json]));
+    const keys = new Set([...groups.keys(), ...legacyByPage.keys()]);
+    return Object.fromEntries([...keys].map((key) => [
+      key, this.recoveryAssetMarker(groups.get(key) ?? [], legacyByPage.get(key) ?? null),
+    ]));
+  }
+
+  readRecoveryRevisions(user: string, ifNoneMatch: string | null) {
+    return this.db.transaction(() => {
+      const epoch = this.db.query<{ epoch: number }, [string]>(
+        "SELECT epoch FROM recovery_epochs WHERE user_id=?",
+      ).get(user)?.epoch ?? 0;
+      const etag = `"recovery-v1-${this.latestChangeSeq(user)}-${epoch}"`;
+      return ifNoneMatch === etag
+        ? { etag, body: null }
+        : { etag, body: { pages: this.pageRevisions(user), assets: this.recoveryAssetRevisions(user) } };
+    })();
+  }
+
+  /** Read all members of the recovery revision in the same SQLite snapshot.
+   * Missing checkpoint files fail closed instead of replaying against empty ink. */
+  readRecoveryPage(
+    user: string, doc: string, page: string,
+    knownNative: string | null, ifNoneMatch: string | null,
+  ) {
+    return this.db.transaction(() => {
+      const snapshot = this.latestSnapshotRow(user, doc, page);
+      const snapshotSeq = snapshot?.seq ?? 0;
+      const opSeq = this.latestOpSeq(user, doc, page);
+      const blob = snapshotSeq || opSeq ? null : this.getPage(user, doc, page);
+      if (!snapshotSeq && !opSeq && !blob) return null;
+      const revision = blob?.revision ?? opMarker(opSeq, snapshotSeq);
+      const legacyOverlay = blob ? this.getOverlay(user, doc, page) : null;
+      const rows = this.db.query<{ file: string; etag: string | null }, [string,string,string]>(
+        "SELECT file, etag FROM assets WHERE user_id=? AND doc=? AND page=? ORDER BY file",
+      ).all(user, doc, page);
+      const assetRevision = this.recoveryAssetMarker(rows, legacyOverlay);
+      const etagFor = (native: string) =>
+        `"${sha256hex(Buffer.from(JSON.stringify([revision, native, assetRevision, legacyOverlay])))}"`;
+      // The client must still hold the exact native bytes for a 304. Including
+      // their digest in the validator makes the common conditional check cheap.
+      if (knownNative && /^[a-f0-9]{64}$/.test(knownNative) && ifNoneMatch === etagFor(knownNative)) {
+        return { etag: ifNoneMatch, body: null };
+      }
+
+      if (this.truncationFloor(user, doc, page) > (snapshot?.op_seq ?? 0)) {
+        throw new Error("Recovery checkpoint is below the retained operation floor");
+      }
+      const checkpointPath = snapshot ? this.storedBlobPath(snapshot.path, "snapshots") : null;
+      if (snapshot && !checkpointPath) throw new Error("Invalid recovery checkpoint path");
+      const checkpoint = checkpointPath
+        ? decodeSnapshot(new Uint8Array(readFileSync(checkpointPath))) : null;
+      const ops = this.opsInRange(user, doc, page, snapshot?.op_seq ?? 0, opSeq);
+      const native = blob?.bytes ?? reconstructRm(checkpoint?.rm ?? null, ops, DEVICE_BRIDGE_AUTHOR);
+      const overlay: OverlayDocument = checkpoint?.overlay ?? (legacyOverlay ? JSON.parse(legacyOverlay) : { shapes: [] });
+      foldOverlayOps(overlay, ops);
+      const nativeSha256 = sha256hex(native);
+      const required = new Set<string>();
+      const missingAssets = new Set<string>();
+      for (const [, item] of RmDocument.parse(native).tree().walk()) {
+        if (item.kind !== "image") continue;
+        if (item.filename) required.add(item.filename);
+        else missingAssets.add("<unresolved image>");
+      }
+      const assets = [];
+      for (const { file, etag } of rows) {
+        if (!required.delete(file)) continue;
+        const bytes = etag ? null : this.getAsset(user, doc, page, file);
+        if (!etag && !bytes) throw new Error("Recovery asset disappeared");
+        assets.push({ name: file, sha256: etag ?? sha256hex(bytes!) });
+      }
+      for (const file of required) missingAssets.add(file);
+      return {
+        etag: etagFor(nativeSha256),
+        body: {
+          revision, snapshotSeq, opSeq, nativeSha256, assetRevision,
+          nativeBase64: nativeSha256 === knownNative ? null : Buffer.from(native).toString("base64"),
+          overlay, assets, missingAssets: [...missingAssets],
+        },
+      };
+    })();
   }
 
   listAssets(user: string, doc: string, page: string): string[] {

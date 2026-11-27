@@ -13,6 +13,8 @@ export interface KeyValueStorage {
     getPair(first: string, second: string): Promise<StoragePair>
     /** Check ownership when starting the atomic write, after any storage wait. */
     setPair(first: StorageEntry, second: StorageEntry, mayWrite?: () => boolean): Promise<void>
+    /** Atomically retire a confirmed request and save its authoritative checkpoint. */
+    commitSave?(checkpoint: readonly StorageEntry[], queueKey: string, queue: Uint8Array | null, mayWrite: () => boolean): Promise<boolean>
     delete(key: string, ...others: string[]): Promise<void>
     keys(prefix: string): Promise<string[]>
     /** Commit both changes together. Required for orphan queue adoption. */
@@ -38,6 +40,15 @@ export class MemoryStorage implements KeyValueStorage {
         const secondValue = second[1].slice()
         this.map.set(first[0], firstValue)
         this.map.set(second[0], secondValue)
+    }
+    async commitSave(checkpoint: readonly StorageEntry[], queueKey: string, queue: Uint8Array | null, mayWrite: () => boolean): Promise<boolean> {
+        if (!mayWrite()) return false
+        const copies = checkpoint.map(([key, value]) => [key, value.slice()] as const)
+        const next = queue?.slice()
+        for (const [key, bytes] of copies) this.map.set(key, bytes)
+        if (next) this.map.set(queueKey, next)
+        else this.map.delete(queueKey)
+        return true
     }
     async delete(key: string, ...others: string[]): Promise<void> {
         this.map.delete(key)
@@ -120,6 +131,15 @@ export class IdbStorage implements KeyValueStorage {
                 store.put(second[1], second[0])
             }
             return () => {}
+        })
+    }
+    async commitSave(checkpoint: readonly StorageEntry[], queueKey: string, queue: Uint8Array | null, mayWrite: () => boolean): Promise<boolean> {
+        return this.transaction('readwrite', (store) => {
+            if (!mayWrite()) return () => false
+            for (const [key, value] of checkpoint) store.put(value, key)
+            if (queue) store.put(queue, queueKey)
+            else store.delete(queueKey)
+            return () => true
         })
     }
     async delete(key: string, ...others: string[]): Promise<void> {

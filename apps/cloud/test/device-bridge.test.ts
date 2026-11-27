@@ -1295,3 +1295,128 @@ test.each(['browser', 'tablet'] as const)('a stale %s save adopts the newer nati
     expect(saved.rootTextBlock?.widthData?.register?.timestamp).toEqual(crdtId(1, 85))
     expect(store.getSnapshotBytes(U, D, P, initial)).toEqual(encodeSnapshotFixture(stale))
 })
+
+test.each(['fresh base', 'stale base', 'explicit same-layer edit', 'same-value browser write'] as const)(
+    'tablet visibility PUT with %s keeps independent browser edits',
+    async (scenario) => {
+        const relay = startCloud({ port: 0, db: ':memory:' })
+        const { store } = relay
+        try {
+            const token = store.mintDeviceToken(U, 'test tablet')
+            const endpoint = `http://127.0.0.1:${relay.port}/api/documents/${D}/pages/${P}`
+            const initial = RmDocument.empty(TABLET_AUTHOR)
+            const first = initial.layers()[0]!.nodeId
+            const second = initial.createLayer('Second layer', { authorUuid: TABLET_AUTHOR })
+            const original = initial.serialize()
+            const seq = store.putSnapshot(U, D, P, encodeSnapshotFixture(original))
+            const ancestor = store.reconstructDevicePage(U, D, P)
+
+            const browser = RmDocument.parse(original)
+            expect(browser.setLayerVisible(first, false, { authorUuid: WEB_AUTHOR })).toBe(true)
+            const sameValue = scenario === 'same-value browser write'
+            if (sameValue) expect(browser.setLayerVisible(first, true, { authorUuid: WEB_AUTHOR })).toBe(true)
+            expect(store.putSnapshotMerged(U, D, P, encodeSnapshotFixture(browser.serialize())).merged).toBe(false)
+            const latest = store.reconstructDevicePage(U, D, P)
+            expect(RmDocument.parse(latest.bytes).layers().map(layer => layer.visible)).toEqual([sameValue, true])
+
+            const base = scenario === 'fresh base' ? latest : ancestor
+            const tablet = RmDocument.parse(base.bytes)
+            // Both writers independently allocate slot 2 for different UUIDs.
+            const localAuthor = 'cccccccc-0000-4000-a000-000000000003'
+            expect(tablet.setLayerVisible(second, false, { authorUuid: localAuthor })).toBe(true)
+            if (scenario === 'explicit same-layer edit') {
+                // A true->false->true tablet gesture is still an edit: its
+                // register changed even though the initial value was true.
+                expect(tablet.setLayerVisible(first, false, { authorUuid: localAuthor })).toBe(true)
+                expect(tablet.setLayerVisible(first, true, { authorUuid: localAuthor })).toBe(true)
+            }
+            const tabletBytes = tablet.serialize()
+            const response = await fetch(endpoint + '/rm', {
+                method: 'PUT',
+                headers: { 'x-device-token': token, 'x-base-revision': base.revision, connection: 'close' },
+                body: tabletBytes as unknown as BodyInit,
+            })
+            expect(response.status).toBe(200)
+            const receipt = await response.json() as { revision: string; merged: boolean }
+            const carriesBrowser = scenario === 'stale base' || sameValue
+            expect(receipt.merged).toBe(carriesBrowser)
+
+            const saved = store.reconstructDevicePage(U, D, P)
+            expect(saved.revision).toBe(receipt.revision)
+            const restored = RmDocument.parse(saved.bytes)
+            expect(restored.layers().map(layer => layer.visible))
+                .toEqual([scenario === 'explicit same-layer edit' || sameValue, false])
+            expect(restored.layers().map(layer => layer.label))
+                .toEqual(tablet.layers().map(layer => layer.label))
+            expect(store.getSnapshotBytes(U, D, P, seq)).toEqual(encodeSnapshotFixture(original))
+            if (scenario === 'fresh base') expect(saved.bytes).toEqual(tabletBytes)
+
+            if (carriesBrowser) {
+                const register = restored.blocks.find(block => block.type === 'treeNode'
+                    && block.nodeId.part1 === first.part1 && block.nodeId.part2 === first.part2)
+                expect(register?.type === 'treeNode'
+                    && restored.authorTable().get(register.visible.timestamp.part1)).toBe(WEB_AUTHOR)
+                const local = restored.blocks.find(block => block.type === 'treeNode'
+                    && block.nodeId.part1 === second.part1 && block.nodeId.part2 === second.part2)
+                expect(local?.type === 'treeNode'
+                    && restored.authorTable().get(local.visible.timestamp.part1)).toBe(localAuthor)
+
+                // Receiving and uploading the merged drawing is idempotent.
+                const retry = await fetch(endpoint + '/rm', {
+                    method: 'PUT',
+                    headers: { 'x-device-token': token, 'x-base-revision': saved.revision, connection: 'close' },
+                    body: saved.bytes as unknown as BodyInit,
+                })
+                expect(await retry.json()).toMatchObject({ revision: saved.revision, merged: false })
+                expect(store.reconstructDevicePage(U, D, P)).toEqual(saved)
+            }
+        } finally {
+            relay.stop()
+        }
+    },
+)
+
+test('tablet PUT retains its own visibility register when both writers reach the same value', async () => {
+    const relay = startCloud({ port: 0, db: ':memory:' })
+    const { store } = relay
+    const localAuthor = 'cccccccc-0000-4000-a000-000000000003'
+    try {
+        for (const visible of [false, true]) {
+            const pageId = visible ? P + '-visible' : P
+            const native = RmDocument.empty(TABLET_AUTHOR)
+            const layer = native.layers()[0]!.nodeId
+            const initial = native.serialize()
+            store.putSnapshot(U, D, pageId, encodeSnapshotFixture(initial))
+            const base = store.reconstructDevicePage(U, D, pageId)
+            const edit = (authorUuid: string) => {
+                const doc = RmDocument.parse(initial)
+                doc.setLayerVisible(layer, false, { authorUuid })
+                if (visible) doc.setLayerVisible(layer, true, { authorUuid })
+                return doc
+            }
+            const browser = edit(WEB_AUTHOR)
+            store.putSnapshotMerged(U, D, pageId, encodeSnapshotFixture(browser.serialize()))
+            const tablet = edit(localAuthor)
+            const tabletBytes = tablet.serialize()
+            const peerHead = store.reconstructDevicePage(U, D, pageId).revision
+            const token = store.mintDeviceToken(U, 'test tablet')
+            const response = await fetch(`http://127.0.0.1:${relay.port}/api/documents/${D}/pages/${pageId}/rm`, {
+                method: 'PUT',
+                headers: { 'x-device-token': token, 'x-base-revision': base.revision, connection: 'close' },
+                body: tabletBytes as unknown as BodyInit,
+            })
+            expect(response.status).toBe(200)
+            const receipt = await response.json() as { revision: string; merged: boolean }
+            expect(receipt.revision).not.toBe(peerHead)
+            expect(receipt.merged).toBe(false)
+            const saved = RmDocument.parse(store.reconstructDevicePage(U, D, pageId).bytes)
+            const register = saved.blocks.find(block => block.type === 'treeNode'
+                && block.nodeId.part1 === layer.part1 && block.nodeId.part2 === layer.part2)
+            expect(register?.type === 'treeNode'
+                && saved.authorTable().get(register.visible.timestamp.part1)).toBe(localAuthor)
+            expect(saved.layers()[0]?.visible).toBe(visible)
+        }
+    } finally {
+        relay.stop()
+    }
+})

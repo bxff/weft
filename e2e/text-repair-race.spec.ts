@@ -81,21 +81,32 @@ test('erase of the freshly re-projected trailing glyph repairs (edit, then table
     await page.mouse.click(box.x + box.width / 2 - 60, box.y + 240)
     await page.keyboard.type('abcd', { delay: 40 })
     await page.keyboard.press('Escape')
-    await textOverlay(page, 4)
+    const initial = await textOverlay(page, 4)
+    const nativeUrl = `/api/documents/${DOC}/pages/${RACE_PAGE}/rm`
+    const bytes = await (await page.request.get(nativeUrl)).body()
 
+    await page.reload()
+    await synced(page)
     const textShape = page.locator('.tl-shape[data-shape-type="text"]')
     await expect(textShape).toContainText('abcd')
+    expect((await textOverlay(page, 4)).rendered).toEqual(initial.rendered)
+    expect(await (await page.request.get(nativeUrl)).body()).toEqual(bytes)
 
-    // wait for the TipTap editor to take focus: an End pressed before focus
-    // is a no-op and "q" lands at the dblclick caret instead of the end
+    // Use a real text edit with a deterministic caret: End keys differ by
+    // platform, and double-click may select the word after reopening.
     await textShape.dblclick()
     await expect(page.locator('[contenteditable="true"]').first()).toBeFocused({
         timeout: 10_000,
     })
-    await page.keyboard.press('End')
+    await page.evaluate(() => {
+        const editor = window.__weftEditor.getRichTextEditor()!
+        editor.commands.setTextSelection(editor.state.doc.content.size - 1)
+    })
     await page.keyboard.type('q', { delay: 40 })
     await page.keyboard.press('Escape')
     const fresh = await textOverlay(page, 5)
+    expect(fresh.rendered.find((p) => p.partKey === 'glyph:0')?.items)
+        .toEqual(initial.rendered.find((p) => p.partKey === 'glyph:0')?.items)
     await expect(textShape).toContainText('abcdq')
 
     // the tablet erases the trailing "q" glyph of the FRESH generation

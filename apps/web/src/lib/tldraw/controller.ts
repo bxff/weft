@@ -73,12 +73,13 @@ import {
     styleForNodeKind,
     type RichLine,
 } from './device-text-richtext'
+import { arrowRecordProps, restoreArrowLinks, unpackArrowProps } from './arrow-persistence'
 import { textFromNode, eraseRichTextGlyphs, canonicalRichText } from './richtext-plain'
 import {
+    NATIVE_FONT_PRELOADS,
     canvasMeasure,
     layoutText,
     metricsFor,
-    penPositions,
     DEVICE_TEXT_LEFT_MARGIN_INK,
 } from './text-metrics'
 import { computeAnchorOffsets } from './text-anchor-layout'
@@ -398,6 +399,7 @@ export class StudioController {
                 authorUuid: author,
                 // history timeline label; CRDT identity stays authorUuid
                 historyAuthor: 'web',
+                guardedSaves: import.meta.env.PUBLIC_GUARDED_SAVES === '1',
                 cachePrimary: primaryAtOpen,
                 adoptOrphanAuthor,
                 onPatch: (patch) => this.onPatches([patch]),
@@ -453,8 +455,10 @@ export class StudioController {
         )
         this.storeUnsub = this.editor.store.listen(
             ({ changes }) => {
-                for (const record of Object.values(changes.added))
+                for (const record of Object.values(changes.added)) {
                     this.noteChange(record as TLShape)
+                    if (record.typeName === 'binding' && record.type === 'arrow') this.queueArrow(record.fromId)
+                }
                 for (const [before, after] of Object.values(changes.updated)) {
                     if (before.typeName === 'shape' && after.typeName === 'shape' && after.meta.rmBrush &&
                         before.parentId !== after.parentId && sameNativeShapeGeometry(before, after)) {
@@ -466,9 +470,16 @@ export class StudioController {
                         if (previous && samePageTransform(previous, this.editor.getShapePageTransform(after))) continue
                     }
                     this.noteChange(after as TLShape, before as TLShape)
+                    if (after.typeName === 'binding' && after.type === 'arrow') this.queueArrow(after.fromId)
+                    if (after.typeName === 'shape') {
+                        for (const binding of this.editor.getBindingsToShape(after.id, 'arrow')) {
+                            this.queueArrow(binding.fromId)
+                        }
+                    }
                 }
                 for (const record of Object.values(changes.removed)) {
                     const shape = record as TLShape
+                    if (record.typeName === 'binding' && record.type === 'arrow') this.queueArrow(record.fromId)
                     if (shape.typeName === 'shape') this.pendingDeletes.set(shape.id, this.shapeEditVersion(shape.id))
                 }
                 this.schedule()
@@ -654,7 +665,7 @@ export class StudioController {
             }
             this.overlayPropsChecks.set(type, check)
         }
-        return check(shape.props)
+        return check(type === 'arrow' ? unpackArrowProps(shape.props).props : shape.props)
     }
 
     get hasUnreadableShapes(): boolean {
@@ -821,18 +832,11 @@ export class StudioController {
     private async settleDeviceFonts(): Promise<void> {
         if (typeof document === 'undefined' || !document.fonts) return
         // the px size is irrelevant to WHICH face loads; use a nominal one
-        const specs = [
-            `10px 'RM Noto Sans'`,
-            `500 10px 'RM Noto Sans'`,
-            `700 10px 'RM Noto Sans'`,
-            `16px 'RM Noto Serif'`,
-        ]
+        const specs = NATIVE_FONT_PRELOADS
         if (specs.every((s) => document.fonts.check(s))) return // already correct
-        try {
-            await Promise.all(specs.map((s) => document.fonts.load(s)))
-        } catch {
-            return // measureText will use whatever face is available
-        }
+        const loaded = await Promise.allSettled(specs.map((s) => document.fonts.load(s)))
+        if (loaded.every((r) => r.status === 'rejected')) return
+        // A missing optional face must not suppress reflow for the ones that did load.
         if (this.disposed || !this.session) return
         if (!this.session.document.tree().rootText) return // nothing to re-lay out
         this.layoutGen++
@@ -967,7 +971,7 @@ export class StudioController {
                 y: shape.y,
                 rotation: shape.rotation,
                 index: this.displayIndex(shape),
-                props: shape.props as never,
+                props: browserOverlayProps(shape) as never,
                 opacity: displayOpacity(shape),
                 meta: { weft: true, detached: shape.state === 'detached' },
             }))
@@ -988,11 +992,22 @@ export class StudioController {
         })
         if (toCreate.length) this.editor.createShapes(toCreate as never[])
         if (toUpdate.length) this.editor.updateShapes(toUpdate as never[])
+        this.restoreOverlayArrowLinks()
         this.applyBrowserOrderTies()
         // Re-apply per-layer visibility on every render: the scene walk yields
         // hidden-layer items too, so without this a hidden layer renders VISIBLE
         // on open / re-bootstrap / editRootText. Idempotent (reads the doc).
         this.applyLayerVisibility()
+    }
+
+    private restoreOverlayArrowLinks(): void {
+        for (const shape of this.session.currentOverlay.shapes) {
+            const id = shape.shapeId as TLShapeId
+            if (shape.kind === 'arrow' && shape.state === 'live' && !this.hasUnprojectedShape(id) &&
+                shape.props && typeof shape.props === 'object') {
+                restoreArrowLinks(this.editor, id, shape.props)
+            }
+        }
     }
 
     private displayIndex(shape: OverlayShape): IndexKey | undefined {
@@ -1486,6 +1501,14 @@ export class StudioController {
 
     // ----- local edits -> engine -----
 
+    private queueArrow(id: TLShapeId): void {
+        const arrow = this.editor.getShape(id)
+        if (arrow?.type !== 'arrow' || arrow.meta.detached) return
+        this.orderOnlyShapeIds.delete(id)
+        this.pendingShapeIds.add(id)
+        this.pendingShapeVersions.set(id, this.captureShapeEdit(id))
+    }
+
     private noteChange(record: TLShape, before?: TLShape): void {
         if (record.typeName !== 'shape') return
         this.pendingDeletes.delete(record.id)
@@ -1919,7 +1942,7 @@ export class StudioController {
         const lines: { x: number; y: number; w: number; h: number }[] = []
         paragraphs.forEach((p, pi) => {
             const para = layout.paras[pi]!
-            const m = metricsFor(p.style, p.sizeCode)
+            const m = metricsFor(p.style, p.sizeCode, p.indentLevel)
             const full = p.spans.map((s) => s.text).join('')
             para.lineStarts.forEach((start, li) => {
                 const end =
@@ -1932,7 +1955,8 @@ export class StudioController {
                     markerX !== undefined
                         ? Math.min(markerX, m.indentInk)
                         : m.indentInk || DEVICE_TEXT_LEFT_MARGIN_INK
-                const wInk = m.indentInk - leftInk + penPositions(lineText, m, undefined, measure).end
+                const textStartInk = m.indentInk || DEVICE_TEXT_LEFT_MARGIN_INK
+                const wInk = textStartInk - leftInk + para.lineWidthsInk[li]!
                 lines.push({
                     x: Math.round(leftInk * RM_SCALE * 100) / 100,
                     y: Math.round((para.topInk + li * para.lineStrideInk) * RM_SCALE * 100) / 100,
@@ -1956,7 +1980,7 @@ export class StudioController {
                 richText,
                 lines,
             },
-            meta: { weft: true },
+            meta: { weft: true, layoutGen: this.layoutGen },
         }
         this.remote(() => {
             if (existing) this.editor.updateShape(record as never)
@@ -2174,12 +2198,20 @@ export class StudioController {
             doc
                 .layers()
                 .filter((l) => !l.visible)
-                .map((l) => `${l.nodeId.part1}:${l.nodeId.part2}`),
+                .map((l) => crdtIdKey(l.nodeId)),
         )
-        // item -> parent layer key
+        // Use live group links to expand hidden layers to every descendant.
+        const children = hidden.size ? new Map<string, string[]>() : undefined
         const parentOf = new Map<string, string>()
         const resolver = new RefResolver(doc)
         for (const block of doc.blocks) {
+            if (children && block.type === 'sceneGroupItem' && !block.deletedLength && block.nodeId) {
+                const parent = crdtIdKey(block.parentId)
+                const group = crdtIdKey(block.nodeId)
+                const siblings = children.get(parent)
+                if (siblings) siblings.push(group)
+                else children.set(parent, [group])
+            }
             if (
                 block.type !== 'sceneLineItem' &&
                 block.type !== 'sceneGlyphItem' &&
@@ -2188,7 +2220,18 @@ export class StudioController {
                 continue
             const ref = resolver.toRef(block.itemId)
             if (ref) {
-                parentOf.set(itemRefKey(ref), `${block.parentId.part1}:${block.parentId.part2}`)
+                parentOf.set(itemRefKey(ref), crdtIdKey(block.parentId))
+            }
+        }
+        if (children) {
+            const pending = [...hidden]
+            while (pending.length) {
+                const parent = pending.pop()!
+                for (const group of children.get(parent) ?? []) {
+                    if (hidden.has(group)) continue
+                    hidden.add(group)
+                    pending.push(group)
+                }
             }
         }
         this.remote(() => {
@@ -2621,10 +2664,14 @@ export class StudioController {
         opacityWrite?: { opacity: number; opacityVersion: OpVersion },
         version = this.shapeEditVersion(shape.id),
     ): LocalOp | null {
+        const previous = shape.type === 'arrow'
+            ? this.session.currentOverlay.shapes.find(record => record.shapeId === shape.id)?.props
+            : undefined
         const base: Omit<OverlayShape, 'rendered' | 'state'> = {
             shapeId: shape.id,
             kind: shape.type as OverlayShape['kind'],
-            props: shape.props,
+            props: shape.type === 'arrow' ? arrowRecordProps(this.editor, shape,
+                previous && typeof previous === 'object' ? previous : undefined) : shape.props,
             x: shape.x,
             y: shape.y,
             rotation: shape.rotation,
@@ -3311,7 +3358,7 @@ export class StudioController {
                         y: patch.shape.y,
                         rotation: patch.shape.rotation,
                         index: this.displayIndex(patch.shape),
-                        props: patch.shape.props as never,
+                        props: browserOverlayProps(patch.shape) as never,
                         opacity: displayOpacity(patch.shape),
                         meta: { weft: true, detached: patch.shape.state === 'detached' },
                     }
@@ -3342,6 +3389,7 @@ export class StudioController {
                 }
                 applyPatch(patch)
             }
+            if (patches.some(patch => patch.type === 'shape-upserted')) this.restoreOverlayArrowLinks()
             paintInk()
             if (orderChanged) this.applyBrowserOrderTies()
             if (visibilityChanged) this.applyLayerVisibility()
@@ -3442,6 +3490,12 @@ const PROJECTION_VERSION: Record<string, number> = {
     highlight: 2,
 }
 
+function browserOverlayProps(shape: OverlayShape): unknown {
+    return shape.kind === 'arrow' && shape.props && typeof shape.props === 'object'
+        ? unpackArrowProps(shape.props).props
+        : shape.props
+}
+
 function hashOf(shape: TLShape, editor: Editor): string {
     // the PAGE transform, not just local x/y: a child of a moved FRAME keeps
     // its frame-local coords, and a props-only hash made the content-
@@ -3449,11 +3503,12 @@ function hashOf(shape: TLShape, editor: Editor): string {
     // following on the tablet)
     const t = editor.getShapePageTransform(shape)
     // Ignore equivalent TipTap default attrs so hydration does not reproject glyphs.
-    const props = shape.props as { richText?: unknown }
+    const saved = shape.type === 'arrow' ? arrowRecordProps(editor, shape) : shape.props
+    const props = saved as { richText?: unknown }
     const p =
         props && props.richText !== undefined
             ? { ...props, richText: canonicalRichText(props.richText) }
-            : shape.props
+            : saved
     const json = JSON.stringify({
         v: PROJECTION_VERSION[shape.type] ?? 1,
         p,
