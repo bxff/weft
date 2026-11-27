@@ -6,6 +6,9 @@
 import { Database } from "bun:sqlite";
 import { publishBackup } from "./backup";
 import {
+  closeSync,
+  fsyncSync,
+  openSync,
   mkdirSync,
   mkdtempSync,
   writeFileSync,
@@ -295,7 +298,8 @@ export class CloudStore {
                 -- at/after its op_seq (newest-snapshot rule), so stateAt(head)==live
                 -- after a revert; targets before op_seq exclude it and raw-replay.
                 -- Also exempts revert markers from SNAPSHOT_KEEP pruning.
-                revert INTEGER NOT NULL DEFAULT 0
+                revert INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT
             );
             CREATE INDEX IF NOT EXISTS page_snapshots_page ON page_snapshots(user_id, doc, page, seq);
             -- Truncation floor: the highest op seq retention deleted for a page
@@ -366,6 +370,10 @@ export class CloudStore {
       .some((column) => column.name === "etag")) {
       this.db.run("ALTER TABLE assets ADD COLUMN etag TEXT");
     }
+    if (!this.db.query("SELECT 1 FROM pragma_table_info('page_snapshots') WHERE name='sha256'").get()) {
+      this.db.run("ALTER TABLE page_snapshots ADD COLUMN sha256 TEXT");
+    }
+
     // Existing change sequence covers normal page writes. Track independent
     // changes transactionally (including DELETE and same-name replacement), so
     // an unchanged recovery sweep does not have to scan a user's library.
@@ -946,16 +954,23 @@ export class CloudStore {
   restoreRecoveryNotebook(
     user: string, data: RecoveryImport, digest: string,
     storageCheck: (stage: "before" | "after") => void,
-  ): "created" | "replay" | "not-empty" {
+  ): "created" | "replay" | "not-empty" | "unverified" {
+    if (this.db.inTransaction) throw new Error("Recovery restore requires its own transaction");
     const { notebook, pages } = data;
-    return this.publishPage(user, notebook.id, pages[0]!.id, () => {
+    const previous = this.db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
+    const restore = () => this.publishPage(user, notebook.id, pages[0]!.id, () => {
       const receipt = this.db.query<{ digest: string }, [string]>(
         "SELECT digest FROM recovery_imports WHERE user_id=?",
       ).get(user);
-      const list = JSON.parse(this.getDocuments(user)) as { documents?: { id?: unknown; deleted?: unknown }[] };
+      const list = JSON.parse(this.getDocuments(user)) as { documents?: { id?: unknown; deleted?: unknown; pages?: { id?: unknown }[] }[] };
       if (!Array.isArray(list.documents)) return "not-empty";
-      if (receipt?.digest === digest && list.documents.some(d => d.id === notebook.id && d.deleted !== true)) {
-        return "replay";
+      const current = list.documents.find(d => d.id === notebook.id && d.deleted !== true);
+      if (receipt?.digest === digest && current) {
+        if (!Array.isArray(current.pages) ||
+            !current.pages.every(p => p && typeof p.id === "string")) return "unverified";
+        const retained = new Set(current.pages.map(p => p.id));
+        return pages.every(p => !retained.has(p.id) || this.verifyRecoveredPage(user, notebook.id, p.id))
+          ? "replay" : "unverified";
       }
       const hasRows = USAGE_TABLES.some(([table]) =>
         !!this.db.query(`SELECT 1 FROM ${table} WHERE user_id=? LIMIT 1`).get(user));
@@ -964,6 +979,9 @@ export class CloudStore {
         return "not-empty";
       }
       storageCheck("before");
+      // Mark the account before generating checkpoint files so every snapshot
+      // written by this restore (and future edits) records an integrity hash.
+      this.db.run("INSERT INTO recovery_imports (user_id, digest) VALUES (?,?)", [user, digest]);
       const timestamp = Date.now();
       this.putDocuments(user, JSON.stringify({
         documents: [{ ...notebook, type: "notebook", parent: "", createdTime: timestamp, lastModified: timestamp }],
@@ -981,9 +999,51 @@ export class CloudStore {
         this.recordOpChange(user, notebook.id, page.id, "recovery");
       }
       storageCheck("after");
-      this.db.run("INSERT INTO recovery_imports (user_id, digest) VALUES (?,?)", [user, digest]);
+      for (const path of this.stagedPageFiles!) this.syncRecoveryPath(path);
+      const snapshotsDir = join(this.filesDir, "snapshots");
+      // A fresh relay may have just created snapshots/ and its parent.
+      this.syncRecoveryPath(snapshotsDir);
+      this.syncRecoveryPath(this.filesDir);
+      this.syncRecoveryPath(dirname(this.filesDir));
       return "created";
     });
+    this.db.run("PRAGMA synchronous = FULL");
+    try {
+      return restore();
+    } finally {
+      this.db.run(`PRAGMA synchronous = ${previous}`);
+    }
+  }
+
+  private syncRecoveryPath(path: string): void {
+    const fd = openSync(path, "r");
+    try { fsyncSync(fd); }
+    finally { closeSync(fd); }
+  }
+
+  private verifyRecoveredPage(user: string, doc: string, page: string): boolean {
+    try {
+      const snapshot = this.latestSnapshotRow(user, doc, page);
+      if (!snapshot?.sha256 || snapshot.op_seq < this.truncationFloor(user, doc, page)) return false;
+      const path = this.existingSnapshotPath(snapshot.path);
+      if (!path) return false;
+      const bytes = readFileSync(path);
+      if (sha256hex(bytes) !== snapshot.sha256) return false;
+      const base = decodeSnapshot(bytes);
+      const ops = this.opsInRange(user, doc, page, snapshot.op_seq, this.latestOpSeq(user, doc, page));
+      const current = reconstructRm(base.rm, ops, DEVICE_BRIDGE_AUTHOR);
+      for (const [, item] of RmDocument.parse(current).tree().walk()) {
+        if (item.kind !== "image") continue;
+        if (!item.filename) return false;
+        const stored = this.db.query<{ bytes: Uint8Array; etag: string | null }, [string, string, string, string]>(
+          "SELECT bytes, etag FROM assets WHERE user_id=? AND doc=? AND page=? AND file=?",
+        ).get(user, doc, page, item.filename);
+        if (!stored?.etag || sha256hex(stored.bytes) !== stored.etag) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Run a synchronous page write under SQLite's write lock. New snapshot
@@ -2473,9 +2533,10 @@ export class CloudStore {
     );
     try {
       writeFileSync(path, bytes);
+      const recovery = this.db.query("SELECT 1 FROM recovery_imports WHERE user_id=?").get(user);
       const seq = this.db
         .query(
-          "INSERT INTO page_snapshots (user_id, doc, page, path, size, ts, op_seq, revert) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO page_snapshots (user_id, doc, page, path, size, ts, op_seq, revert, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .run(
           user,
@@ -2486,6 +2547,7 @@ export class CloudStore {
           Date.now(),
           opSeq,
           revert ? 1 : 0,
+          recovery ? sha256hex(bytes) : null,
         ).lastInsertRowid as number;
       this.stagedPageFiles?.push(path);
       return seq;
@@ -2538,10 +2600,10 @@ export class CloudStore {
   private latestSnapshotRow(user: string, doc: string, page: string) {
     return this.db
       .query<
-        { seq: number; op_seq: number; revert: number; path: string; complete: number },
+        { seq: number; op_seq: number; revert: number; path: string; complete: number; sha256: string | null },
         [string, string, string]
       >(
-        `SELECT s.seq, s.op_seq, s.revert, s.path,
+        `SELECT s.seq, s.op_seq, s.revert, s.path, s.sha256,
            (s.op_seq >= COALESCE((SELECT floor_seq FROM page_floors
              WHERE user_id=?1 AND doc=?2 AND page=?3), 0)
             AND NOT EXISTS (SELECT 1 FROM page_ops
