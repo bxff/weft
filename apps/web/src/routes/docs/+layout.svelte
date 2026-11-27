@@ -42,7 +42,7 @@
             {/each}
         </nav>
 
-        <article class="wf-docs-article">
+        <article class="wf-docs-article wf-reading-column">
             {@render children()}
         </article>
 

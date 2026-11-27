@@ -41,6 +41,8 @@ test("Bun static delivery matches the hosted rules for a built site", async () =
       "/index.html": "entry",
       "/app/shell/shell.html": "notebook shell",
       "/docs.html": "documentation",
+      "/privacy.html": "privacy notice",
+      "/terms.html": "terms",
       "/docs/setup.html": "setup documentation",
       "/docs/__data.json": "docs data",
       "/assets/download": "extensionless asset",
@@ -54,6 +56,8 @@ test("Bun static delivery matches the hosted rules for a built site", async () =
     const cases = [
       ["/", nav, "entry"],
       ["/docs/", nav, "documentation"],
+      ["/privacy", nav, "privacy notice"],
+      ["/terms/", nav, "terms"],
       ["/docs/setup", nav, "setup documentation"],
       ["/docs/__data.json", { accept: "application/json" }, "docs data"],
       ["/docs/missing", nav, null],

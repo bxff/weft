@@ -6,8 +6,8 @@
 <footer class="wf-bottombar">
     <span class="wf-foot-brand">weft</span>
     <span class="wf-foot-meta text-right">
-        © 2026 weft · <a href={source}>source</a> · made by
-        <a href={author}>musaab.io</a>
+        <a href={source}>bxff/weft</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Hosted Terms</a> ·
+        made by <a href={author}>musaab.io</a>
     </span>
 </footer>
 

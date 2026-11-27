@@ -1,7 +1,10 @@
 # Deploy the hosted frontend
 
 For maintainers of a Cloudflare Pages Direct Upload project. This job only
-deploys the static frontend; the relay has its own deployment and credentials.
+deploys the frontend and its read-only library gateway; the relay has its own
+deployment and credentials. Only the hosted browser's notebook-list GET goes
+through the gateway. It forwards the existing bearer, not cookies, and never
+caches notebook data. Tablet, self-hosted, and public API URLs are unchanged.
 
 Set up a GitHub Actions environment named `pages-production`, restricted to the
 `main` branch. Use a dedicated Cloudflare API token with Cloudflare Pages edit

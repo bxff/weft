@@ -67,10 +67,8 @@ export function computeAnchorOffsets(
 
     // Device PDF regressions: Mako's START uses the second paragraph's
     // line-box top, not its baseline (a 33.59375-unit difference).
-    // Mako and InterSync END groups likewise use the last line's top.
-    // These groups have anchorType=2: that field alone does not imply a
-    // baseline offset. The former type-2 branches were unreachable because
-    // anchoredGroups() did not expose anchorType.
+    // Mako and InterSync END groups follow a trailing empty paragraph, so
+    // they use its line top.
     const p0 = paras[0]
     const p1 = paras[1]
     const startY =
@@ -81,7 +79,13 @@ export function computeAnchorOffsets(
               : p1.topInk
     // Preserve the existing fallback for a missing second paragraph;
     // the device regression above covers the multi-paragraph case.
+    // The device export verifies the baseline for a single, unwrapped
+    // heading. Keep existing placement for other styles and wrapped lines
+    // until their device behavior is measured.
+    const heading = paragraphs.length === 1 && p0?.style === 2 &&
+        p0.lineStarts.length === 1 && paragraphs[0]?.spans.some((span) => /\S/.test(span.text))
     const endY = lastLineTopInk
+    const headingEndY = heading ? endY + p0.baselineOffsetInk : endY
     const charAt = new Map(chars.map((c) => [crdtIdKey(c.id), c]))
 
     for (const g of groups) {
@@ -91,7 +95,7 @@ export function computeAnchorOffsets(
             dy = posY + startY
             dx = g.originX ?? posX
         } else if (crdtIdEquals(g.anchorId, ANCHOR_TEXT_END)) {
-            dy = posY + endY
+            dy = posY + (g.anchorType === 2 ? headingEndY : endY)
             dx = g.originX ?? posX
         } else {
             const pos = charAt.get(crdtIdKey(g.anchorId))

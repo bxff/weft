@@ -1,5 +1,6 @@
 @import 'tailwindcss';
 @import 'tldraw/tldraw.css';
+@import './native-font-profile.generated.css';
 @import "tw-animate-css";
 @import "shadcn-svelte/tailwind.css";
 
@@ -297,8 +298,16 @@
 
 /* =========================================================================
    DOCS — native SvelteKit /docs. Flat terminal layout: uniform 16px, the
-   [250px | content | 250px] grid, white headings, blue links, flat #111 code.
+   three-column desktop grid, white headings, blue links, flat #111 code.
    ========================================================================= */
+:root {
+    --wf-reading-width: 68ch;
+}
+.wf-reading-column {
+    width: min(100%, var(--wf-reading-width));
+    margin-inline: auto;
+}
+
 .wf-docs-shell {
     /* tangram outer: grid, rows = header / content / footer, gap-1rem, p-1rem */
     display: grid;
@@ -342,7 +351,7 @@
 }
 @media (min-width: 1024px) {
     .wf-docs-grid {
-        grid-template-columns: 250px minmax(0, 1fr) 250px;
+        grid-template-columns: minmax(0, 1fr) var(--wf-reading-width) minmax(0, 1fr);
     }
 }
 
