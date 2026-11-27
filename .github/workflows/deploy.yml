@@ -1,5 +1,10 @@
 name: Deploy Weft VPS
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/deploy.yml'
+      - 'scripts/deploy-vps-ci.sh'
+      - 'scripts/test-deploy.sh'
   workflow_dispatch:
 
 permissions:
@@ -12,7 +17,7 @@ concurrency:
 
 jobs:
   preflight:
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -21,6 +26,7 @@ jobs:
           persist-credentials: false
       - run: bash scripts/test-deploy.sh
       - name: Require a successful push CI run for this exact commit
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -31,7 +37,7 @@ jobs:
           [[ "$green" == "$GITHUB_SHA" ]] || { echo "CI has not passed on this exact main commit."; exit 1; }
 
   vps:
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 20
