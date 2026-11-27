@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test'
+import { expect, spyOn, test } from 'bun:test'
 import { RmDocument, crdtId, lww, uuidToBytesLE } from '@weft/rm-format'
 import { encodeOp, encodeSnapshot } from '@weft/sync-engine'
 import { startCloud } from '../src/server'
@@ -11,6 +11,20 @@ const asset = 'bbbbbbbb-0000-4000-a000-000000000002'
 const filename = asset + '.png'
 const recovery = { 'x-weft-recovery': '1' }
 const hash = (data: string | Uint8Array) => new Bun.CryptoHasher('sha256').update(data).digest('hex')
+
+function imageDocument(missing: string) {
+    const imagedPage = RmDocument.empty(author)
+    // Match xochitl's registry and image records, but leave the promised file absent.
+    imagedPage.blocks.push({
+        type: 'sceneImageInfo', extraData: new Uint8Array(), version: { min: 1, current: 1 },
+        images: [{ uuid: missing, filename: lww(crdtId(1, 11), missing + '.png'), flags: lww(crdtId(1, 12), new Uint8Array([17, 0])) }],
+    })
+    imagedPage.appendImage({
+        kind: 'image', uuid: lww(crdtId(1, 12), uuidToBytesLE(missing)), timestamp: crdtId(0, 0),
+        vertices: [0, 0, 0, 0, 10, 0, 1, 0, 10, 10, 1, 1], indices: [0, 1, 2], filename: null,
+    }, { authorUuid: author })
+    return imagedPage
+}
 
 test('tablet recovery pins overlay, native content and mutable asset versions', async () => {
     const previous = process.env.HOST
@@ -71,44 +85,59 @@ test('tablet recovery pins overlay, native content and mutable asset versions', 
             nativeBase64: null, snapshotSeq: replacement, opSeq: tailData.opSeq, overlay: { shapes: [] },
         })
 
+        const photoPage = imageDocument(asset).serialize()
+        cloud.store.putSnapshot(user, doc, page, encodeSnapshot(photoPage, { shapes: [] }))
+        const photoNative = { ...recovery, 'x-weft-native-sha256': hash(photoPage) }
         const firstSweep = await get(revisions, recovery)
         const firstSweepTag = firstSweep.headers.get('etag')!
         const firstSweepData = await firstSweep.json() as any
+        const scan = spyOn(cloud.store, 'pageRevisions')
+        expect((await get(revisions, { ...recovery, 'if-none-match': firstSweepTag })).status).toBe(304)
+        expect(scan).not.toHaveBeenCalled()
+        scan.mockRestore()
         expect((await putAsset('image v1')).status).toBe(200)
         const secondSweep = await get(revisions, { ...recovery, 'if-none-match': firstSweepTag })
         const secondSweepData = await secondSweep.json() as any
         expect(secondSweepData.pages).toEqual(firstSweepData.pages)
         expect(secondSweepData.assets[doc + '/' + page]).toBeString()
 
-        const firstAsset = await get(url + '/rm', sameNative)
+        const firstAsset = await get(url + '/rm', photoNative)
         const assetTag = firstAsset.headers.get('etag')!
         expect(await firstAsset.json()).toMatchObject({
             assetRevision: secondSweepData.assets[doc + '/' + page],
             assets: [{ name: filename, sha256: hash('image v1') }],
         })
         expect((await putAsset('image v2')).status).toBe(200)
-        const newer = await get(url + '/rm', { ...sameNative, 'if-none-match': assetTag, 'accept-encoding': 'gzip' })
+        const newer = await get(url + '/rm', { ...photoNative, 'if-none-match': assetTag, 'accept-encoding': 'gzip' })
         expect(newer.headers.get('content-encoding')).toBe('gzip')
         expect(await newer.json()).toMatchObject({
-            nativeBase64: null, snapshotSeq: replacement, opSeq: tailData.opSeq,
+            nativeBase64: null,
             assets: [{ name: filename, sha256: hash('image v2') }],
         })
 
-        const imagedPage = RmDocument.empty(author)
         const missing = 'cccccccc-0000-4000-a000-000000000003'
-        // Match xochitl's registry and image records, but leave the promised file absent.
-        imagedPage.blocks.push({
-            type: 'sceneImageInfo', extraData: new Uint8Array(), version: { min: 1, current: 1 },
-            images: [{ uuid: missing, filename: lww(crdtId(1, 11), missing + '.png'), flags: lww(crdtId(1, 12), new Uint8Array([17, 0])) }],
-        })
-        imagedPage.appendImage({
-            kind: 'image', uuid: lww(crdtId(1, 12), uuidToBytesLE(missing)), timestamp: crdtId(0, 0),
-            vertices: [0, 0, 0, 0, 10, 0, 1, 0, 10, 10, 1, 1], indices: [0, 1, 2], filename: null,
-        }, { authorUuid: author })
+        const imagedPage = imageDocument(missing)
         cloud.store.putSnapshot(user, doc, page, encodeSnapshot(imagedPage.serialize(), { shapes: [] }))
         expect(await (await get(url + '/rm', recovery)).json()).toMatchObject({
-            missingAssets: [missing + '.png'],
+            missingAssets: [missing + '.png'], assets: [],
         })
+        const [imageId] = [...imagedPage.tree().walk()].find(([, item]) => item.kind === 'image')!
+        expect(imagedPage.tombstone(imageId)).toBe(true)
+        cloud.store.putSnapshot(user, doc, page, encodeSnapshot(imagedPage.serialize(), { shapes: [] }))
+        expect(await (await get(url + '/rm', recovery)).json()).toMatchObject({
+            missingAssets: [], assets: [],
+        })
+
+        const legacyPage = 'legacy'
+        cloud.store.putPage(user, doc, legacyPage, '', native, 'test')
+        const beforeLegacy = await get(revisions, recovery)
+        cloud.store.putOverlay(user, doc, legacyPage, JSON.stringify({ shapes: [], tombstones: {} }))
+        const afterLegacy = await get(revisions, { ...recovery, 'if-none-match': beforeLegacy.headers.get('etag')! })
+        expect(afterLegacy.status).toBe(200)
+        const legacyData = await afterLegacy.json() as any
+        expect(legacyData.assets[doc + '/' + legacyPage]).toBeString()
+        expect(await (await get(root + '/documents/' + doc + '/pages/' + legacyPage + '/rm', recovery)).json())
+            .toMatchObject({ assetRevision: legacyData.assets[doc + '/' + legacyPage], overlay: { shapes: [], tombstones: {} } })
     } finally {
         cloud.stop()
         if (previous === undefined) delete process.env.HOST

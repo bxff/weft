@@ -1225,22 +1225,22 @@ export function startCloud(
       // ZERO body — the tablet never re-downloads markers it already acted
       // on (owner requirement: the sweep must not weigh on the device).
       if (path === "/api/revisions" && req.method === "GET") {
-        const recovery = auth.via === "device" && req.headers.get("x-weft-recovery") === "1";
-        const assets = recovery ? store.recoveryAssetRevisions(user) : undefined;
-        const pages = recovery ? store.pageRevisions(user) : undefined;
-        const etag = recovery
-          ? quoteEtag(new Bun.CryptoHasher("sha256").update(JSON.stringify([pages, assets])).digest("hex"))
-          : quoteEtag(String(store.latestChangeSeq(user)));
-        const headers = recovery
-          ? { etag, "cache-control": "private, no-store", vary: "X-Weft-Recovery" }
-          : { etag };
-        if (req.headers.get("if-none-match") === etag) {
-          return new Response(null, {
-            status: 304,
-            headers: { ...headers, ...CORS },
+        const ifNoneMatch = req.headers.get("if-none-match");
+        if (auth.via === "device" && req.headers.get("x-weft-recovery") === "1") {
+          const recovery = store.readRecoveryRevisions(user, ifNoneMatch);
+          const headers = {
+            etag: recovery.etag, "cache-control": "private, no-store", vary: "X-Weft-Recovery",
+          };
+          if (!recovery.body) return new Response(null, {
+            status: 304, headers: { ...CORS, ...headers },
           });
+          return json(recovery.body, 200, headers);
         }
-        return json({ pages: pages ?? store.pageRevisions(user), assets }, 200, headers);
+        const etag = quoteEtag(String(store.latestChangeSeq(user)));
+        if (ifNoneMatch === etag) return new Response(null, {
+          status: 304, headers: { etag, ...CORS },
+        });
+        return json({ pages: store.pageRevisions(user) }, 200, { etag });
       }
 
       // Current storage usage + quota per class (limit 0 = unlimited).

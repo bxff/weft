@@ -203,6 +203,9 @@ export class CloudStore {
                 file TEXT NOT NULL, bytes BLOB NOT NULL, etag TEXT,
                 PRIMARY KEY (user_id, doc, page, file)
             );
+            CREATE TABLE IF NOT EXISTS recovery_epochs (
+                user_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS thumbnails (
                 user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
                 bytes BLOB NOT NULL,
@@ -358,6 +361,20 @@ export class CloudStore {
     if (!(this.db.query<{ name: string }, []>("PRAGMA table_info(assets)").all())
       .some((column) => column.name === "etag")) {
       this.db.run("ALTER TABLE assets ADD COLUMN etag TEXT");
+    }
+    // Existing change sequence covers normal page writes. Track independent
+    // changes transactionally (including DELETE and same-name replacement), so
+    // an unchanged recovery sweep does not have to scan a user's library.
+    for (const table of ["assets", "overlays", "page_snapshots"]) {
+      for (const [event, row] of [["INSERT", "NEW"], ["UPDATE", "NEW"], ["DELETE", "OLD"]]) {
+        this.db.run(`
+          CREATE TRIGGER IF NOT EXISTS recovery_epoch_${table}_${event}
+          AFTER ${event} ON ${table} BEGIN
+            INSERT INTO recovery_epochs (user_id, epoch) VALUES (${row}.user_id, 1)
+            ON CONFLICT(user_id) DO UPDATE SET epoch=epoch+1;
+          END;
+        `);
+      }
     }
     this.initUsageTracking();
   }
@@ -1440,12 +1457,16 @@ export class CloudStore {
 
   /** Existing rows may lack a hash after upgrade. Their marker changes on
    * the first subsequent PUT, and remains stable until the bytes are replaced. */
-  private assetMarker(rows: { file: string; etag: string | null }[]): string {
-    return sha256hex(Buffer.from(JSON.stringify(rows.map(({ file, etag }) => [file, etag]))));
+  private recoveryAssetMarker(
+    rows: { file: string; etag: string | null }[], legacyOverlay: string | null = null,
+  ): string {
+    if (!rows.length && legacyOverlay === null) return "";
+    return sha256hex(Buffer.from(JSON.stringify([rows.map(({ file, etag }) => [file, etag]), legacyOverlay])));
   }
 
   /** A separate marker per page lets an asset-only overwrite wake the tablet
-   * even if the native revision and the retained change feed did not change. */
+   * even if the native revision and the retained change feed did not change.
+   * Legacy blob overlays can change independently of the native revision too. */
   recoveryAssetRevisions(user: string): Record<string, string> {
     const rows = this.db.query<
       { doc: string; page: string; file: string; etag: string | null }, [string]
@@ -1457,7 +1478,29 @@ export class CloudStore {
       if (group) group.push(row);
       else groups.set(key, [row]);
     }
-    return Object.fromEntries([...groups].map(([key, group]) => [key, this.assetMarker(group)]));
+    const legacy = this.db.query<{ doc: string; page: string; json: string }, [string]>(`
+      SELECT o.doc, o.page, o.json FROM overlays o
+      WHERE o.user_id=?1
+        AND NOT EXISTS (SELECT 1 FROM page_ops p WHERE p.user_id=?1 AND p.doc=o.doc AND p.page=o.page)
+        AND NOT EXISTS (SELECT 1 FROM page_snapshots s WHERE s.user_id=?1 AND s.doc=o.doc AND s.page=o.page)
+    `).all(user);
+    const legacyByPage = new Map(legacy.map(({ doc, page, json }) => [`${doc}/${page}`, json]));
+    const keys = new Set([...groups.keys(), ...legacyByPage.keys()]);
+    return Object.fromEntries([...keys].map((key) => [
+      key, this.recoveryAssetMarker(groups.get(key) ?? [], legacyByPage.get(key) ?? null),
+    ]));
+  }
+
+  readRecoveryRevisions(user: string, ifNoneMatch: string | null) {
+    return this.db.transaction(() => {
+      const epoch = this.db.query<{ epoch: number }, [string]>(
+        "SELECT epoch FROM recovery_epochs WHERE user_id=?",
+      ).get(user)?.epoch ?? 0;
+      const etag = `"recovery-v1-${this.latestChangeSeq(user)}-${epoch}"`;
+      return ifNoneMatch === etag
+        ? { etag, body: null }
+        : { etag, body: { pages: this.pageRevisions(user), assets: this.recoveryAssetRevisions(user) } };
+    })();
   }
 
   /** Read all members of the recovery revision in the same SQLite snapshot.
@@ -1477,7 +1520,7 @@ export class CloudStore {
       const rows = this.db.query<{ file: string; etag: string | null }, [string,string,string]>(
         "SELECT file, etag FROM assets WHERE user_id=? AND doc=? AND page=? ORDER BY file",
       ).all(user, doc, page);
-      const assetRevision = rows.length ? this.assetMarker(rows) : "";
+      const assetRevision = this.recoveryAssetMarker(rows, legacyOverlay);
       const etagFor = (native: string) =>
         `"${sha256hex(Buffer.from(JSON.stringify([revision, native, assetRevision, legacyOverlay])))}"`;
       // The client must still hold the exact native bytes for a 304. Including
@@ -1498,18 +1541,21 @@ export class CloudStore {
       const overlay: OverlayDocument = checkpoint?.overlay ?? (legacyOverlay ? JSON.parse(legacyOverlay) : { shapes: [] });
       foldOverlayOps(overlay, ops);
       const nativeSha256 = sha256hex(native);
-      const assets = rows.map(({ file, etag }) => {
-        const bytes = etag ? null : this.getAsset(user, doc, page, file);
-        if (!etag && !bytes) throw new Error("Recovery asset disappeared");
-        return { name: file, sha256: etag ?? sha256hex(bytes!) };
-      });
-      const names = new Set(assets.map(({ name }) => name));
+      const required = new Set<string>();
       const missingAssets = new Set<string>();
       for (const [, item] of RmDocument.parse(native).tree().walk()) {
-        if (item.kind === "image" && (!item.filename || !names.has(item.filename))) {
-          missingAssets.add(item.filename ?? "<unresolved image>");
-        }
+        if (item.kind !== "image") continue;
+        if (item.filename) required.add(item.filename);
+        else missingAssets.add("<unresolved image>");
       }
+      const assets = [];
+      for (const { file, etag } of rows) {
+        if (!required.delete(file)) continue;
+        const bytes = etag ? null : this.getAsset(user, doc, page, file);
+        if (!etag && !bytes) throw new Error("Recovery asset disappeared");
+        assets.push({ name: file, sha256: etag ?? sha256hex(bytes!) });
+      }
+      for (const file of required) missingAssets.add(file);
       return {
         etag: etagFor(nativeSha256),
         body: {
