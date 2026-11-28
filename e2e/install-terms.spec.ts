@@ -23,6 +23,19 @@ test('a new signed-in hosted account can generate a pairing token after agreeing
         })
     })
     await page.goto('/install')
+    await expect(page.getByText('This factory-resets the device.')).toBeVisible()
+    await expect(page.getByText('check that your latest changes are there')).toBeVisible()
+    await expect(page.getByRole('link', { name: 'export it' })).toHaveAttribute(
+        'href',
+        'https://support.remarkable.com/articles/Knowledge/Importing-and-exporting-files',
+    )
+    await expect(page.getByText("don't reset until you've verified an editable copy elsewhere.")).toBeVisible()
+    await expect(page.getByText('Settings › General › Help › About › Copyrights and Licenses')).toBeVisible()
+    await expect(page.getByRole('link', { name: 'Without Connect' })).toHaveAttribute(
+        'href',
+        'https://support.remarkable.com/s/article/Using-reMarkable-without-a-subscription',
+    )
+    await expect(page.getByText("Only use the tablet's Wi-Fi IP if SSH over Wi-Fi is already enabled")).toBeVisible()
     const generate = page.getByRole('button', { name: 'Generate my token' })
     await expect(generate).toBeDisabled()
     expect(requests).toBe(0)
