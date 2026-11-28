@@ -6,6 +6,11 @@ on:
       - '.github/workflows/release-tablet.yml'
       - 'device/**'
   workflow_dispatch:
+    inputs:
+      provenance_preflight:
+        description: Verify branch-bound attestations on main (does not create a release)
+        type: boolean
+        default: false
   push:
     tags: ['tablet-v*']
 
@@ -16,11 +21,6 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-      artifact-metadata: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -66,21 +66,64 @@ jobs:
           done
           (cd release; sha256sum rmsyncd-aarch64 rmsyncd-armv7 > SHA256SUMS)
 
-      - name: Attest the binaries built from the release tag
-        if: github.event_name == 'push'
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
-        with:
-          subject-path: 'device/release/rmsyncd-*'
-
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: weft-tablet-binaries
           path: device/release/
           if-no-files-found: error
 
-  publish:
-    if: github.event_name == 'push'
+  attest:
+    if: >-
+      (github.event_name == 'push' && github.ref_type == 'tag') ||
+      (github.event_name == 'workflow_dispatch' && github.repository == 'bxff/weft' &&
+       github.ref == 'refs/heads/main' && inputs.provenance_preflight)
     needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: weft-tablet-binaries
+          path: release
+
+      - name: Check built asset digests
+        working-directory: release
+        run: sha256sum -c SHA256SUMS
+
+      - name: Attest the built binaries
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: 'release/rmsyncd-*'
+
+      - name: Verify the rehearsal cannot satisfy the tagged installer policy
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          args=(--repo bxff/weft --signer-workflow bxff/weft/.github/workflows/release-tablet.yml
+                --source-digest "$GITHUB_SHA" --deny-self-hosted-runners)
+          for binary in rmsyncd-aarch64 rmsyncd-armv7; do
+            gh attestation verify "$binary" "${args[@]}" --source-ref refs/heads/main
+            # Test this bundle only: identical bytes might already have a tag attestation.
+            gh attestation verify "$binary" "${args[@]}" --bundle "$BUNDLE" --source-ref refs/heads/main
+            if gh attestation verify "$binary" "${args[@]}" --bundle "$BUNDLE" --source-ref refs/tags/tablet-v0.0.0; then
+              echo "Branch attestation incorrectly satisfied the tag policy" >&2
+              exit 1
+            fi
+          done
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: attest
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
