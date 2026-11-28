@@ -14,17 +14,18 @@
  */
 
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BelowFloorError, CloudStore } from "../src/store";
+import { BelowFloorError, CloudStore, CheckpointUnavailableError } from "../src/store";
 import { startCloud, type CloudServer } from "../src/server";
-import { RmDocument } from "@weft/rm-format";
+import { Pen, PenColor, RmDocument, crdtId } from "@weft/rm-format";
 import { polylineToPoints, type Xy } from "@weft/rm-ink/pure";
 import {
   applyOps,
   encodeOp,
   decodeSnapshot,
+  encodeSnapshot,
   type Op,
   type OverlayDocument,
 } from "@weft/sync-engine";
@@ -542,4 +543,167 @@ test("POST /clear-history: live bytes identical, storage freed, old points gone,
       )
     ).status,
   ).toBe(200);
+});
+
+
+test("missing or corrupt history checkpoint refuses reads, reverts and trimming until restored", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "weft-required-checkpoint-"));
+  const relay = startCloud({ port: 0, db: join(dir, "t.db") });
+  const s = relay.store;
+  const endpoint = `http://localhost:${relay.port}/api/documents/${D}/pages/${P}`;
+  const call = (route: string, payload?: object) => fetch(endpoint + route, payload
+    ? { method: "POST", headers: h({ "content-type": "application/json" }), body: JSON.stringify(payload) }
+    : { headers: h() });
+  try {
+    // An untouched page genuinely has no checkpoint and reconstructs empty.
+    expect(liveLines(s.stateAt(USER, D, P, 0).rm)).toBe(0);
+    const e = editor(s, USER);
+    for (let i = 0; i < 12; i++) e.edit();
+    s.compact(USER, D, P, { keepAll: false, keepRecentOps: 5 });
+    const initialFloor = s.truncationFloor(USER, D, P);
+    const snapHead = s.latestOpSeq(USER, D, P);
+    const beforeNativeEdit = s.stateAt(USER, D, P, snapHead);
+    const rm = RmDocument.parse(beforeNativeEdit.rm);
+    rm.appendLine({
+      kind: "line", color: PenColor.BLACK, tool: Pen.FINELINER_1,
+      points: polylineToPoints([{ x: 891, y: 765 }, { x: 940, y: 721 }], { width: 40 }),
+      thicknessScale: 1, startingLength: 0, timestamp: crdtId(0, 0), moveId: null,
+    }, { authorUuid: "bbbbbbbb-0000-4000-b000-000000000002" });
+    const snapSeq = s.putSnapshot(USER, D, P, encodeSnapshot(rm.serialize(), beforeNativeEdit.overlay), false, snapHead);
+    for (let i = 0; i < 9; i++) e.edit();
+    const head = s.latestOpSeq(USER, D, P);
+    const expected = s.stateAt(USER, D, P, head);
+    const points = s.historyPoints(USER, D, P, 100);
+    const ops = s.opsSince(USER, D, P, 0);
+    const db = (s as unknown as { db: import("bun:sqlite").Database }).db;
+    const { path } = db.query<{ path: string }, [number]>("SELECT path FROM page_snapshots WHERE seq=?").get(snapSeq)!;
+    const checkpoint = readFileSync(path);
+    unlinkSync(path);
+
+    expect(() => s.stateAt(USER, D, P, head)).toThrow(CheckpointUnavailableError);
+    expect(() => s.compact(USER, D, P, { keepAll: false, keepRecentOps: 5 })).toThrow(CheckpointUnavailableError);
+    expect((await call(`/at?seq=${head}`)).status).toBe(503);
+    expect((await call("/revert", { toSeq: head })).status).toBe(503);
+    expect((await call("/revert", { toSnapshot: snapSeq })).status).toBe(503);
+    expect((await call("/clear-history", {})).status).toBe(503);
+
+    // Legacy snapshots lack a digest; still refuse a malformed envelope.
+    const invalidFrame = Buffer.from(checkpoint);
+    invalidFrame[0] ^= 1;
+    writeFileSync(path, invalidFrame);
+    expect((await call(`/at?seq=${head}`)).status).toBe(503);
+
+    // A structurally valid changed byte is detected when a digest is recorded.
+    const digest = new Bun.CryptoHasher("sha256").update(checkpoint).digest("hex");
+    db.run("UPDATE page_snapshots SET sha256=? WHERE seq=?", [digest, snapSeq]);
+    const changed = Buffer.from(checkpoint);
+    const shape = changed.indexOf("shape:");
+    expect(shape).toBeGreaterThan(0);
+    changed[shape] = 0x53; // "shape:" -> "Shape:"; valid JSON, same byte count.
+    expect(decodeSnapshot(changed).rm).toEqual(decodeSnapshot(checkpoint).rm);
+    writeFileSync(path, changed);
+    expect(() => s.compact(USER, D, P)).toThrow(CheckpointUnavailableError);
+    expect(s.historyPoints(USER, D, P, 100)).toEqual(points);
+    expect(s.opsSince(USER, D, P, 0)).toEqual(ops);
+    expect(s.truncationFloor(USER, D, P)).toBe(initialFloor);
+
+    writeFileSync(path, checkpoint);
+    const read = await call(`/at?seq=${head}`);
+    expect(read.status).toBe(200);
+    const recovered = decodeSnapshot(new Uint8Array(await read.arrayBuffer()));
+    expect(recovered.rm).toEqual(expected.rm);
+    expect(s.compact(USER, D, P, { keepAll: false, keepRecentOps: 5 }).opsTruncated).toBeGreaterThan(0);
+    expect(s.stateAt(USER, D, P, head)).toEqual(expected);
+  } finally {
+    relay.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("history does not replace a known missing zero-op checkpoint with an older blob", async () => {
+  const { store } = server;
+  const doc = "legacy-history-basis";
+  const page = "zero-op";
+  const old = RmDocument.empty(WEB_AUTHOR);
+  const newer = RmDocument.parse(old.serialize());
+  webStroke(newer, { shapes: [] }, "shape:native-only", [{ x: 20, y: 10 }, { x: 90, y: 75 }]);
+  store.putPage(USER, doc, page, "", old.serialize(), "fixture");
+  expect(store.seedSnapshotFromBlob(USER, doc, page)).toBe(true);
+  const snapSeq = store.putSnapshot(USER, doc, page, encodeSnapshot(newer.serialize(), { shapes: [] }));
+  const db = (store as unknown as { db: import("bun:sqlite").Database }).db;
+  const { path } = db.query<{ path: string }, [number]>("SELECT path FROM page_snapshots WHERE seq=?").get(snapSeq)!;
+  const bytes = readFileSync(path);
+  const points = store.historyPoints(USER, doc, page, 100);
+  unlinkSync(path);
+  try {
+    const result = await fetch(`${base}/api/documents/${doc}/pages/${page}/at?seq=0`, { headers: h() });
+    expect(result.status).toBe(503);
+    const revert = await fetch(`${base}/api/documents/${doc}/pages/${page}/revert`, {
+      method: "POST",
+      headers: h({ "content-type": "application/json" }),
+      body: JSON.stringify({ toSeq: 0 }),
+    });
+    expect(revert.status).toBe(503);
+    expect(store.historyPoints(USER, doc, page, 100)).toEqual(points);
+  } finally {
+    writeFileSync(path, bytes);
+  }
+  const retry = await fetch(`${base}/api/documents/${doc}/pages/${page}/at?seq=0`, { headers: h() });
+  expect(retry.status).toBe(200);
+  expect(liveLines(decodeSnapshot(new Uint8Array(await retry.arrayBuffer())).rm)).toBe(1);
+});
+
+test("browser bootstrap and publish distinguish a lost checkpoint from fresh or opaque snapshots", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "weft-live-checkpoint-"));
+  const relay = startCloud({ port: 0, db: join(dir, "t.db") });
+  const s = relay.store;
+  const db = (s as unknown as { db: import("bun:sqlite").Database }).db;
+  const call = (page: string, body?: Uint8Array) =>
+    fetch(`http://localhost:${relay.port}/api/documents/${D}/pages/${page}/snapshot`, body
+      ? { method: "PUT", headers: h(), body: Buffer.from(body) }
+      : { headers: h() });
+  const empty = encodeSnapshot(RmDocument.empty(WEB_AUTHOR).serialize(), { shapes: [] });
+  const opaque = new TextEncoder().encode("synthetic-future-snapshot-format");
+  try {
+    expect((await call("untouched")).status).toBe(204);
+    expect((await call("untouched", empty)).status).toBe(200);
+    expect((await call("untouched", opaque)).status).toBe(200);
+    expect(new Uint8Array(await (await call("untouched")).arrayBuffer())).toEqual(opaque);
+    for (const count of [0, 3]) {
+      const page = `lost-${count}`;
+      const author = "bbbbbbbb-0000-4000-b000-000000000002";
+      const native = RmDocument.empty(author);
+      native.appendLine({
+        kind: "line", color: PenColor.BLACK, tool: Pen.FINELINER_1,
+        points: polylineToPoints([{ x: 400, y: 410 }, { x: 450, y: 470 }], { width: 40 }),
+        thicknessScale: 1, startingLength: 0, timestamp: crdtId(0, 0), moveId: null,
+      }, { authorUuid: author });
+      const checkpoint = encodeSnapshot(native.serialize(), { shapes: [] });
+      const seq = s.putSnapshot(USER, D, page, checkpoint);
+      const e = editor(s, USER, D, page);
+      for (let i = 0; i < count; i++) e.edit();
+      const expected = s.stateAt(USER, D, page, s.latestOpSeq(USER, D, page));
+      expect(liveLines(expected.rm)).toBe(count + 1);
+      const points = s.historyPoints(USER, D, page, 100);
+      const { path } = db.query<{ path: string }, [number]>("SELECT path FROM page_snapshots WHERE seq=?").get(seq)!;
+      const bytes = readFileSync(path);
+      unlinkSync(path);
+      try {
+        expect((await call(page)).status).toBe(503);
+        expect((await call(page, empty)).status).toBe(503);
+        expect((await call(page, opaque)).status).toBe(503);
+        expect(s.historyPoints(USER, D, page, 100)).toEqual(points);
+      } finally {
+        writeFileSync(path, bytes);
+      }
+      const retry = await call(page);
+      expect(retry.status).toBe(200);
+      expect(new Uint8Array(await retry.arrayBuffer())).toEqual(checkpoint);
+      expect((await call(page, empty)).status).toBe(200);
+      expect(liveLines(s.stateAt(USER, D, page, s.latestOpSeq(USER, D, page)).rm)).toBe(count + 1);
+    }
+  } finally {
+    relay.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
