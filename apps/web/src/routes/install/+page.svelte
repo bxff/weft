@@ -112,25 +112,30 @@
         <p class="my-4">
             <span style="color: var(--gray-f)">1. Enable developer mode.</span>
             Newer reMarkables gate SSH behind developer mode. On the tablet, open
-            <span style="color: var(--gray-b)">Settings › General › Software</span> and turn on
-            developer mode. <span style="color: var(--red)">This factory-resets the device</span>,
-            so make sure your notebooks are synced/backed up first. Follow reMarkable's official
-            steps:
-            <a href="https://support.remarkable.com/s/article/Developer-mode" class="wf-link" target="_blank" rel="noreferrer">Developer mode guide →</a>
+            <span style="color: var(--gray-b)">Settings › General › Paper Tablet › Software › Advanced</span> and turn on
+            developer mode. <span style="color: var(--red)">This factory-resets the device.</span>
+            Before turning it on, open your important notebooks in the reMarkable desktop or
+            mobile app and check that your latest changes are there. If anything is missing,
+            <a href="https://support.remarkable.com/articles/Knowledge/Importing-and-exporting-files" class="wf-link" target="_blank" rel="noreferrer">export it</a>
+            and open the copy on another device before resetting. PDF, PNG, and SVG exports preserve
+            how pages look, not the original editable notebook. If you need to keep editing it,
+            don't reset until you've verified an editable copy elsewhere.
+            <a href="https://support.remarkable.com/s/article/Using-reMarkable-without-a-subscription" class="wf-link" target="_blank" rel="noreferrer">Without Connect</a>,
+            notebooks that haven't been opened and synced within 50 days may only be on the tablet.
+            <a href="https://developer.remarkable.com/documentation/developer-mode" class="wf-link" target="_blank" rel="noreferrer">Developer Mode guide →</a>
         </p>
 
         <p class="my-4">
             <span style="color: var(--gray-f)">2. Get the SSH password.</span>
-            Once developer mode is on, open
-            <span style="color: var(--gray-b)">Settings › General › Help › Copyrights and licenses</span>
-            and note the password (and IP) shown under the "GPLv3 Compliance" section.
+            On Paper Pro, once developer mode is on, open
+            <span style="color: var(--gray-b)">Settings › General › Help › About › Copyrights and Licenses</span>
+            and find the SSH username and password under “General Information.”
         </p>
 
         <p class="my-4">
             <span style="color: var(--gray-f)">3. Connect it to this computer.</span>
-            A USB cable is simplest (the tablet appears at
-            <code class="wf-icode">10.11.99.1</code>). Wi-Fi works too: use the IP from the
-            same screen.
+            Start with USB (<code class="wf-icode">10.11.99.1</code>). Only use the tablet's
+            Wi-Fi IP if SSH over Wi-Fi is already enabled. It is off by default on Paper Pro.
         </p>
 
         <label class="my-4 block">
