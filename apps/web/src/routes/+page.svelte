@@ -35,7 +35,8 @@
     <main>
         <div>
             <p class="my-4 first:mt-0 last:mb-0" style="color: var(--gray-e)">
-                Edit your reMarkable notebooks in a browser. Ink and text sync both ways, including on marked-up PDFs.
+                Edit your reMarkable notebooks in a browser. Ink, text, and PDF annotations sync both ways.
+                Page history lets you restore earlier versions.
             </p>
 
             <!-- Primary action: sign in (hosted). -->
@@ -65,8 +66,8 @@
             {/if}
 
             <p class="my-4">
-                <a href="/install" class="wf-link">Set up your reMarkable Paper Pro</a>.
-                Back up your notes first: turning on Developer Mode factory-resets the tablet.
+                Weft supports the reMarkable Paper Pro. Back up your notes before
+                <a href="/install" class="wf-link">setting up your tablet</a>: Developer Mode factory-resets it.
                 While installed, Weft replaces reMarkable cloud sync, so changes won&rsquo;t
                 reach reMarkable&rsquo;s apps.
             </p>
