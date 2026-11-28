@@ -4,7 +4,9 @@
  */
 
 import { Database } from "bun:sqlite";
+import { withFullDurability } from "./sqlite-durability";
 import { publishBackup } from "./backup";
+import { drainAccountPurge, initAccountPurge, isAccountFenced, stageAccountPurge, withAccountBlobWrite } from "./account-purge";
 import {
   closeSync,
   fsyncSync,
@@ -40,18 +42,6 @@ import {
   type Op,
   type OverlayDocument,
 } from "@weft/sync-engine";
-
-/** Keep FULL enabled through the caller's synchronous, top-level commit. */
-function withFullDurability<T>(db: Database, publish: () => T): T {
-  if (db.inTransaction) throw new Error("Durable publication requires its own transaction");
-  const previous = db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
-  db.run("PRAGMA synchronous = FULL");
-  try {
-    return publish();
-  } finally {
-    db.run(`PRAGMA synchronous = ${previous}`);
-  }
-}
 
 /** Author naming author-table index 1 when seeding an empty reconstructed doc
  *  for the device bridge; real ink ops carry their own authors. */
@@ -408,7 +398,21 @@ export class CloudStore {
       }
     }
     this.initUsageTracking();
+    initAccountPurge(this.db);
     this.reclaimOrphanSources();
+  }
+
+  isAccountFenced(userId: string): boolean {
+    return isAccountFenced(this.db, userId);
+  }
+
+  /** Storage-only foundation; not connected to request handlers. */
+  stageAccountPurge(userId: string): void {
+    stageAccountPurge(this.db, userId);
+  }
+
+  drainAccountPurge(userId: string): { removed: number; remaining: number } {
+    return drainAccountPurge(this.db, this.filesDir, userId);
   }
 
   // ----- per-user storage usage (two classes) -----
@@ -1764,6 +1768,9 @@ export class CloudStore {
     const retired: string[] = [];
     try {
       const published = this.commitSources(() => {
+        // A source admitted through HTTP before an account closes cannot stage
+        // a file after the fence commits. This is inside BEGIN IMMEDIATE.
+        if (this.isAccountFenced(user)) throw new Error("Account is fenced");
         const old = this.sourceRow(user, doc);
         const needed = this.usageBytes(user, "sources") - (old?.size ?? 0) + bytes.length - limit;
         const victims = limit > 0 && needed > 0 ? this.colderSources(user, doc, needed) : [];
@@ -2574,40 +2581,42 @@ export class CloudStore {
     opSeq: number,
     revert: boolean,
   ): number {
-    const dir = join(this.filesDir, "snapshots");
-    mkdirSync(dir, { recursive: true });
-    const path = join(
-      dir,
-      sha256hex(
-        new TextEncoder().encode(
-          `${user} ${doc} ${page} ${crypto.randomUUID()}`,
+    return withAccountBlobWrite(this.db, user, () => {
+      const dir = join(this.filesDir, "snapshots");
+      mkdirSync(dir, { recursive: true });
+      const path = join(
+        dir,
+        sha256hex(
+          new TextEncoder().encode(
+            `${user} ${doc} ${page} ${crypto.randomUUID()}`,
+          ),
         ),
-      ),
-    );
-    try {
-      writeFileSync(path, bytes);
-      const recovery = this.db.query("SELECT 1 FROM recovery_imports WHERE user_id=?").get(user);
-      const seq = this.db
-        .query(
-          "INSERT INTO page_snapshots (user_id, doc, page, path, size, ts, op_seq, revert, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .run(
-          user,
-          doc,
-          page,
-          path,
-          bytes.length,
-          Date.now(),
-          opSeq,
-          revert ? 1 : 0,
-          recovery ? sha256hex(bytes) : null,
-        ).lastInsertRowid as number;
-      this.stagedPageFiles?.push(path);
-      return seq;
-    } catch (error) {
-      this.removeSnapshotFile(path);
-      throw error;
-    }
+      );
+      try {
+        writeFileSync(path, bytes);
+        const recovery = this.db.query("SELECT 1 FROM recovery_imports WHERE user_id=?").get(user);
+        const seq = this.db
+          .query(
+            "INSERT INTO page_snapshots (user_id, doc, page, path, size, ts, op_seq, revert, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          )
+          .run(
+            user,
+            doc,
+            page,
+            path,
+            bytes.length,
+            Date.now(),
+            opSeq,
+            revert ? 1 : 0,
+            recovery ? sha256hex(bytes) : null,
+          ).lastInsertRowid as number;
+        this.stagedPageFiles?.push(path);
+        return seq;
+      } catch (error) {
+        this.removeSnapshotFile(path);
+        throw error;
+      }
+    });
   }
 
   /** The latest snapshot for a page (seq + op_seq cursor + bytes), or null.
