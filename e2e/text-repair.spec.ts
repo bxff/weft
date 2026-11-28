@@ -290,3 +290,63 @@ test('detach releases ink ownership, freezes the shape (no resurrection), re-att
         .poll(async () => (await getRm(page, FREEZE_PAGE)).revision)
         .not.toBe(before)
 })
+
+test('guarded erase parks while newer browser text is waiting for projection', async ({ page }) => {
+    test.skip(process.env.PUBLIC_GUARDED_SAVES !== '1', 'Requires the guarded build')
+    const pageId = crypto.randomUUID()
+    await seedText(page, `/app/${DOC}/${pageId}`, 'ABCD')
+    const shape = await textOverlay(page, pageId, 4)
+    await synced(page)
+    const prior = await page.evaluate(shapeId => {
+        const w = window as any
+        const controller = w.__weftController
+        const editor = w.__weftEditor as Editor
+        const previousFont = controller.font
+        controller.font = null
+        const hold = new Promise(resolve => {
+            w.releaseGuardedProjection = () => {
+                controller.font = previousFont
+                resolve(previousFont)
+            }
+        })
+        controller.ensureFont = () => {
+            w.waitingForGuardedProjection = true
+            return hold
+        }
+        editor.updateShape({
+            id: shapeId as never, type: 'text',
+            props: { richText: { type: 'doc', content: [
+                { type: 'paragraph', content: [{ type: 'text', text: 'XYZW' }] },
+            ] } },
+        })
+        editor.store._flushHistory()
+        return [controller.session.lastSnapshotSeq, controller.session.opCursor] as [number, number]
+    }, shape.shapeId)
+    await expect.poll(() => page.evaluate(() => !!(window as any).waitingForGuardedProjection)).toBe(true)
+    expect(await page.evaluate(shapeId => {
+        const c = (window as any).__weftController
+        return [c.pendingShapeIds.has(shapeId), c.session.pendingCount]
+    }, shape.shapeId)).toEqual([true, 0])
+
+    await tabletErase(page, pageId, glyphItems(shape, 3))
+    await expect.poll(() => page.evaluate(([snapshotSeq, cursor]) => {
+        const s = (window as any).__weftController.session
+        return s.lastSnapshotSeq > snapshotSeq || s.opCursor > cursor
+    }, prior)).toBe(true)
+    const text = page.locator('.tl-shape[data-shape-type="text"]')
+    await expect(text).toHaveText('XYZW')
+    expect(await page.evaluate(shapeId => (window as any).__weftController.session.parkedRepairs.has(shapeId), shape.shapeId)).toBe(true)
+    await page.evaluate(() => (window as any).releaseGuardedProjection())
+    await synced(page)
+    await expect.poll(() => page.evaluate(shapeId => {
+        const c = (window as any).__weftController
+        return [c.pendingShapeIds.has(shapeId), c.session.pendingCount, c.session.parkedRepairs.has(shapeId)]
+    }, shape.shapeId)).toEqual([false, 0, false])
+    const remote = await page.request.get(`/api/documents/${DOC}/pages/${pageId}/overlay`)
+    expect(remote.ok()).toBe(true)
+    const overlay = await remote.json() as OverlayDocument
+    const saved = overlay.shapes.find(entry => entry.shapeId === shape.shapeId)
+    expect(saved?.props).toHaveProperty('richText.content.0.content.0.text', 'XYZW')
+    await page.reload()
+    await expect(text).toHaveText('XYZW')
+})

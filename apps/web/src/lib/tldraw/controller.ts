@@ -431,6 +431,7 @@ export class StudioController {
                 // history timeline label; CRDT identity stays authorUuid
                 historyAuthor: 'web',
                 guardedSaves: scope !== undefined,
+                ...(scope !== undefined && { canApplyGuardedRepair: (shape: OverlayShape) => this.canApplyGuardedRepair(shape) }),
                 cachePrimary: primaryAtOpen,
                 adoptOrphanAuthor,
                 onPatch: (patch) => this.onPatches([patch]),
@@ -3351,7 +3352,7 @@ export class StudioController {
         if (this.disposed) return
         // A peer update can land before the SDK delivers this frame's user
         // changes. Record those edits before resolving their display gaps.
-        if (this.browserOrderTies.size) this.editor.store._flushHistory()
+        if (this.opts.guardedScope !== undefined || this.browserOrderTies.size) this.editor.store._flushHistory()
         let inkChanged = false
         let visibilityChanged = false
         let orderChanged = false
@@ -3518,6 +3519,18 @@ export class StudioController {
             if (orderChanged) this.applyBrowserOrderTies()
             if (visibilityChanged) this.applyLayerVisibility()
         }), { history: 'ignore' })
+    }
+
+    private canApplyGuardedRepair(basis: OverlayShape): boolean {
+        if (this.disposed || !this.session || !this.guardedScopeCurrent()) return false
+        // The SDK listener is frame-batched. An edit can be visible before
+        // pendingShapeIds is populated, or before the engine can stage it.
+        this.editor.store._flushHistory()
+        if (this.hasUnprojectedShape(basis.shapeId) || this.editor.getEditingShapeId() === basis.shapeId) return false
+        const live = this.editor.getShape(basis.shapeId as TLShapeId)
+        const props = browserOverlayProps(basis) as { richText?: unknown } | null
+        return live?.type === 'text' && props?.richText !== undefined &&
+            JSON.stringify(canonicalRichText(live.props.richText)) === JSON.stringify(canonicalRichText(props.richText))
     }
 
     /** ABCD -> ABC: apply the inverse edit to the live text shape. */

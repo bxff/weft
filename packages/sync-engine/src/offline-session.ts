@@ -117,6 +117,8 @@ export interface OfflineSessionOptions extends ApplyOptions {
     historyAuthor?: string
     /** Enable only after the relay supports guarded save receipts. */
     guardedSaves?: boolean
+    /** The visible editor may still have an edit not yet staged in the engine. */
+    canApplyGuardedRepair?: (basis: OverlayShape) => boolean
 }
 
 export class OfflineSession {
@@ -917,7 +919,8 @@ export class OfflineSession {
         const basis = this.overlay.shapes.find(shape => shape.shapeId === patch.shapeId)
         const visible = this.currentOverlay.shapes.find(shape => shape.shapeId === patch.shapeId)
         if (!basis || !visible || compareVersion(basis.version, visible.version) !== 0 ||
-            basis.renderRevision !== visible.renderRevision || basis.state !== visible.state) {
+            basis.renderRevision !== visible.renderRevision || basis.state !== visible.state ||
+            this.opts.canApplyGuardedRepair?.(basis) === false) {
             this.parkedRepairs.add(patch.shapeId)
             return
         }
