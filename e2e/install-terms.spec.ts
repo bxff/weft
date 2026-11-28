@@ -1,13 +1,20 @@
 import { expect, test } from '@playwright/test'
 
-test('hosted install asks for agreement before generating a pairing command', async ({ page }) => {
-    await page.addInitScript(() => {
-        localStorage.setItem('weft-dev-user', 'terms-fixture')
+test('a new signed-in hosted account can generate a pairing token after agreeing to the terms', async ({ page }) => {
+    const fixture = { sub: 'new-beta-account', iss: 'https://fixture.clerk.example', exp: Math.floor(Date.now() / 1000) + 300 }
+    const bearer = `fixture.${Buffer.from(JSON.stringify(fixture)).toString('base64url')}.signature`
+    await page.addInitScript(({ sub, bearer }) => {
+        localStorage.setItem('weft-clerk-pk', 'pk_test_open_beta')
         localStorage.setItem('weft-server-url', 'https://api.weft.page')
-    })
+        Object.assign(window, { __WEFT_CLERK_MOCK__: Promise.resolve({
+            user: { id: sub },
+            session: { id: 'fixture-session', getToken: async () => bearer },
+        }) })
+    }, { sub: fixture.sub, bearer })
     let requests = 0
     await page.route('https://api.weft.page/api/pair', async route => {
         expect(route.request().method()).toBe('POST')
+        expect(route.request().headers().authorization).toBe(`Bearer ${bearer}`)
         expect(route.request().postDataJSON()).toEqual({ label: 'tablet' })
         requests++
         await route.fulfill({
