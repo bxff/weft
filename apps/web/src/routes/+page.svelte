@@ -35,8 +35,8 @@
     <main>
         <div>
             <p class="my-4 first:mt-0 last:mb-0" style="color: var(--gray-e)">
-                Edit your reMarkable notebooks in a browser. Ink, text, and PDF annotations sync both ways.
-                Page history lets you restore earlier versions.
+                weft syncs reMarkable notebooks with a browser editor. Handwriting, typed text
+                and PDF annotations sync both ways. You can restore an earlier version of a page.
             </p>
 
             <!-- Primary action: sign in (hosted). -->
@@ -66,15 +66,15 @@
             {/if}
 
             <p class="my-4">
-                Weft supports the reMarkable Paper Pro. Back up your notes before
-                <a href="/install" class="wf-link">setting up your tablet</a>: Developer Mode factory-resets it.
-                While installed, Weft replaces reMarkable cloud sync, so changes won&rsquo;t
-                reach reMarkable&rsquo;s apps.
+                <a href="/install" class="wf-link">Setup</a>: Paper Pro is supported; reMarkable 1 and 2
+                are experimental. Back up your notes first: turning on Developer Mode factory-resets
+                the Paper Pro. weft replaces reMarkable Cloud sync while installed, so new edits
+                won&rsquo;t appear in reMarkable&rsquo;s apps.
             </p>
 
             <p class="my-4">
-                The hosted beta is free. You don&rsquo;t need reMarkable Connect.
-                Weft is open source and you can run it yourself.
+                The hosted beta is free and doesn&rsquo;t require reMarkable Connect.
+                The code is open source if you&rsquo;d rather run it yourself.
             </p>
         </div>
     </main>
