@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { withFullDurability } from "./sqlite-durability";
 import { closeSync, fsyncSync, lstatSync, openSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { ACCOUNT_PURGE_ORDER, accountReceiptTables, planRelayAccountPurge } from "./account-purge-plan";
@@ -73,17 +74,7 @@ export function stageAccountPurge(db: Database, userId: string, providerTag?: st
 }
 
 export function durableAccountWrite(db: Database, change: () => void): void {
-  if (db.inTransaction) throw new Error("Account purge requires its own writer transaction");
-  // The normal relay connection uses WAL synchronous=NORMAL. A successful
-  // fence/queue write must not roll back after a subsequent permanent unlink
-  // on power loss. FULL synchronizes the WAL commit before we return.
-  const sync = db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
-  if (sync < 2) db.run("PRAGMA synchronous=FULL");
-  try {
-    db.transaction(change).immediate();
-  } finally {
-    if (sync < 2) db.run(sync === 0 ? "PRAGMA synchronous=OFF" : "PRAGMA synchronous=NORMAL");
-  }
+  withFullDurability(db, () => db.transaction(change).immediate(), "at-least-FULL");
 }
 
 function isMissing(error: unknown): boolean {

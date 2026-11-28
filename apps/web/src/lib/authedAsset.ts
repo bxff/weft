@@ -274,12 +274,15 @@ export async function fetchDataUrl(
     const relay = apiBase()
     const initialScope = libraryCacheScope()
     try {
-        if (initialScope === null) await authHeaders(relay)
+        // Get the first request's credentials while the scoped disk cache
+        // is read, but do not make a warm preview wait for authentication.
+        const firstHeaders = authHeaders(relay).catch(() => null)
+        if (initialScope === null && !await firstHeaders) return null
         const scope = libraryCacheScope()
         if (initialScope !== null && initialScope !== scope) return null
         const current = () => !signal.aborted && apiBase() === relay && scope === libraryCacheScope()
         const key = scope ? `${scope}/${path}` : null
-        const cached = key && await readPhoto(key)
+        const cached = key ? await readPhoto(key) : null
         if (!current()) return null
         if (key && cached) {
             const url = await photoUrl(key, cached.etag, cached.bytes, mime)
@@ -288,12 +291,14 @@ export async function fetchDataUrl(
         }
         const locks = typeof navigator !== 'undefined' ? navigator.locks : undefined
         for (let attempt = 0; attempt < 3 && current(); attempt++) {
-            const observed = key ? await readPhoto(key) : null
+            // No need to re-read the cache before the first request. The
+            // commit below still compares against newer writes from other tabs.
+            const observed = attempt === 0 ? cached : key ? await readPhoto(key) : null
             // Old relays used the filename itself as ETag. Only send a
             // content validator so they cannot preserve a stale cache hit.
             const etag = observed && /^"[0-9a-f]{64}"$/.test(observed.etag) ? observed.etag : null
-            const headers = await authHeaders(relay)
-            if (!current()) return null
+            const headers = attempt === 0 ? await firstHeaders : await authHeaders(relay)
+            if (!headers || !current()) return null
             const response = await fetch(`${relay}${path}`, {
                 cache: 'no-store',
                 signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),

@@ -2289,79 +2289,70 @@ export class StudioController {
                 handler: (content: FilesContent) => Promise<void>,
             ) => void
         }
-        editor.registerExternalContentHandler?.('files', async (content) => {
+        editor.registerExternalContentHandler?.('files', (content) => {
             const file = content.files.find((f) => /^image\/(png|jpeg)$/.test(f.type))
-            if (!file || this.disposed) return
+            if (!file || this.disposed) return Promise.resolve()
             const center = content.point ?? this.editor.getViewportPageBounds().center
-            const ext = file.type === 'image/jpeg' ? 'jpg' : 'png'
-            const assetUuid = uuidv4()
-            const filename = `${assetUuid}.${ext}`
-            const bytes = new Uint8Array(await file.arrayBuffer())
-            const bitmap = await createImageBitmap(file)
-            const { width, height } = bitmap
-            bitmap.close()
-            if (this.disposed) return
-            const assetScope = libraryCacheScope()
-            try {
-                await this.opts.transport.putAsset(
-                    this.opts.docId,
-                    this.opts.pageId,
-                    filename,
-                    bytes,
-                )
-                // the bytes are in hand: render must not round-trip the server
-                await seedAssetBytes(
-                    `/api/documents/${this.opts.docId}/pages/${this.opts.pageId}/assets/${encodeURIComponent(filename)}`,
-                    bytes,
-                    assetScope,
-                )
-            } catch (e) {
-                if (this.disposed) return
-                this.opts.onStatus?.({
-                    state: 'error',
-                    detail: `image upload failed: ${String(e)}`,
-                })
-                return
+            const { x, y } = center
+            const target = this.listLayers().find((layer) => layer.active)
+            const scope = libraryCacheScope()
+            const ownerIsCurrent = () =>
+                !this.disposed && scope !== null && scope === libraryCacheScope() &&
+                (this.photoOwner === null || this.photoOwner === scope)
+            const checkTarget = () => {
+                if (!ownerIsCurrent()) throw new Error('The notebook account changed')
+                const layers = this.listLayers()
+                if (target ? !layers.some((layer) => layer.key === target.key) : layers.length !== 0) {
+                    throw new Error('The original layer is no longer available')
+                }
             }
-            if (this.disposed) return
-            // natural pixels as ink units, capped to a sane page footprint
-            const MAX_INK = 900
-            const scale = Math.min(1, MAX_INK / Math.max(width, height))
-            const w = width * scale
-            const h = height * scale
-            const cx = center.x / RM_SCALE
-            const cy = center.y / RM_SCALE
-            const x0 = cx - w / 2
-            const y0 = Math.max(0, cy - h / 2)
-            await this.trackCommand(this.applyLocal([
-                {
+            const insert = async () => {
+                const ext = file.type === 'image/jpeg' ? 'jpg' : 'png'
+                const assetUuid = uuidv4()
+                const filename = `${assetUuid}.${ext}`
+                let width: number
+                let height: number
+                try {
+                    checkTarget()
+                    const bytes = new Uint8Array(await file.arrayBuffer())
+                    const bitmap = await createImageBitmap(file)
+                    ;({ width, height } = bitmap)
+                    bitmap.close()
+                    checkTarget()
+                    await this.opts.transport.putAsset(this.opts.docId, this.opts.pageId, filename, bytes, ownerIsCurrent)
+                    await seedAssetBytes(
+                        `/api/documents/${this.opts.docId}/pages/${this.opts.pageId}/assets/${encodeURIComponent(filename)}`,
+                        bytes,
+                        scope,
+                    )
+                    checkTarget()
+                } catch (error) {
+                    if (!this.disposed) this.opts.onStatus?.({
+                        state: 'error',
+                        detail: `Image was not inserted: ${String(error)}. Paste or drop it again to retry.`,
+                    })
+                    throw error
+                }
+
+                // Natural pixels as ink units, capped to a sane page footprint.
+                const scale = Math.min(1, 900 / Math.max(width, height))
+                const w = width * scale
+                const h = height * scale
+                const x0 = x / RM_SCALE - w / 2
+                const y0 = Math.max(0, y / RM_SCALE - h / 2)
+                await this.applyLocal([{
                     type: 'insert-image',
                     assetUuid,
                     filename,
-                    ...(this.activeLayer ? { layer: this.activeLayer } : {}),
-                    vertices: [
-                        x0,
-                        y0,
-                        0,
-                        0,
-                        x0 + w,
-                        y0,
-                        1,
-                        0,
-                        x0 + w,
-                        y0 + h,
-                        1,
-                        1,
-                        x0,
-                        y0 + h,
-                        0,
-                        1,
-                    ],
-                },
-            ], () => {
-                // Render the new placement (own writes emit no patches).
-                this.remote(() => this.renderInkItems(this.ownedItemKeys()))
-            })).catch(() => {})
+                    ...(target ? { layer: target.ref } : {}),
+                    vertices: [x0, y0, 0, 0, x0 + w, y0, 1, 0, x0 + w, y0 + h, 1, 1, x0, y0 + h, 0, 1],
+                }], () => {
+                    this.remote(() => this.renderInkItems(this.ownedItemKeys()))
+                })
+            }
+            // Departure must see the command before its first asynchronous
+            // stage. The canvas handler has no caller to surface rejections.
+            return this.trackCommand(insert()).catch(() => {})
         })
     }
 
