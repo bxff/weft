@@ -173,7 +173,7 @@ export class OfflineSession {
         // the page may have changed while NO session was watching (tablet
         // moves/erases of our rendered shapes): audit before the view binds
         if (session.runAudit(patch => {
-            if (opts.guardedSaves && patch.type === 'shape-edited') session.emitGuardedRepair(patch)
+            if ((opts.guardedSaves || session.publication) && patch.type === 'shape-edited') session.emitGuardedRepair(patch)
             else opts.onPatch(patch)
         })) await session.persist()
         if (session.bootstrapped || session.pendingOps.length) opts.onPageAvailable?.()
@@ -965,7 +965,9 @@ export class OfflineSession {
         // A receipt proves remote durability, not successful local folding.
         // Defer observers and keep a rollback copy until the complete
         // authoritative state exists. A failed fold leaves the outbox visible.
-        const prior = receiptFold ? {
+        const guardedView = !!(this.opts.guardedSaves || receiptFold)
+        const canonicalGuarded = guardedView && (!!snap || records.length > 0 || this.parkedRepairs.size > 0)
+        const prior = canonicalGuarded ? {
             baseDoc: this.baseDoc,
             overlay: this.overlay,
             opCursor: this.opCursor,
@@ -974,7 +976,7 @@ export class OfflineSession {
         } : null
         const notifications: Array<() => void> = []
         const notify = (fn: () => void) => {
-            if (receiptFold) notifications.push(fn)
+            if (guardedView) notifications.push(fn)
             else fn()
         }
         const notifyPatch = (patch: ViewPatch) => notify(() => this.opts.onPatch(patch))
@@ -984,17 +986,16 @@ export class OfflineSession {
         let nativeBytes: Uint8Array | undefined
         let repaired: boolean
         const repairs: Array<Extract<ViewPatch, { type: 'shape-edited' }>> = []
-        const canonicalReceipt = !!receiptFold && (!!snap || records.length > 0 || this.parkedRepairs.size > 0)
         if (prior) this.overlay = structuredClone(prior.overlay)
         try {
             // Follow one canonical guarded projection. Queued upsert objects
             // can be mutated by native move audit; replaying their mirror move
             // after a post-audit upsert would translate the same shape twice.
-            const publishReplacement = snap && !canonicalReceipt ? this.opts.onPatchBatch : undefined
-            const auditFolded = !!snap || canonicalReceipt
+            const publishReplacement = snap && !canonicalGuarded ? this.opts.onPatchBatch : undefined
+            const auditFolded = !!snap || canonicalGuarded
             const collectReplacement = auditFolded ? (patch: ViewPatch) => {
                 if (patch.type === 'shape-edited') repairs.push(patch)
-                else if (!publishReplacement && !canonicalReceipt) notifyPatch(patch)
+                else if (!publishReplacement && !canonicalGuarded) notifyPatch(patch)
             } : undefined
             const previous = auditFolded && !snap?.revert && this.bootstrapped ? this.baseDoc : null
             if (snap && replacement && replacementDoc) {
@@ -1011,7 +1012,7 @@ export class OfflineSession {
             const snapshotBase = snap ? this.baseDoc : null
             // A single-patch subscriber also observes the individual changes since
             // this checkpoint. Compare ink after the tail has established ownership.
-            const priorInk = snap && !publishReplacement && !canonicalReceipt &&
+            const priorInk = snap && !publishReplacement && !canonicalGuarded &&
                 batch.some(op => op.op === 'add' || op.op === 'tombstone')
                 ? snapshotKnownState(this.baseDoc) : null
             if (records.length) {
@@ -1028,12 +1029,12 @@ export class OfflineSession {
                 if (diff.foreignAdds.length) notifyPatch({ type: 'ink-added', items: diff.foreignAdds })
                 if (diff.foreignDeletes.length) notifyPatch({ type: 'ink-removed', items: diff.foreignDeletes })
             }
-            if (snap || canonicalReceipt) {
+            if (snap || canonicalGuarded) {
                 const patch = { type: 'document-replaced' } as const
                 if (notifyBatch) notifyBatch([patch])
                 else notifyPatch(patch)
             }
-            if (!receiptFold) for (const repair of repairs) notifyPatch(repair)
+            if (!guardedView) for (const repair of repairs) notifyPatch(repair)
         } catch (error) {
             if (prior) {
                 this.baseDoc = prior.baseDoc
@@ -1058,7 +1059,7 @@ export class OfflineSession {
             }
         }
         for (const callback of notifications) observeConfirmed(callback)
-        if (canonicalReceipt) {
+        if (canonicalGuarded) {
             // A superseding projection or native edit can eliminate the old
             // repair. The final audit, not this in-memory set, is authoritative.
             const repairIds = new Set(repairs.map(repair => repair.shapeId))
@@ -1072,7 +1073,7 @@ export class OfflineSession {
         if (!active()) return false
         if (first) {
             this.bootstrapped = true
-            if (receiptFold) observeConfirmed(() => this.opts.onPageAvailable?.())
+            if (guardedView) observeConfirmed(() => this.opts.onPageAvailable?.())
             else this.opts.onPageAvailable?.()
         }
         if (repaintNeeded && active()) {

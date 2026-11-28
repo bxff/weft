@@ -405,8 +405,8 @@ test('a view observer exception cannot prevent atomic local retirement of an acc
     }
 })
 
-for (const replacement of ['none', 'relay', 'optimistic'] as const) {
-    test(`guarded receipt resolves glyph repair against the final folded overlay (replacement=${replacement})`, async () => {
+for (const scenario of ['none', 'relay', 'optimistic', 'before-snapshot', 'before-tail'] as const) {
+    test(`guarded pull resolves glyph repair against the final folded overlay (${scenario})`, async () => {
         const daemon = new GuardedDaemon()
         daemon.subscribe = () => () => {}
         const id = 'shape:glyphs'
@@ -440,36 +440,51 @@ for (const replacement of ['none', 'relay', 'optimistic'] as const) {
         })
         try {
             await session.reconcile()
-            daemon.afterSave = async () => {
-                const blobs = [encodeOp({ op: 'tombstone', id: { author: deleted.authorUuid, clock: deleted.clock } })]
-                daemon.afterSave = undefined
-                if (replacement === 'relay') blobs.push(encodeOp({
-                    op: 'upsert-object', id, objType: 'text', props: { text: 'XBC' },
-                    transform: { x: 0, y: 0, rotation: 0 }, rendered: shape.rendered.slice(0, 3),
-                    version: { actor: B, ts: 2 }, renderRevision: 'new',
-                }))
-                await daemon.appendOps('d', 'p', blobs, B)
-                if (replacement === 'optimistic') {
-                    daemon.beforeSave = async () => {
-                        const state = session as unknown as { parkedRepairs: Set<string> }
-                        observedParked = state.parkedRepairs.has(id)
-                    }
-                    await session.apply([{
-                        ...initial,
-                        shape: { ...initial.shape, props: { text: 'XYZW' }, renderRevision: 'new-local', version: { actor: C, ts: 2 } },
-                    }])
-                }
+            const newLocal: LocalOp = {
+                ...initial,
+                shape: { ...initial.shape, props: { text: 'XYZW' }, renderRevision: 'new-local', version: { actor: C, ts: 2 } },
             }
-            await session.apply([outgoing])
+            const observeParking = async () => {
+                const state = session as unknown as { parkedRepairs: Set<string> }
+                observedParked = state.parkedRepairs.has(id)
+            }
+            if (scenario.startsWith('before-')) {
+                daemon.beforeSave = observeParking
+                if (scenario === 'before-snapshot') {
+                    expect(base.tombstone({ part1: base.resolveAuthor(deleted.authorUuid), part2: deleted.clock })).toBe(true)
+                    await daemon.putSnapshot('d', 'p', encodeSnapshot(base.serialize(), overlay))
+                } else {
+                    await daemon.appendOps('d', 'p', [encodeOp({
+                        op: 'tombstone', id: { author: deleted.authorUuid, clock: deleted.clock },
+                    })], B)
+                }
+                await session.apply([newLocal])
+            } else {
+                daemon.afterSave = async () => {
+                    const blobs = [encodeOp({ op: 'tombstone', id: { author: deleted.authorUuid, clock: deleted.clock } })]
+                    daemon.afterSave = undefined
+                    if (scenario === 'relay') blobs.push(encodeOp({
+                        op: 'upsert-object', id, objType: 'text', props: { text: 'XBC' },
+                        transform: { x: 0, y: 0, rotation: 0 }, rendered: shape.rendered.slice(0, 3),
+                        version: { actor: B, ts: 2 }, renderRevision: 'new',
+                    }))
+                    await daemon.appendOps('d', 'p', blobs, B)
+                    if (scenario === 'optimistic') {
+                        daemon.beforeSave = observeParking
+                        await session.apply([newLocal])
+                    }
+                }
+                await session.apply([outgoing])
+            }
             for (let i = 0; i < 3; i++) await session.reconcile()
             expect(session.pendingCount).toBe(0)
             expect(daemon.accepted[0]?.kind).toBe('ops')
-            expect(observedParked).toBe(replacement === 'optimistic')
+            if (scenario !== 'none') expect(observations).toEqual([])
+            expect(observedParked).toBe(scenario === 'optimistic' || scenario.startsWith('before-'))
             expect((session as unknown as { parkedRepairs: Set<string> }).parkedRepairs.size).toBe(0)
-            if (replacement !== 'none') {
-                expect(observations).toEqual([])
+            if (scenario !== 'none') {
                 expect(session.currentOverlay.shapes.find(shape => shape.shapeId === id)?.props).toEqual({
-                    text: replacement === 'optimistic' ? 'XYZW' : 'XBC',
+                    text: scenario === 'relay' ? 'XBC' : 'XYZW',
                 })
             } else {
                 expect(observations).toEqual([{
