@@ -641,9 +641,8 @@ export function startCloud(
         });
       }
 
-      // Invite-link sign-up (private beta). One shareable link
-      // (weft.page/join#<code>) lets friends in while the public waitlist
-      // stays on: the join page POSTs {code, email} here, we mint a
+      // Optional legacy invite-link sign-up. The join page can POST
+      // {code, email} from an existing link to have the relay mint a
       // single-use Clerk invitation (notify:false — the visitor is redirected
       // immediately, no email that could land in spam) and return the
       // ticketed portal sign-up URL. WEFT_INVITE_CODE unset = endpoint off.

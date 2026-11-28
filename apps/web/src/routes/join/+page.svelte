@@ -4,8 +4,7 @@
     import SiteFooter from '$lib/components/SiteFooter.svelte'
     import { connection } from '$lib/settings'
 
-    // Shareable beta door: code rides the URL (#<code> or ?code=), visitor
-    // types only their email. POST /api/invite returns a ticketed sign-up URL.
+    // Keep coded links working for deployments that still enable invitations.
     let code = $state('')
     let email = $state('')
     let busy = $state(false)
@@ -43,36 +42,34 @@
     <!-- Block centered in the viewport, text left-aligned. -->
     <main class="grid place-content-center">
         <div style="max-width: 46ch">
-        <h1 class="my-4" style="color: var(--gray-f)">You're invited</h1>
+            <h1 class="my-4" style="color: var(--gray-f)">Join Weft</h1>
+            <p class="my-4">Weft’s hosted beta is open. You don’t need an invitation to sign up.</p>
+            <a href="/" class="wf-cta" rel="noreferrer">Continue to Weft</a>
 
-        {#if code}
-            <p class="my-4">
-                Someone shared their weft beta invite with you. Enter the email of the
-                Google account you'll sign in with, and you'll go straight to sign-up.
-            </p>
-
-            <form class="my-6 flex items-center gap-3" onsubmit={join}>
-                <input
-                    type="email"
-                    required
-                    placeholder="you@gmail.com"
-                    bind:value={email}
-                    class="w-72 border px-3 py-1.5 text-sm outline-none focus:border-[var(--blue)]"
-                    style="border-color: var(--gray-3); border-radius: var(--radius); background: var(--gray-1); color: var(--gray-b)"
-                />
-                <button type="submit" class="wf-cta disabled:opacity-50" disabled={busy || !email}>
-                    {busy ? 'One moment' : 'Get access'}
-                </button>
-            </form>
-            {#if error}
-                <p class="my-2 text-[13px]" style="color: var(--red)">{error}</p>
+            {#if code}
+                <details class="my-6">
+                    <summary>Use an existing invitation instead</summary>
+                    <form class="my-4 flex flex-wrap items-end gap-3" onsubmit={join}>
+                        <label class="flex flex-col gap-1">
+                            Google account email
+                            <input
+                                type="email"
+                                required
+                                autocomplete="email"
+                                bind:value={email}
+                                class="border px-3 py-1.5 text-sm outline-none focus:border-[var(--blue)]"
+                                style="border-color: var(--gray-3); border-radius: var(--radius); background: var(--gray-1); color: var(--gray-b)"
+                            />
+                        </label>
+                        <button type="submit" class="wf-cta disabled:opacity-50" disabled={busy || !email}>
+                            {busy ? 'One moment' : 'Use invitation'}
+                        </button>
+                    </form>
+                    {#if error}
+                        <p class="my-2 text-[13px]" role="alert" style="color: var(--red)">{error}</p>
+                    {/if}
+                </details>
             {/if}
-        {:else}
-            <p class="my-4">
-                This page needs an invite link with its code attached. If a friend sent
-                you here, ask them for the full link.
-            </p>
-        {/if}
         </div>
     </main>
 
