@@ -807,13 +807,17 @@ export class OfflineSession {
             throw new Error('Cannot yet rebase pending native text anchors safely')
         }
         if (receipt.kind !== 'stale') {
-            await this.pullOps(gen, true, (seq, cursor) => {
-                const present = receipt.kind === 'ops' ? cursor >= receipt.lastSeq : seq >= receipt.seq
-                if (!present) throw new Error('Relay save is not yet readable')
-                // Apply the authoritative checkpoint without replaying the
-                // acknowledged prefix in the optimistic editor view.
-                this.confirmedPrefix = publication.count
-                this.pendingVersion++
+            await this.pullOps(gen, true, {
+                verify: (seq, cursor) => {
+                    const present = receipt.kind === 'ops' ? cursor >= receipt.lastSeq : seq >= receipt.seq
+                    if (!present) throw new Error('Relay save is not yet readable')
+                },
+                complete: () => {
+                    // Hide the optimistic copy only after the authority has
+                    // been folded successfully, before the view is notified.
+                    this.confirmedPrefix = publication.count
+                    this.pendingVersion++
+                },
             }, false)
         }
         await this.writePending(async () => {
@@ -905,7 +909,10 @@ export class OfflineSession {
     private async pullOps(
         gen: number,
         forceTail = false,
-        beforeFold?: (snapshotSeq: number, cursor: number) => void,
+        receiptFold?: {
+            verify: (snapshotSeq: number, cursor: number) => void
+            complete: () => void
+        },
         persistCheckpoint = true,
     ): Promise<boolean> {
         const active = () => gen === this.generation && !this.disposed
@@ -934,53 +941,97 @@ export class OfflineSession {
         const batch = records.map((r) => decodeOp(r.op))
         const replacement = snap ? decodeSnapshot(snap.bytes) : null
         const replacementDoc = replacement ? RmDocument.parse(replacement.rm) : null
-        beforeFold?.(snap?.seq ?? this.lastSnapshotSeq, records.at(-1)?.seq ?? snap?.opSeq ?? this.opCursor)
-        // A replacement paints the final checkpoint and tail together. Keep
-        // follow-up repairs separate, after the source shapes are installed.
-        const publishReplacement = snap ? this.opts.onPatchBatch : undefined
-        const repairs: ViewPatch[] = []
-        const collectReplacement = snap ? (patch: ViewPatch) => {
-            if (patch.type === 'shape-edited') repairs.push(patch)
-            else if (!publishReplacement) this.opts.onPatch(patch)
-        } : undefined
-        const previous = snap && !snap.revert && this.bootstrapped ? this.baseDoc : null
+        receiptFold?.verify(snap?.seq ?? this.lastSnapshotSeq, records.at(-1)?.seq ?? snap?.opSeq ?? this.opCursor)
+        // A receipt proves remote durability, not successful local folding.
+        // Defer observers and keep a rollback copy until the complete
+        // authoritative state exists. A failed fold leaves the outbox visible.
+        const prior = receiptFold ? {
+            baseDoc: this.baseDoc,
+            overlay: this.overlay,
+            opCursor: this.opCursor,
+            lastSnapshotSeq: this.lastSnapshotSeq,
+            overlayVersion: this.overlayVersion,
+        } : null
+        const notifications: Array<() => void> = []
+        const notify = (fn: () => void) => {
+            if (receiptFold) notifications.push(fn)
+            else fn()
+        }
+        const notifyPatch = (patch: ViewPatch) => notify(() => this.opts.onPatch(patch))
+        const notifyBatch = this.opts.onPatchBatch
+            ? (patches: readonly ViewPatch[]) => notify(() => this.opts.onPatchBatch!(patches))
+            : undefined
         let nativeBytes: Uint8Array | undefined
-        if (snap && replacement && replacementDoc) {
-            const { rm, overlay } = replacement
-            this.baseDoc = replacementDoc
-            nativeBytes = rm
-            // The explicit revert can rewind versions. Ordinary checkpoints merge
-            // with the existing overlay to retain already-known newer records.
-            this.overlay = snap.revert ? overlay : mergeOverlayDocuments(this.overlay, overlay)
-            this.opCursor = snap.opSeq
-            this.lastSnapshotSeq = snap.seq
-            this.overlayVersion++
+        let repaired: boolean
+        if (prior) this.overlay = structuredClone(prior.overlay)
+        try {
+            // A replacement paints the final checkpoint and tail together. Keep
+            // follow-up repairs separate, after the source shapes are installed.
+            const publishReplacement = snap ? this.opts.onPatchBatch : undefined
+            const repairs: ViewPatch[] = []
+            const collectReplacement = snap ? (patch: ViewPatch) => {
+                if (patch.type === 'shape-edited') repairs.push(patch)
+                else if (!publishReplacement) notifyPatch(patch)
+            } : undefined
+            const previous = snap && !snap.revert && this.bootstrapped ? this.baseDoc : null
+            if (snap && replacement && replacementDoc) {
+                const { rm, overlay } = replacement
+                this.baseDoc = replacementDoc
+                nativeBytes = rm
+                // The explicit revert can rewind versions. Ordinary checkpoints merge
+                // with the existing overlay to retain already-known newer records.
+                this.overlay = snap.revert ? overlay : mergeOverlayDocuments(this.overlay, overlay)
+                this.opCursor = snap.opSeq
+                this.lastSnapshotSeq = snap.seq
+                this.overlayVersion++
+            }
+            const snapshotBase = snap ? this.baseDoc : null
+            // A single-patch subscriber also observes the individual changes since
+            // this checkpoint. Compare ink after the tail has established ownership.
+            const priorInk = snap && !publishReplacement && batch.some(op => op.op === 'add' || op.op === 'tombstone')
+                ? snapshotKnownState(this.baseDoc) : null
+            if (records.length) {
+                this.applyOpBatch(batch, collectReplacement, notifyPatch, notifyBatch)
+                this.opCursor = records[records.length - 1]!.seq
+            }
+            const replayedInk = snapshotBase && snapshotBase !== this.baseDoc
+            repaired = snap ? this.runAudit(collectReplacement, {
+                previous: replayedInk ? snapshotBase : previous,
+                beforeSnapshot: replayedInk ? previous : null,
+            }) : false
+            if (priorInk) {
+                const diff = diffPage(priorInk, this.baseDoc, this.overlay)
+                if (diff.foreignAdds.length) notifyPatch({ type: 'ink-added', items: diff.foreignAdds })
+                if (diff.foreignDeletes.length) notifyPatch({ type: 'ink-removed', items: diff.foreignDeletes })
+            }
+            if (snap) {
+                const patch = { type: 'document-replaced' } as const
+                if (publishReplacement) notifyBatch?.([patch])
+                else notifyPatch(patch)
+                for (const repair of repairs) notifyPatch(repair)
+            }
+        } catch (error) {
+            if (prior) {
+                this.baseDoc = prior.baseDoc
+                this.overlay = prior.overlay
+                this.opCursor = prior.opCursor
+                this.lastSnapshotSeq = prior.lastSnapshotSeq
+                this.overlayVersion = prior.overlayVersion
+            }
+            throw error
         }
-        const snapshotBase = snap ? this.baseDoc : null
-        // A single-patch subscriber also observes the individual changes since
-        // this checkpoint. Compare ink after the tail has established ownership.
-        const priorInk = snap && !publishReplacement && batch.some(op => op.op === 'add' || op.op === 'tombstone')
-            ? snapshotKnownState(this.baseDoc) : null
-        if (records.length) {
-            this.applyOpBatch(batch, collectReplacement)
-            this.opCursor = records[records.length - 1]!.seq
+        receiptFold?.complete()
+        const observeConfirmed = (callback: () => void) => {
+            try {
+                callback()
+            } catch {
+                // A paint failure cannot unwind an accepted publication or
+                // stop its exact checkpoint and journal retirement. Exceptions
+                // from view code can embed note text; don't report their detail.
+                this.reportFailure('codec', 'ViewPatch', 'Guarded view observer failed')
+            }
         }
-        const replayedInk = snapshotBase && snapshotBase !== this.baseDoc
-        const repaired = snap ? this.runAudit(collectReplacement, {
-            previous: replayedInk ? snapshotBase : previous,
-            beforeSnapshot: replayedInk ? previous : null,
-        }) : false
-        if (priorInk) {
-            const diff = diffPage(priorInk, this.baseDoc, this.overlay)
-            if (diff.foreignAdds.length) this.opts.onPatch({ type: 'ink-added', items: diff.foreignAdds })
-            if (diff.foreignDeletes.length) this.opts.onPatch({ type: 'ink-removed', items: diff.foreignDeletes })
-        }
-        if (snap) {
-            const patch = { type: 'document-replaced' } as const
-            if (publishReplacement) publishReplacement([patch])
-            else this.opts.onPatch(patch)
-            for (const repair of repairs) this.opts.onPatch(repair)
-        }
+        for (const callback of notifications) observeConfirmed(callback)
         const first = !this.bootstrapped
         if (persistCheckpoint && (first || snap || records.length || this.checkpointDirty)) {
             await this.persist(gen, records.length || repaired ? undefined : nativeBytes)
@@ -988,7 +1039,8 @@ export class OfflineSession {
         if (!active()) return false
         if (first) {
             this.bootstrapped = true
-            this.opts.onPageAvailable?.()
+            if (receiptFold) observeConfirmed(() => this.opts.onPageAvailable?.())
+            else this.opts.onPageAvailable?.()
         }
         return skipTail
     }
@@ -999,20 +1051,25 @@ export class OfflineSession {
      *  actually changed the live overlay — a STALE op (lower version) or our own
      *  echo (equal version) is dropped, so the view never churns or "flips back"
      *  to an older edit. */
-    private applyOpBatch(batch: Op[], capture?: (patch: ViewPatch) => void): void {
+    private applyOpBatch(
+        batch: Op[],
+        capture?: (patch: ViewPatch) => void,
+        notifyPatch = this.opts.onPatch,
+        notifyBatch = this.opts.onPatchBatch,
+    ): void {
         const patches: ViewPatch[] = []
         const publish = () => {
-            if (patches.length) this.opts.onPatchBatch?.(patches.splice(0))
+            if (patches.length) notifyBatch?.(patches.splice(0))
         }
         const emit = capture ?? ((patch: ViewPatch) => {
-            if (this.opts.onPatchBatch && patch.type !== 'shape-edited') {
+            if (notifyBatch && patch.type !== 'shape-edited') {
                 patches.push(patch)
                 return
             }
             // A repair projects a local write using the state at this point in
             // the pull. Apply earlier paints before handing off the repair.
             publish()
-            this.opts.onPatch(patch)
+            notifyPatch(patch)
         })
         const inkOps = batch.filter(
             (o): o is AddItemOp | TombstoneOp => o.op === 'add' || o.op === 'tombstone',

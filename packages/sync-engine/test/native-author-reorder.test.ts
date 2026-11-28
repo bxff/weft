@@ -322,3 +322,65 @@ test('a large existing formatted page is fenced by a fixed digest, not duplicate
         session.dispose()
     }
 })
+
+test('receipt folding failure leaves the journal and previously visible edit intact', async () => {
+    const daemon = new GuardedDaemon(), storage = new MemoryStorage()
+    daemon.subscribe = () => () => {}
+    await seed(daemon, native(A, 'A'))
+    const session = await open(daemon, storage)
+    try {
+        await session.reconcile()
+        const internal = session as unknown as {
+            runAudit: (...args: unknown[]) => boolean
+            lastSnapshotSeq: number
+        }
+        const beforeSeq = internal.lastSnapshotSeq
+        const original = internal.runAudit.bind(session)
+        const failed = Promise.withResolvers<void>()
+        internal.runAudit = () => {
+            internal.runAudit = original
+            failed.resolve()
+            throw new Error('Synthetic failure folding authoritative text')
+        }
+        await session.apply([{ type: 'edit-root-text', inserts: [{ afterKey: firstKey(session.document), text: 'B' }] }])
+        await failed.promise
+        expect(text(session.document)).toBe('AB')
+        expect(session.pendingCount).toBe(1)
+        expect(internal.lastSnapshotSeq).toBe(beforeSeq)
+        expect(await relayText(daemon)).toBe('AB')
+
+        await session.reconcile()
+        expect(session.pendingCount).toBe(0)
+        expect(daemon.requests[1]).toEqual(daemon.requests[0])
+    } finally {
+        session.dispose()
+    }
+})
+
+test('a view observer exception cannot prevent atomic local retirement of an accepted save', async () => {
+    const daemon = new GuardedDaemon(), storage = new MemoryStorage()
+    daemon.subscribe = () => () => {}
+    await seed(daemon, native(A, 'A'))
+    let crashes = 0
+    const reports: string[] = []
+    let session = await OfflineSession.open(storage, daemon, 'd', 'p', {
+        authorUuid: C, clientId: 'editor', guardedSaves: true,
+        onPatch: () => { if (daemon.accepted.length) { crashes++; throw new Error('Synthetic view failure with note text: AB') } },
+        onFailure: report => reports.push(report.message),
+    })
+    try {
+        await session.reconcile()
+        await session.apply([{ type: 'edit-root-text', inserts: [{ afterKey: firstKey(session.document), text: 'B' }] }])
+        await session.reconcile()
+        expect(crashes).toBe(1)
+        expect(reports).toEqual(['Guarded view observer failed'])
+        expect(daemon.requests).toHaveLength(1)
+        expect(session.pendingCount).toBe(0)
+        await session.disposeAndDrainLocalWrites()
+        daemon.getSnapshot = async () => { throw new Error('offline') }
+        session = await open(daemon, storage)
+        expect(text(session.document)).toBe('AB')
+    } finally {
+        session.dispose()
+    }
+})
