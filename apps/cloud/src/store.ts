@@ -41,6 +41,18 @@ import {
   type OverlayDocument,
 } from "@weft/sync-engine";
 
+/** Keep FULL enabled through the caller's synchronous, top-level commit. */
+function withFullDurability<T>(db: Database, publish: () => T): T {
+  if (db.inTransaction) throw new Error("Durable publication requires its own transaction");
+  const previous = db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
+  db.run("PRAGMA synchronous = FULL");
+  try {
+    return publish();
+  } finally {
+    db.run(`PRAGMA synchronous = ${previous}`);
+  }
+}
+
 /** Author naming author-table index 1 when seeding an empty reconstructed doc
  *  for the device bridge; real ink ops carry their own authors. */
 const DEVICE_BRIDGE_AUTHOR = "c10d0000-0000-4000-a000-000000000001";
@@ -115,6 +127,13 @@ export class BelowFloorError extends Error {
     super(
       `op seq ${target} is below the truncation floor ${floorSeq} (ops truncated by retention)`,
     );
+  }
+}
+
+/** A required checkpoint is represented in history but cannot be read safely. */
+export class HistoryCheckpointError extends Error {
+  constructor(cause?: unknown) {
+    super("required history checkpoint is unavailable", { cause });
   }
 }
 
@@ -946,9 +965,7 @@ export class CloudStore {
     user: string, data: RecoveryImport, digest: string,
     storageCheck: (stage: "before" | "after") => void,
   ): "created" | "replay" | "not-empty" | "unverified" {
-    if (this.db.inTransaction) throw new Error("Recovery restore requires its own transaction");
     const { notebook, pages } = data;
-    const previous = this.db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
     const restore = () => this.publishPage(user, notebook.id, pages[0]!.id, () => {
       const receipt = this.db.query<{ digest: string }, [string]>(
         "SELECT digest FROM recovery_imports WHERE user_id=?",
@@ -990,23 +1007,18 @@ export class CloudStore {
         this.recordOpChange(user, notebook.id, page.id, "recovery");
       }
       storageCheck("after");
-      for (const path of this.stagedPageFiles!) this.syncRecoveryPath(path);
+      for (const path of this.stagedPageFiles!) this.syncPath(path);
       const snapshotsDir = join(this.filesDir, "snapshots");
       // A fresh relay may have just created snapshots/ and its parent.
-      this.syncRecoveryPath(snapshotsDir);
-      this.syncRecoveryPath(this.filesDir);
-      this.syncRecoveryPath(dirname(this.filesDir));
+      this.syncPath(snapshotsDir);
+      this.syncPath(this.filesDir);
+      this.syncPath(dirname(this.filesDir));
       return "created";
     });
-    this.db.run("PRAGMA synchronous = FULL");
-    try {
-      return restore();
-    } finally {
-      this.db.run(`PRAGMA synchronous = ${previous}`);
-    }
+    return withFullDurability(this.db, restore);
   }
 
-  private syncRecoveryPath(path: string): void {
+  private syncPath(path: string): void {
     const fd = openSync(path, "r");
     try { fsyncSync(fd); }
     finally { closeSync(fd); }
@@ -1522,7 +1534,7 @@ export class CloudStore {
    * always minted against the seeded blob base with non-colliding clocks.)
    */
   seedSnapshotFromBlob(user: string, doc: string, page: string): boolean {
-    if (this.latestSnapshotReference(user, doc, page)) return false; // already op-regime
+    if (this.latestSnapshotRow(user, doc, page)) return false; // never replace a known checkpoint with a legacy blob
     if (this.latestOpSeq(user, doc, page) > 0) return false; // op content stands
     const blob = this.getPage(user, doc, page);
     if (!blob) return false; // nothing to migrate (fresh/op-born page)
@@ -1764,8 +1776,8 @@ export class CloudStore {
         } finally {
           closeSync(fd);
         }
-        this.syncRecoveryPath(this.filesDir);
-        this.syncRecoveryPath(dirname(this.filesDir));
+        this.syncPath(this.filesDir);
+        this.syncPath(dirname(this.filesDir));
         this.db.run(
           "INSERT OR REPLACE INTO files (user_id, doc, path, size, mime, etag) VALUES (?, ?, ?, ?, ?, ?)",
           [user, doc, path, bytes.length, mime, etag],
@@ -1801,13 +1813,7 @@ export class CloudStore {
   private commitSources<T>(write: () => T): T {
     // No autocommit ROW can be lost to a WAL reset after deleting its old
     // files. BEGIN IMMEDIATE also serializes quota planning with other writers.
-    const previous = this.db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
-    this.db.run("PRAGMA synchronous = FULL");
-    try {
-      return this.db.transaction(write).immediate();
-    } finally {
-      this.db.run(`PRAGMA synchronous = ${previous}`);
-    }
+    return withFullDurability(this.db, () => this.db.transaction(write).immediate());
   }
 
   private unlinkSource(stored: string): void {
@@ -2764,17 +2770,39 @@ export class CloudStore {
   ): { opSeq: number; bytes: Uint8Array } | null {
     const row = this.db
       .query<
-        { op_seq: number; path: string },
+        { op_seq: number; path: string; size: number; sha256: string | null },
         [string, string, string, number]
       >(
-        `SELECT op_seq, path FROM page_snapshots
+        `SELECT op_seq, path, size, sha256 FROM page_snapshots
                  WHERE user_id=? AND doc=? AND page=? AND op_seq<=? ORDER BY seq DESC LIMIT 1`,
       )
       .get(user, doc, page, target);
     if (!row) return null;
-    const path = this.existingSnapshotPath(row.path);
-    if (!path) return null;
-    return { opSeq: row.op_seq, bytes: new Uint8Array(readFileSync(path)) };
+    return { opSeq: row.op_seq, bytes: this.readHistoryCheckpoint(row) };
+  }
+
+  private readHistoryCheckpoint(row: { path: string; size: number; sha256: string | null }): Uint8Array {
+    try {
+      const path = this.existingSnapshotPath(row.path);
+      if (!path) throw new Error("missing checkpoint file");
+      const bytes = new Uint8Array(readFileSync(path));
+      if (bytes.length !== row.size || (row.sha256 && sha256hex(bytes) !== row.sha256)) {
+        throw new Error("checkpoint integrity mismatch");
+      }
+      return bytes;
+    } catch (cause) {
+      throw new HistoryCheckpointError(cause);
+    }
+  }
+
+  private decodeHistoryCheckpoint(bytes: Uint8Array): ReturnType<typeof decodeSnapshot> {
+    try {
+      const checkpoint = decodeSnapshot(bytes);
+      if (!Array.isArray(checkpoint.overlay?.shapes)) throw new Error("invalid checkpoint overlay");
+      return checkpoint;
+    } catch (cause) {
+      throw new HistoryCheckpointError(cause);
+    }
   }
 
   /** Ops for a page in the seq window (after, target] in order (bounded replay
@@ -2840,9 +2868,9 @@ export class CloudStore {
     const floor = this.truncationFloor(user, doc, page);
     if (floor > 0 && target < floor) throw new BelowFloorError(floor, target);
     const snap = this.snapshotForSeq(user, doc, page, target);
-    const base = snap ? decodeSnapshot(snap.bytes) : null;
+    if (floor > 0 && (!snap || snap.opSeq < floor)) throw new HistoryCheckpointError();
+    const base = snap ? this.decodeHistoryCheckpoint(snap.bytes) : null;
     const ops = this.opsInRange(user, doc, page, snap?.opSeq ?? 0, target);
-    // Rebuild ink from the snapshot's .rm + ink ops (reused bridge logic).
     const rm = reconstructRm(base?.rm ?? null, ops, DEVICE_BRIDGE_AUTHOR);
     // Rebuild overlay from the snapshot's overlay + the object ops only — the
     // ink was already materialized above, so no throwaway doc / double apply.
@@ -2914,23 +2942,33 @@ export class CloudStore {
     });
   }
 
-  /** Raw container bytes of one stored snapshot (by its OWN seq, not op_seq).
-   *  Null when the row or its file is gone (pruned). */
+  /** Raw container bytes by the checkpoint's own seq, not op_seq. Bridge
+   *  callers can fall back when a file is gone; history restoration cannot. */
   getSnapshotBytes(
     user: string,
     doc: string,
     page: string,
     snapSeq: number,
+    verifyHistory = false,
   ): Uint8Array | null {
     const row = this.db
-      .query<{ path: string }, [string, string, string, number]>(
-        "SELECT path FROM page_snapshots WHERE user_id=? AND doc=? AND page=? AND seq=?",
+      .query<{ path: string; size: number; sha256: string | null }, [string, string, string, number]>(
+        "SELECT path, size, sha256 FROM page_snapshots WHERE user_id=? AND doc=? AND page=? AND seq=?",
       )
       .get(user, doc, page, snapSeq);
     if (!row) return null;
+    if (verifyHistory) {
+      const bytes = this.readHistoryCheckpoint(row);
+      try {
+        const { rm } = this.decodeHistoryCheckpoint(bytes);
+        RmDocument.parse(rm);
+      } catch (cause) {
+        throw new HistoryCheckpointError(cause);
+      }
+      return bytes;
+    }
     const path = this.existingSnapshotPath(row.path);
-    if (!path) return null;
-    return new Uint8Array(readFileSync(path));
+    return path ? new Uint8Array(readFileSync(path)) : null;
   }
 
   /**
@@ -2947,7 +2985,7 @@ export class CloudStore {
    * the snapshot's bytes as a revert=1 checkpoint at H'. No op replay happens,
    * so the truncation floor is irrelevant here — a retained snapshot is
    * restorable even when the ops around it were truncated. Returns null when
-   * the snapshot row/file no longer exists (pruned).
+   * the snapshot row no longer exists (pruned). A known damaged checkpoint is an error.
    */
   revertToSnapshot(
     user: string,
@@ -2956,7 +2994,7 @@ export class CloudStore {
     snapSeq: number,
   ): { snapshotSeq: number; opHead: number; newHead: number } | null {
     return this.publishPage(user, doc, page, () => {
-      const bytes = this.getSnapshotBytes(user, doc, page, snapSeq);
+      const bytes = this.getSnapshotBytes(user, doc, page, snapSeq, true);
       if (!bytes) return null;
       const opHead = this.latestOpSeq(user, doc, page);
       this.appendOps(user, doc, page, [revertMarkerOp(opHead)], REVERT_AUTHOR);
@@ -3057,6 +3095,9 @@ export class CloudStore {
           .get(user, doc, page, cutoff) as { m: number | null }
       ).m;
     }
+    // Validate both required bases before writing anything. Inserting the
+    // boundary first would also shadow the head's distinct, newer checkpoint.
+    const state = this.stateAt(user, doc, page, head);
     if (floor !== null) {
       const boundary = this.stateAt(user, doc, page, floor);
       // insertSnapshotRow, not putSnapshot: this checkpoint is deliberately
@@ -3080,7 +3121,6 @@ export class CloudStore {
     // op_seq would disagree and silently drop the interleaved op from
     // reconstruct — so we fail loudly instead. (No interleave is possible today:
     // SQLite/Bun runs synchronously with no await on this path.)
-    const state = this.stateAt(user, doc, page, head);
     const snapshotSeq = this.putSnapshot(
       user,
       doc,

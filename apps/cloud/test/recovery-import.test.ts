@@ -142,14 +142,14 @@ test("file-backed recovery rolls back a durability fault and verifies the edited
   try {
     const raw = cloud.store as unknown as {
       db: import("bun:sqlite").Database;
-      syncRecoveryPath(path: string): void;
+      syncPath(path: string): void;
     };
     const headers = { "x-api-key": cloud.store.mintApiKey("fresh", "restore").key, "content-type": "application/json" };
     const body = JSON.stringify(fixture());
     const post = () => fetch(`http://127.0.0.1:${cloud.port}/api/recovery/notebook`, { method: "POST", headers, body });
-    const barrier = raw.syncRecoveryPath.bind(raw);
+    const barrier = raw.syncPath.bind(raw);
     const checked: string[] = [];
-    raw.syncRecoveryPath = (path) => {
+    raw.syncPath = (path) => {
       expect(raw.db.inTransaction).toBe(true);
       expect(raw.db.query("PRAGMA synchronous").values()).toEqual([[2]]);
       checked.push(path);
@@ -162,7 +162,7 @@ test("file-backed recovery rolls back a durability fault and verifies the edited
     expect(JSON.parse(cloud.store.getDocuments("fresh"))).toEqual({ documents: [] });
     expect(raw.db.query("SELECT * FROM recovery_imports").all()).toEqual([]);
     expect(raw.db.query("PRAGMA synchronous").values()).toEqual([[1]]);
-    raw.syncRecoveryPath = barrier;
+    raw.syncPath = barrier;
     expect((await post()).status).toBe(201);
     expect(raw.db.query("PRAGMA synchronous").values()).toEqual([[1]]);
     const native = RmDocument.parse(Buffer.from(fixture().pages[0]!.currentNative.base64, "base64"));
@@ -224,8 +224,8 @@ test.each(["acknowledged", "before-commit"] as const)(
         import { writeFileSync, renameSync } from "node:fs";
         const cloud = startCloud({ port: 0, db: ${JSON.stringify(db)} });
         if (${phase === "before-commit"}) {
-          const original = cloud.store.syncRecoveryPath.bind(cloud.store);
-          cloud.store.syncRecoveryPath = path => {
+          const original = cloud.store.syncPath.bind(cloud.store);
+          cloud.store.syncPath = path => {
             original(path);
             if (!path.endsWith("/snapshots")) return;
             writeFileSync(${JSON.stringify(blocked)}, "before commit");
