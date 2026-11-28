@@ -79,7 +79,7 @@ export interface Transport {
     getOverlay(doc: string, page: string): Promise<OverlayDocument>
     putOverlay(doc: string, page: string, overlay: OverlayDocument): Promise<void>
     /** Upload an image asset into the page's resource dir. */
-    putAsset(doc: string, page: string, filename: string, bytes: Uint8Array): Promise<void>
+    putAsset(doc: string, page: string, filename: string, bytes: Uint8Array, canSend?: () => boolean): Promise<void>
     readonly pageEventsConnection?: object | undefined
     subscribe(handler: (event: PageEvent) => void, onConnected?: () => void): () => void
 

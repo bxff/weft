@@ -121,7 +121,7 @@ export class HttpTransport implements Transport {
         ws.onerror = () => ws.close()
     }
 
-    private async fetchOk(path: string, init: RequestInit = {}, baseUrl = this.base): Promise<Response> {
+    private async fetchOk(path: string, init: RequestInit = {}, baseUrl = this.base, canSend?: () => boolean): Promise<Response> {
         const lifetime = this.lifetime.signal
         lifetime.throwIfAborted()
         // One deadline covers credential refresh, the request, and its response body.
@@ -151,6 +151,7 @@ export class HttpTransport implements Transport {
         }
         // The token can win the race just before cancellation.
         if (signal.aborted) throw abortFailure()
+        if (canSend && !canSend()) throw new EngineFailure({ _tag: 'Unauthorized' })
         if (token) {
             init.headers = { ...(init.headers as Record<string, string>), authorization: `Bearer ${token}` }
         }
@@ -229,7 +230,7 @@ export class HttpTransport implements Transport {
         })
     }
 
-    async putAsset(doc: string, page: string, filename: string, bytes: Uint8Array): Promise<void> {
+    async putAsset(doc: string, page: string, filename: string, bytes: Uint8Array, canSend?: () => boolean): Promise<void> {
         const r = await this.fetchOk(
             `/api/documents/${doc}/pages/${page}/assets/${encodeURIComponent(filename)}`,
             {
@@ -237,6 +238,8 @@ export class HttpTransport implements Transport {
                 headers: { 'content-type': 'application/octet-stream' },
                 body: bytes as unknown as BodyInit,
             },
+            this.base,
+            canSend,
         )
         if (!r.ok) {
             throw new EngineFailure({ _tag: 'DeviceUnreachable', cause: `PUT asset ${r.status}` })
