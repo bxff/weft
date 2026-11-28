@@ -236,8 +236,11 @@ rm -f /etc/systemd/system/xochitl.service.d/weft.conf \
       /etc/systemd/system/multi-user.target.wants/weft.service 2>/dev/null || true
 rm -f /home/root/weft/install-service.sh 2>/dev/null || true
 
-# keep stock cloud sync out of the way (we own the bus name)
-systemctl mask rm-sync 2>/dev/null || true
+# Keep stock sync out of the way without escalating an existing runtime mask.
+case "$(systemctl is-enabled rm-sync 2>/dev/null)" in
+  masked|masked-runtime) ;;
+  *) systemctl mask rm-sync 2>/dev/null || true ;;
+esac
 systemctl stop rm-sync 2>/dev/null || true
 
 systemctl daemon-reload
@@ -260,17 +263,18 @@ RestartSec=3
 WantedBy=multi-user.target
 `
 
-/** Install manually in one remote operation so a failed takeover restores stock sync. */
-type VerifiedStage = { tag: string; commit: string; sha256: string; dir: string }
-
-function activateManualSetup(configured: boolean, release?: VerifiedStage): void {
-    const staged = release?.dir ?? INSTALL_DIR
+/** Activate either setup mode in one remote operation; a failure restores the old install. */
+function activateSetup(
+    configured: boolean, autoReinstall: boolean, stageDir: string,
+    release?: { tag: string; commit: string; sha256: string },
+): void {
     const receipt = `${INSTALL_DIR}/verified-release`
-    const lock = `${INSTALL_DIR}/verified-install.lock`
-    const guard = release ? `
-mkdir ${lock} || { echo 'Another verified install is in progress.' >&2; exit 1; }
-trap 'rmdir ${lock}' 0
-printf '%s  %s\n' '${release.sha256}' '${staged}/rmsyncd.new' | sha256sum -c - >/dev/null
+    const restoreXochitl = autoReinstall || release !== undefined
+    const lock = `${INSTALL_DIR}/setup-activation.lock`
+    const activate = `set -e
+mkdir ${lock} || { echo 'Another setup activation is in progress.' >&2; exit 1; }
+trap 'rmdir ${lock} || :' 0
+${release ? `printf '%s  %s\n' '${release.sha256}' '${stageDir}/rmsyncd.new' | sha256sum -c - >/dev/null
 if [ -e ${receipt} ] || [ -L ${receipt} ]; then
     if ! awk -v incoming='${release.tag}' -v commit='${release.commit}' '
         NR == 1 && NF == 2 && $1 ~ /^tablet-v[0-9]+[.][0-9]+[.][0-9]+$/ &&
@@ -290,13 +294,15 @@ if [ -e ${receipt} ] || [ -L ${receipt} ]; then
         echo 'Verified release is older, retagged, or the installed release receipt is invalid.' >&2
         exit 1
     fi
-fi
-` : ''
-    const activate = `set -e
-${guard}
+fi` : ''}
 stock_mask=$(systemctl is-enabled rm-sync.service 2>/dev/null) || :
 stock_active=$(systemctl is-active rm-sync.service 2>/dev/null) || :
 weft_active=$(systemctl is-active weft.service 2>/dev/null) || :
+${restoreXochitl ? `xochitl_active=$(systemctl is-active xochitl.service 2>/dev/null) || :
+case "$xochitl_active" in
+    active|inactive|failed) ;;
+    *) echo 'Could not determine a stable xochitl state.' >&2; exit 1 ;;
+esac` : ''}
 case "$stock_mask" in
     enabled|enabled-runtime|linked|linked-runtime|alias|static|indirect|disabled|generated|transient|masked|masked-runtime) ;;
     *) echo 'Could not determine stock sync unit state.' >&2; exit 1 ;;
@@ -312,7 +318,11 @@ esac
 mount -o remount,rw / 2>/dev/null || true
 backup=$(mktemp -d "${INSTALL_DIR}/setup-rollback.XXXXXX")
 paths="${INSTALL_DIR}/rmsyncd${release ? `
-${receipt}` : ''}${configured ? `
+${receipt}` : ''}${autoReinstall ? `
+${INSTALL_DIR}/boot-guard.sh
+${INSTALL_DIR}/firmware-mismatch
+${INSTALL_DIR}/install-service.sh
+/usr/bin/rm-sync.original` : ''}${configured ? `
 ${INSTALL_DIR}/cloud.json` : ''}
 /usr/lib/systemd/system/weft.service
 /usr/lib/systemd/system/multi-user.target.wants/weft.service
@@ -323,6 +333,7 @@ ${INSTALL_DIR}/cloud.json` : ''}
 mask_attempted=0
 stock_stop_attempted=0
 weft_attempted=0
+xochitl_attempted=0
 files_changed=0
 rollback() {
     result=$?
@@ -330,7 +341,7 @@ rollback() {
     trap '' HUP INT TERM
     if [ "$result" -eq 0 ]; then
         rm -rf "$backup"
-        ${release ? `rmdir ${lock} || :` : ''}
+        rmdir ${lock} || :
         return
     fi
     set +e
@@ -352,12 +363,17 @@ rollback() {
     if [ "$weft_active" = active ] && [ "$weft_attempted" -eq 1 ]; then
         systemctl start weft.service || failed=1
     fi
+    ${restoreXochitl ? `if [ "$xochitl_attempted" -eq 1 ]; then
+        if [ "$xochitl_active" = active ]; then systemctl start xochitl.service || failed=1
+        else systemctl stop xochitl.service || failed=1
+        fi
+    fi` : ''}
     if [ "$failed" -eq 0 ]; then
         rm -rf "$backup"
     else
         echo "Setup rollback was incomplete. Backups remain at $backup" >&2
     fi
-    ${release ? `rmdir ${lock} || :` : ''}
+    rmdir ${lock} || :
     exit "$result"
 }
 trap rollback 0
@@ -379,14 +395,17 @@ fi
 
 files_changed=1
 rm -f ${INSTALL_DIR}/rmsyncd
-mv ${staged}/rmsyncd.new ${INSTALL_DIR}/rmsyncd
+mv ${stageDir}/rmsyncd.new ${INSTALL_DIR}/rmsyncd
 chmod +x ${INSTALL_DIR}/rmsyncd
-${configured ? `rm -f ${INSTALL_DIR}/cloud.json
-mv ${staged}/cloud.json.new ${INSTALL_DIR}/cloud.json
+${autoReinstall ? `rm -f ${INSTALL_DIR}/boot-guard.sh
+mv ${stageDir}/boot-guard.sh.new ${INSTALL_DIR}/boot-guard.sh
+chmod +x ${INSTALL_DIR}/boot-guard.sh
+` : ''}${configured ? `rm -f ${INSTALL_DIR}/cloud.json
+mv ${stageDir}/cloud.json.new ${INSTALL_DIR}/cloud.json
 ` : ''}mkdir -p /usr/lib/systemd/system/multi-user.target.wants /usr/lib/systemd/system/xochitl.service.d
 rm -f /usr/lib/systemd/system/weft.service /usr/lib/systemd/system/xochitl.service.d/weft.conf
 cat > /usr/lib/systemd/system/weft.service <<'WEFT_UNIT'
-${unit(false)}WEFT_UNIT
+${unit(autoReinstall)}WEFT_UNIT
 cat > /usr/lib/systemd/system/xochitl.service.d/weft.conf <<'WEFT_DROP_IN'
 [Service]
 Environment=XOCHITL_STORE_TIMEOUT=${STORE_TIMEOUT}
@@ -402,19 +421,18 @@ systemctl restart weft.service
 sleep 3
 systemctl is-active --quiet weft.service
 wget -q -O- http://127.0.0.1:9000/api/health
+xochitl_attempted=1
 systemctl restart xochitl
-${release ? `printf '%s %s\n' '${release.tag}' '${release.commit}' > ${staged}/receipt.new
-mv ${staged}/receipt.new ${receipt}
+${release ? `printf '%s %s\n' '${release.tag}' '${release.commit}' > ${stageDir}/receipt.new
+mv ${stageDir}/receipt.new ${receipt}
 ` : ''}
 `
-    const result = run([...sshBase(), 'sh -s'], activate)
-    if (release) requireVerifiedStep('activate manual setup', result)
-    else step('activate manual setup', result)
+    setupStep('activate setup', run([...sshBase(), 'sh -s'], activate))
 }
 
-function requireVerifiedStep(label: string, result: { ok: boolean; out: string }): void {
-    if (!result.ok) throw Error(`${label} failed: ${result.out.trim()}`)
-    console.log(`✓ ${label}`)
+function setupStep(label: string, result: { ok: boolean; out: string }): void {
+    console.log(`${result.ok ? '✓' : '✗'} ${label}`)
+    if (!result.ok) throw Error(result.out.trim() || label + ' failed')
 }
 
 // ----- commands -----
@@ -451,82 +469,33 @@ async function setup(): Promise<void> {
         process.exit(1)
     }
     step('check firmware compatibility', ssh(firmwarePreflight))
-    if (flags.release !== undefined && !DRY) {
-        const daemon = stageTabletDaemon(isArm32 ? 'armv7' : 'aarch64', flags.release)
-        const dir = `${INSTALL_DIR}/verified-stage-${crypto.randomUUID()}`
-        const cleanup = () => {
-            daemon.remove()
-            ssh(`rm -rf ${dir}`)
-        }
-        try {
-            console.log(`  verified GitHub release ${daemon.tag}`)
-            requireVerifiedStep('create install staging', ssh(`mkdir -p ${INSTALL_DIR} && mkdir -m 700 ${dir}`))
-            requireVerifiedStep('stage verified daemon', scp(daemon.path, `${dir}/rmsyncd.new`))
-            if (CLOUD && TOKEN) {
-                requireVerifiedStep('stage cloud config', run([...sshBase(), `umask 077; cat > ${dir}/cloud.json.new`], JSON.stringify({ url: CLOUD, token: TOKEN })))
-            }
-            activateManualSetup(Boolean(CLOUD && TOKEN), { tag: daemon.tag, commit: daemon.commit, sha256: daemon.sha256, dir })
-        } finally {
-            cleanup()
-        }
-        return
-    }
-    const daemonBin = DRY ? DAEMON_BIN : await daemonBinary(isArm32 ? 'armv7' : 'aarch64')
-    step('create install dir', ssh(`mkdir -p ${INSTALL_DIR}`))
-    step('deploy daemon', scp(daemonBin, `${INSTALL_DIR}/rmsyncd.new`))
-    // file contents travel via stdin, never heredocs inside joined commands
-    console.log(
-        `  config: store-timeout=${STORE_TIMEOUT}ms, auto-reinstall=${AUTO_REINSTALL ? 'on' : 'off'}, ` +
-            `cloud=${CLOUD ? CLOUD : 'unchanged (keeping existing config if present)'}`,
-    )
-    if (AUTO_REINSTALL) {
-        step(
-            'install boot guard',
-            run(
-                [...sshBase(), `cat > ${INSTALL_DIR}/boot-guard.sh && chmod +x ${INSTALL_DIR}/boot-guard.sh`],
-                bootGuard(STORE_TIMEOUT),
-            ),
+    const arch = isArm32 ? 'armv7' : 'aarch64'
+    const release = !DRY && flags.release !== undefined ? stageTabletDaemon(arch, flags.release) : undefined
+    const daemonBin = release?.path ?? (DRY ? DAEMON_BIN : await daemonBinary(arch))
+    if (release) console.log(`  verified GitHub release ${release.tag}`)
+    const stageDir = `${INSTALL_DIR}/setup-stage-${crypto.randomUUID()}`
+    try {
+        setupStep('create private staging dir', ssh(`mkdir -p ${INSTALL_DIR} && mkdir -m 700 ${stageDir}`))
+        setupStep('deploy daemon', scp(daemonBin, `${stageDir}/rmsyncd.new`))
+        console.log(
+            `  config: store-timeout=${STORE_TIMEOUT}ms, auto-reinstall=${AUTO_REINSTALL ? 'on' : 'off'}, ` +
+                `cloud=${CLOUD ? CLOUD : 'unchanged (keeping existing config if present)'}`,
         )
-
-        step(
-            'install unit',
-            // /usr/lib is persistent rootfs; /etc is a tmpfs overlay wiped on reboot
-            run(
-                [...sshBase(), 'mount -o remount,rw / 2>/dev/null; cat > /usr/lib/systemd/system/weft.service'],
-                unit(AUTO_REINSTALL),
-            ),
-        )
+        if (AUTO_REINSTALL) {
+            setupStep('stage boot guard', run(
+                [...sshBase(), `umask 077; cat > ${stageDir}/boot-guard.sh.new`], bootGuard(STORE_TIMEOUT),
+            ))
+        }
         if (CLOUD && TOKEN) {
-            step(
-                'connect to weft account',
-                run([...sshBase(), `cat > ${INSTALL_DIR}/cloud.json`], JSON.stringify({ url: CLOUD, token: TOKEN })),
-            )
+            setupStep('stage cloud config', run(
+                [...sshBase(), `umask 077; cat > ${stageDir}/cloud.json.new`], JSON.stringify({ url: CLOUD, token: TOKEN }),
+            ))
         }
-        step(
-            'activate',
-            ssh(
-                [
-                    `mv ${INSTALL_DIR}/rmsyncd.new ${INSTALL_DIR}/rmsyncd && chmod +x ${INSTALL_DIR}/rmsyncd`,
-                    // enable via /usr/lib wants-symlink (survives reboot; /etc doesn't)
-                    'mkdir -p /usr/lib/systemd/system/multi-user.target.wants',
-                    'ln -sf ../weft.service /usr/lib/systemd/system/multi-user.target.wants/weft.service',
-                    'rm -f /etc/systemd/system/weft.service /etc/systemd/system/multi-user.target.wants/weft.service 2>/dev/null || true',
-                    'systemctl daemon-reload',
-                    'systemctl restart weft.service',
-                    'sleep 2',
-                    'systemctl restart xochitl',
-                ].join(' && '),
-            ),
-        )
-        step('daemon healthy', ssh('sleep 3; wget -q -O- http://127.0.0.1:9000/api/health'))
-    } else {
-        if (CLOUD && TOKEN) {
-            step(
-                'stage cloud config',
-                run([...sshBase(), `umask 077; cat > ${INSTALL_DIR}/cloud.json.new`], JSON.stringify({ url: CLOUD, token: TOKEN })),
-            )
-        }
-        activateManualSetup(Boolean(CLOUD && TOKEN))
+        activateSetup(Boolean(CLOUD && TOKEN), AUTO_REINSTALL, stageDir, release)
+    } finally {
+        release?.remove()
+        const cleanup = ssh(`rm -rf ${stageDir}`)
+        if (!cleanup.ok) console.error(`Could not clean up temporary setup files at ${stageDir}.`)
     }
     step('unit parses cleanly', ssh('journalctl -u weft --no-pager | grep -c "Missing" | grep -q "^0$" || systemd-analyze verify /usr/lib/systemd/system/weft.service 2>&1 | head -n 2; echo ok'))
     // no --cloud: keep the existing cloud.json, so re-running setup is a safe redeploy
