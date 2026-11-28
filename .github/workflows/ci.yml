@@ -119,3 +119,30 @@ jobs:
           path: test-results/persistent-editor-departur-*--for-font-and-local-storage/
           if-no-files-found: ignore
           retention-days: 2
+
+      # Keep the shipping build above flag-off. Use a fresh synthetic relay for
+      # the guarded browser save contract; never reuse this build for deploys.
+      - name: Build guarded browser saves for E2E
+        run: bun run build
+        working-directory: apps/web
+        env:
+          PUBLIC_CLOUD_URL: ""
+          PUBLIC_CLERK_PUBLISHABLE_KEY: ""
+          PUBLIC_DOCS_URL: ""
+          PUBLIC_TLDRAW_LICENSE_KEY: ""
+          PUBLIC_GUARDED_SAVES: "1"
+      - name: Exercise guarded browser saves
+        env:
+          PUBLIC_GUARDED_SAVES: "1"
+        run: |
+          export PLAYWRIGHT_JSON_OUTPUT_FILE="$RUNNER_TEMP/guarded-e2e.json"
+          node node_modules/@playwright/test/cli.js test \
+            --grep 'guarded-[^.]+\.spec\.ts|guarded erase parks' \
+            --workers=1 --reporter=line,json --output="$RUNNER_TEMP/guarded-test-results"
+          node --input-type=commonjs - "$PLAYWRIGHT_JSON_OUTPUT_FILE" <<'JS'
+          const { stats } = require(process.argv[2])
+          if (stats.expected < 14 || stats.skipped !== 0 || stats.unexpected !== 0 || stats.flaky !== 0) {
+            console.error('Guarded E2E must execute all persistence cases without skips:', stats)
+            process.exit(1)
+          }
+          JS
