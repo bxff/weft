@@ -1,4 +1,4 @@
-import { expect, test, type Browser } from '@playwright/test'
+import { expect, test, type BrowserContext } from '@playwright/test'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os'
@@ -12,15 +12,29 @@ test('hosted install to real pair, isolated device, capacity and revocation', as
     // Standard suite still serves existing fixtures. Use a private child
     // relay here for real token validation and per-test capacity state.
     const scratch = mkdtempSync(join(tmpdir(), 'weft-hosted-enrollment-'))
+    const contexts = new Set<BrowserContext>()
     const child = spawn(
         join(homedir(), '.bun', 'bin', 'bun'),
         [fileURLToPath(new URL('../scripts/hosted-enrollment-e2e.ts', import.meta.url)), scratch],
         { env: {}, stdio: 'ignore' },
     )
-    const exit = new Promise<void>((resolve) => {
-        child.once('close', () => resolve())
-        child.once('error', () => resolve())
+    const exit = new Promise<true>((resolve) => {
+        child.once('close', () => resolve(true))
+        child.once('error', () => resolve(true))
     })
+    const exitedWithin = async (ms: number) => {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+            return await Promise.race([
+                exit,
+                new Promise<false>((resolve) => {
+                    timer = setTimeout(() => resolve(false), ms)
+                }),
+            ])
+        } finally {
+            clearTimeout(timer)
+        }
+    }
     try {
         const ready = join(scratch, 'ready.json')
         await expect
@@ -40,8 +54,14 @@ test('hosted install to real pair, isolated device, capacity and revocation', as
                     ...(device ? { 'x-device-token': key } : { authorization: 'Bearer ' + key }),
                 },
             })
-        async function install(b: Browser, user: string, key: string) {
-            const context = await b.newContext({ baseURL: origin, serviceWorkers: 'block' })
+        async function devices(key: string): Promise<{ id: string }[]> {
+            const r = await request('/api/devices', key)
+            expect(r.status).toBe(200)
+            return (await r.json()).devices
+        }
+        async function install(user: string, key: string) {
+            const context = await browser.newContext({ baseURL: origin, serviceWorkers: 'block' })
+            contexts.add(context)
             const page = await context.newPage()
             await page.addInitScript(
                 ({ user, key, hosted }) => {
@@ -59,44 +79,34 @@ test('hosted install to real pair, isolated device, capacity and revocation', as
             let calls = 0,
                 status = 0,
                 reason: unknown
-            // Deny outbound traffic; the canonical pairing URL alone is forwarded
-            // to the real local relay. An unexpected pairing destination is a test failure.
-            const unexpectedPairPaths: string[] = []
-            await page.route(
-                (url) => /^https?:$/.test(url.protocol) && url.origin !== origin,
-                (route) => {
-                    if (/pair|invite/i.test(new URL(route.request().url()).pathname))
-                        unexpectedPairPaths.push('unexpected-enrollment')
-                    return route.abort()
-                },
-            )
-            await page.route(hosted + '/api/pair', async (route) => {
-                if (route.request().method() === 'OPTIONS')
-                    return route.fulfill({
-                        status: 204,
-                        headers: {
-                            'access-control-allow-origin': '*',
-                            'access-control-allow-methods': 'POST',
-                            'access-control-allow-headers': 'authorization,content-type',
-                        },
-                    })
-                if (route.request().method() !== 'POST') {
-                    unexpectedPairPaths.push('unexpected-enrollment-method')
+            // Browser may load only the install page and its loopback static
+            // assets. The one canonical hosted transfer is routed explicitly;
+            // even a same-origin /api/* request is unexpected.
+            let unexpected = 0
+            await context.route(/^https?:\/\//, async (route) => {
+                const req = route.request()
+                const url = new URL(req.url())
+                const method = req.method()
+                if (
+                    method === 'GET' &&
+                    url.origin === origin &&
+                    (url.pathname === '/install' || /^\/(?:_app|fonts)\//.test(url.pathname))
+                )
+                    return route.continue()
+                if (url.href !== hosted + '/api/pair' || method !== 'POST') {
+                    unexpected++
                     return route.abort()
                 }
                 calls++
-                const r = await request(
-                    '/api/pair',
-                    route
-                        .request()
-                        .headers()
-                        .authorization?.replace(/^Bearer /, '') ?? '',
-                    {
-                        method: 'POST',
-                        headers: { 'content-type': route.request().headers()['content-type'] ?? '' },
-                        body: route.request().postData(),
+                const r = await fetch(origin + '/api/pair', {
+                    method,
+                    headers: {
+                        authorization: req.headers().authorization ?? '',
+                        'content-type': req.headers()['content-type'] ?? '',
                     },
-                )
+                    body: req.postData(),
+                    redirect: 'error',
+                })
                 const wire = await r.text()
                 if (!r.ok) reason = JSON.parse(wire)?.reason
                 status = r.status
@@ -110,6 +120,7 @@ test('hosted install to real pair, isolated device, capacity and revocation', as
             const generate = page.getByRole('button', { name: 'Generate my token' })
             await expect(generate).toBeDisabled()
             expect(calls).toBe(0)
+            expect(await devices(key)).toEqual([])
             await expect(page.getByRole('link', { name: 'Read the Hosted Terms' })).toHaveAttribute(
                 'href',
                 '/terms',
@@ -118,7 +129,7 @@ test('hosted install to real pair, isolated device, capacity and revocation', as
             await generate.click()
             await expect.poll(() => status).toBeGreaterThan(0)
             expect(calls).toBe(1)
-            expect(unexpectedPairPaths).toEqual([])
+            expect(unexpected).toBe(0)
             const text = () => page.locator('.installer-cmd').textContent()
             async function issued() {
                 let token: string | undefined
@@ -130,12 +141,22 @@ test('hosted install to real pair, isolated device, capacity and revocation', as
                     .toBe(true)
                 return token!
             }
-            return { context, page, status, reason, issued }
+            return {
+                page,
+                status,
+                reason,
+                issued,
+                close: async () => {
+                    await context.close()
+                    contexts.delete(context)
+                    expect(unexpected).toBe(0)
+                },
+            }
         }
-        const enrolled = await install(browser, 'owner', keys.owner!)
+        const enrolled = await install('owner', keys.owner!)
         const token = await enrolled.issued()
         expect(enrolled.status).toBe(200)
-        await enrolled.context.close()
+        await enrolled.close()
         const docs = (id: string) => ({
             method: 'PUT',
             ...json({ documents: [{ id, name: id, type: 'notebook', lastModified: 10, pages: [] }] }),
@@ -172,13 +193,12 @@ test('hosted install to real pair, isolated device, capacity and revocation', as
                 )
             ).status,
         ).toBe(200)
-        const denied = await install(browser, 'fresh', keys.fresh!)
+        const denied = await install('fresh', keys.fresh!)
         expect(denied.status).toBe(503)
         expect(denied.reason).toBe('capacity')
         await expect(denied.page.getByText('Server error minting token (503).')).toBeVisible()
-        const list = await request('/api/devices', keys.fresh!)
-        expect((await list.json()).devices).toEqual([])
-        await denied.context.close()
+        expect(await devices(keys.fresh!)).toEqual([])
+        await denied.close()
         expect(
             (
                 await request(
@@ -192,11 +212,11 @@ test('hosted install to real pair, isolated device, capacity and revocation', as
                 )
             ).status,
         ).toBe(200)
-        const hard = await install(browser, 'fresh', keys.fresh!)
+        const hard = await install('fresh', keys.fresh!)
         expect(hard.status).toBe(507)
         expect(hard.reason).toBe('capacity')
         await expect(hard.page.getByText('Server error minting token (507).')).toBeVisible()
-        await hard.context.close()
+        await hard.close()
         expect(
             (
                 await request(
@@ -212,10 +232,9 @@ test('hosted install to real pair, isolated device, capacity and revocation', as
         ).toBe(507)
         expect((await request('/api/documents', token, undefined, true)).status).toBe(200)
         expect((await request('/api/documents', keys.owner!)).status).toBe(200)
-        const old = await request('/api/devices', keys.owner!)
-        const devices = (await old.json()).devices as { id: string }[]
-        expect(devices).toHaveLength(1)
-        const path = '/api/devices/' + devices[0]!.id
+        const paired = await devices(keys.owner!)
+        expect(paired).toHaveLength(1)
+        const path = '/api/devices/' + paired[0]!.id
         expect((await request(path, keys.peer!, { method: 'DELETE' })).status).toBe(404)
         expect((await request('/api/documents', token, undefined, true)).status).toBe(200)
         expect((await request(path, keys.owner!, { method: 'DELETE' })).status).toBe(200)
@@ -223,7 +242,13 @@ test('hosted install to real pair, isolated device, capacity and revocation', as
         expect((await request('/api/documents', keys.owner!)).status).toBe(200)
     } finally {
         child.kill('SIGTERM')
-        await exit
+        let stopped = await exitedWithin(1500)
+        if (!stopped) {
+            child.kill('SIGKILL')
+            stopped = await exitedWithin(1500)
+        }
         rmSync(scratch, { recursive: true, force: true })
+        await Promise.allSettled([...contexts].map((context) => context.close()))
+        if (!stopped) throw Error('isolated enrollment relay did not stop after SIGKILL')
     }
 })
