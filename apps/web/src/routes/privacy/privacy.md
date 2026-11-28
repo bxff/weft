@@ -13,7 +13,7 @@ For privacy questions or requests, email me at [musaab.khan@protonmail.com](mail
 
 ## Information we use
 
-- **Former beta waitlist.** If you joined the former waitlist, Clerk collected the email address you provided so I could manage invitations and contact you about your request. If you want to ask about that information or have it removed, email me.
+- **Earlier beta registrations.** Before the beta opened, Clerk collected the email address you provided if you asked to hear about joining. The purpose was to manage invitations and contact people about their requests. If you want to ask about that information or have it removed, email me.
 
 - **Account and sign-in information.** Clerk handles sign-in, including Google sign-in. The relay uses your Clerk account ID to associate your synced notebooks with your account. When you’re signed in, Weft displays your primary email address, or your username or account ID if no primary email address is available.
 
