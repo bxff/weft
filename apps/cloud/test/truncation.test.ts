@@ -619,3 +619,36 @@ test("missing or corrupt history checkpoint refuses reads, reverts and trimming 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("history does not replace a known missing zero-op checkpoint with an older blob", async () => {
+  const { store } = server;
+  const doc = "legacy-history-basis";
+  const page = "zero-op";
+  const old = RmDocument.empty(WEB_AUTHOR);
+  const newer = RmDocument.parse(old.serialize());
+  webStroke(newer, { shapes: [] }, "shape:native-only", [{ x: 20, y: 10 }, { x: 90, y: 75 }]);
+  store.putPage(USER, doc, page, "", old.serialize(), "fixture");
+  expect(store.seedSnapshotFromBlob(USER, doc, page)).toBe(true);
+  const snapSeq = store.putSnapshot(USER, doc, page, encodeSnapshot(newer.serialize(), { shapes: [] }));
+  const db = (store as unknown as { db: import("bun:sqlite").Database }).db;
+  const { path } = db.query<{ path: string }, [number]>("SELECT path FROM page_snapshots WHERE seq=?").get(snapSeq)!;
+  const bytes = readFileSync(path);
+  const points = store.historyPoints(USER, doc, page, 100);
+  unlinkSync(path);
+  try {
+    const result = await fetch(`${base}/api/documents/${doc}/pages/${page}/at?seq=0`, { headers: h() });
+    expect(result.status).toBe(503);
+    const revert = await fetch(`${base}/api/documents/${doc}/pages/${page}/revert`, {
+      method: "POST",
+      headers: h({ "content-type": "application/json" }),
+      body: JSON.stringify({ toSeq: 0 }),
+    });
+    expect(revert.status).toBe(503);
+    expect(store.historyPoints(USER, doc, page, 100)).toEqual(points);
+  } finally {
+    writeFileSync(path, bytes);
+  }
+  const retry = await fetch(`${base}/api/documents/${doc}/pages/${page}/at?seq=0`, { headers: h() });
+  expect(retry.status).toBe(200);
+  expect(liveLines(decodeSnapshot(new Uint8Array(await retry.arrayBuffer())).rm)).toBe(1);
+});
