@@ -2,6 +2,7 @@
 import { Database } from "bun:sqlite";
 import { closeSync, cpSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, renameSync, rmSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { backupBlobReferences, verifyAndSyncBlob } from "./backup";
 import { drainAccountPurge, initAccountPurge, stageAccountPurge } from "./account-purge";
 
 export const RESTORE_LEDGER_KEY = "restore-deletion-ledger-id";
@@ -110,6 +111,10 @@ export function restoreWithLedger(options: {
     cpSync(files, path + "-files", { recursive: true, errorOnExist: true });
     const db = new Database(path, { readwrite: true, create: false });
     try {
+      const check = db.query<{ quick_check: string }, []>("PRAGMA quick_check").all();
+      if (check.length !== 1 || check[0]?.quick_check !== "ok") {
+        throw new Error("Restored SQLite database did not pass quick_check");
+      }
       if (db.query<{ value: string }, [string]>("SELECT value FROM config WHERE key=?").get(RESTORE_LEDGER_KEY)?.value !== deployment) {
         throw new Error("Wrong archive identity");
       }
@@ -126,12 +131,27 @@ export function restoreWithLedger(options: {
           if (!removed) throw new Error("Restore cannot finish a recorded deletion; shared or unsafe file");
         }
       }
+      const buffer = new Uint8Array(128 * 1024);
+      for (const { folder, name, size, digest } of backupBlobReferences(db)) {
+        verifyAndSyncBlob(join(path + "-files", folder, name), size, digest, buffer);
+      }
       db.run("PRAGMA wal_checkpoint(TRUNCATE)");
     } finally { db.close(); }
     checkTree(staging, true);
     if (lstatSync(finalDir, { throwIfNoEntry: false })) throw new Error("Restore destination appeared during validation");
     renameSync(staging, finalDir);
-    syncPath(parent);
+    try {
+      syncPath(parent);
+    } catch (error) {
+      try {
+        renameSync(finalDir, staging);
+      } catch (rollback) {
+        throw new Error("Restore publication could not be confirmed and its destination could not be removed. Do not serve it.", {
+          cause: new AggregateError([error, rollback]),
+        });
+      }
+      throw error;
+    }
     return join(finalDir, "relay.db");
   } finally {
     ledger?.close();

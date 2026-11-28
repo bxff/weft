@@ -22,7 +22,7 @@ function syncPath(path: string): void {
   finally { closeSync(fd); }
 }
 
-function verifyAndSyncBlob(path: string, size: number, digest: string | null, buffer: Uint8Array): void {
+export function verifyAndSyncBlob(path: string, size: number, digest: string | null, buffer: Uint8Array): void {
   const fd = openSync(path, "r");
   try {
     const stat = fstatSync(fd);
@@ -41,6 +41,20 @@ function verifyAndSyncBlob(path: string, size: number, digest: string | null, bu
   }
 }
 
+export function* backupBlobReferences(db: Database) {
+  const blobs = db.query<
+    { folder: "" | "snapshots"; path: string; size: number; digest: string | null }, []
+  >(`SELECT '' AS folder, path, size, etag AS digest FROM files
+     UNION ALL SELECT 'snapshots', path, size, sha256 FROM page_snapshots`);
+  for (const blob of blobs.iterate()) {
+    const name = win32.basename(blob.path);
+    if (name.length !== 64 || /[^0-9a-f]/.test(name)) {
+      throw new Error("Invalid stored blob name in backup database");
+    }
+    yield { folder: blob.folder, size: blob.size, digest: blob.digest, name };
+  }
+}
+
 /** A source blob can change after the database capture. Verify the copied
  * bytes against the captured rows before making the archive visible. */
 export function publishBackup(db: Database, filesDir: string, destDir: string): string {
@@ -56,16 +70,8 @@ export function publishBackup(db: Database, filesDir: string, destDir: string): 
     try {
       mkdirSync(snapshots, { recursive: true });
       const buffer = new Uint8Array(128 * 1024);
-      const blobs = capture.query<
-        { folder: "" | "snapshots"; path: string; size: number; digest: string | null },
-        []
-      >(`SELECT '' AS folder, path, size, etag AS digest FROM files
-         UNION ALL SELECT 'snapshots', path, size, sha256 FROM page_snapshots`);
-      for (const blob of blobs.iterate()) {
-        const name = win32.basename(blob.path);
-        if (name.length !== 64 || /[^0-9a-f]/.test(name)) {
-          throw new Error("Invalid stored blob name in backup database");
-        }
+      for (const blob of backupBlobReferences(capture)) {
+        const { name } = blob;
         const copy = join(files, blob.folder, name);
         copyFileSync(join(filesDir, blob.folder, name), copy, constants.COPYFILE_EXCL);
         verifyAndSyncBlob(copy, blob.size, blob.digest, buffer);

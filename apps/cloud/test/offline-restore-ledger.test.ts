@@ -1,7 +1,8 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { CloudStore } from "../src/store";
 import { startCloud } from "../src/server";
@@ -94,6 +95,35 @@ test("offline restore fails closed without its current external deletion ledger"
     fail(["--offline", ...input, "--archive", legacyArchive], "Wrong archive identity");
     fail(["--offline", ...input, "--destination", join(archive, "nested")], "cannot overlap");
     fail(["--offline", ...input, "--minimum-generation", "1.1"], "every restore input");
+
+    const peerBlob = join(archive, "files", basename(store.getFileRef(peer, doc)!.path));
+    const peerBytes = fs.readFileSync(peerBlob);
+    fs.unlinkSync(peerBlob);
+    fail(["--offline", ...input], "ENOENT");
+    fs.writeFileSync(peerBlob, Buffer.alloc(peerBytes.length, 99));
+    fail(["--offline", ...input], "Backup blob differs");
+    fs.writeFileSync(peerBlob, peerBytes);
+
+    const rename = fs.renameSync;
+    const sync = fs.fsyncSync;
+    let published = false;
+    const renaming = spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      rename(from, to);
+      if (String(to).endsWith("/promoted")) published = true;
+    });
+    const syncing = spyOn(fs, "fsyncSync").mockImplementation(fd => {
+      if (published) throw new Error("Injected restore parent sync failure");
+      sync(fd);
+    });
+    try {
+      expect(() => restoreWithLedger(guard)).toThrow("Injected restore parent sync failure");
+      expect(published).toBe(true);
+    } finally {
+      syncing.mockRestore();
+      renaming.mockRestore();
+    }
+    expect(existsSync(dest)).toBe(false);
+    expect(readdirSync(root).some(name => name.startsWith(".weft-restore-"))).toBe(false);
 
     const originalDatabase = readFileSync(join(archive, "weft.db"));
     const originalLive = readFileSync(join(root, "live.db"));
