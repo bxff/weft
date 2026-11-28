@@ -4,6 +4,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { withFullDurability } from "./sqlite-durability";
 import { publishBackup } from "./backup";
 import { drainAccountPurge, initAccountPurge, isAccountFenced, stageAccountPurge, withAccountBlobWrite } from "./account-purge";
 import {
@@ -41,18 +42,6 @@ import {
   type Op,
   type OverlayDocument,
 } from "@weft/sync-engine";
-
-/** Keep FULL enabled through the caller's synchronous, top-level commit. */
-function withFullDurability<T>(db: Database, publish: () => T): T {
-  if (db.inTransaction) throw new Error("Durable publication requires its own transaction");
-  const previous = db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
-  db.run("PRAGMA synchronous = FULL");
-  try {
-    return publish();
-  } finally {
-    db.run(`PRAGMA synchronous = ${previous}`);
-  }
-}
 
 /** Author naming author-table index 1 when seeding an empty reconstructed doc
  *  for the device bridge; real ink ops carry their own authors. */

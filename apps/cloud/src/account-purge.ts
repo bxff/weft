@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { withFullDurability } from "./sqlite-durability";
 import { closeSync, fsyncSync, lstatSync, openSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { ACCOUNT_PURGE_ORDER, accountReceiptTables, planRelayAccountPurge } from "./account-purge-plan";
@@ -47,13 +48,9 @@ export function withAccountBlobWrite<T>(db: Database, userId: string, write: () 
 }
 
 export function stageAccountPurge(db: Database, userId: string): void {
-  if (db.inTransaction) throw new Error("Account purge requires its own writer transaction");
-  // The normal relay connection uses WAL synchronous=NORMAL. A successful
-  // fence/queue write must not roll back after a subsequent permanent unlink
-  // on power loss. FULL synchronizes the WAL commit before we return.
-  const sync = db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
-  if (sync < 2) db.run("PRAGMA synchronous=FULL");
-  try {
+  // Do not acknowledge the fence/queue at NORMAL: an older DB cannot point
+  // at permanently unlinked files after power loss.
+  withFullDurability(db, () =>
     db.transaction(() => {
       if (isAccountFenced(db, userId)) return;
       const plan = planRelayAccountPurge(db, userId);
@@ -68,10 +65,9 @@ export function stageAccountPurge(db: Database, userId: string): void {
       // DELETE triggers above can derive account rows until their turn in
       // the purge order. Publish the fence last under the same writer lock.
       db.run("INSERT INTO account_purge_fences VALUES (?,?)", [userId, Date.now()]);
-    }).immediate();
-  } finally {
-    if (sync < 2) db.run(sync === 0 ? "PRAGMA synchronous=OFF" : "PRAGMA synchronous=NORMAL");
-  }
+    }).immediate(),
+    "at-least-FULL",
+  );
 }
 
 function isMissing(error: unknown): boolean {

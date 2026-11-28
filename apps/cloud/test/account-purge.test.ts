@@ -48,7 +48,7 @@ test("SQL purge rolls back together, then persisted fence and tracked file work 
     const syncSetting = () => connection(store).query("PRAGMA synchronous").get();
     expect(syncSetting()).toEqual({ synchronous: 1 });
     expect(() => connection(store).transaction(() => store.stageAccountPurge(target))())
-      .toThrow("requires its own writer transaction");
+      .toThrow("requires its own transaction");
     const otherBlobs = planRelayAccountPurge(db, other).blobs;
     db.run(`CREATE TRIGGER fail_purge BEFORE DELETE ON files
       WHEN OLD.user_id='synthetic-target' BEGIN SELECT RAISE(ABORT,'injected'); END`);
