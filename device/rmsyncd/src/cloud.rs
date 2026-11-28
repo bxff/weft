@@ -643,15 +643,33 @@ async fn push_page(
                 eprintln!("cloud: {doc}/{page} was merged server-side; pulling union back");
                 // propagate the pull-back's own success — the disk only holds
                 // the union if this pull actually wrote it
-                return Box::pin(pull_page(state, client, config, cloud, doc, page)).await;
+                return pull_page_inner(
+                    state,
+                    client,
+                    config,
+                    cloud,
+                    doc,
+                    page,
+                    PullMode::AfterUpload,
+                )
+                .await;
             }
             true
         }
         Ok(r) if r.status().as_u16() == 409 => {
-            // Cloud moved: pull its bytes locally; xochitl merges; the merged
-            // local file will push again on its own change event.
-            eprintln!("cloud: conflict on {doc}/{page}, merging via device");
-            pull_page(state, client, config, cloud, doc, page).await
+            // The legacy relay cannot merge a stale CAS. We may adopt an
+            // identical remote revision, but cannot replace an unpushed page
+            // or recurse into another PUT using the same stale base.
+            pull_page_inner(
+                state,
+                client,
+                config,
+                cloud,
+                doc,
+                page,
+                PullMode::AfterUpload,
+            )
+            .await
         }
         Ok(r) => {
             eprintln!("cloud: push {doc}/{page} failed: HTTP {}", r.status());
@@ -1120,7 +1138,16 @@ async fn reconcile_pulls(
             all_ok = false;
             break;
         }
-        if !pull_page_inner(state, client, config, cloud, doc, page, Some(deadline)).await
+        if !pull_page_inner(
+            state,
+            client,
+            config,
+            cloud,
+            doc,
+            page,
+            PullMode::Recovery(deadline),
+        )
+        .await
             || needs_recovery(cloud, key, cloud_rev, *asset_marker)
         {
             all_ok = false;
@@ -1558,7 +1585,7 @@ async fn pull_page(
     doc: &str,
     page: &str,
 ) -> bool {
-    pull_page_inner(state, client, config, cloud, doc, page, None).await
+    pull_page_inner(state, client, config, cloud, doc, page, PullMode::Reconcile).await
 }
 
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1584,6 +1611,13 @@ async fn bounded_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&bytes).ok()
 }
 
+#[derive(Clone, Copy)]
+enum PullMode {
+    Reconcile,
+    AfterUpload,
+    Recovery(tokio::time::Instant),
+}
+
 async fn pull_page_inner(
     state: &AppState,
     client: &reqwest::Client,
@@ -1591,8 +1625,13 @@ async fn pull_page_inner(
     cloud: &mut CloudState,
     doc: &str,
     page: &str,
-    deadline: Option<tokio::time::Instant>,
+    mode: PullMode,
 ) -> bool {
+    let deadline = if let PullMode::Recovery(deadline) = mode {
+        Some(deadline)
+    } else {
+        None
+    };
     let capture = deadline.is_some();
     if !crate::store::safe_id(doc) || !crate::store::safe_id(page) {
         return false;
@@ -1809,6 +1848,12 @@ async fn pull_page_inner(
     // Push it using the existing causal base and let the relay merge first.
     if native_changed && has_unpushed_local(&local_rev, cloud.pushed.get(&key).map(String::as_str))
     {
+        if matches!(mode, PullMode::AfterUpload) {
+            // Both copies stay intact and the caller keeps this change pending.
+            // Retrying on the sync scheduler keeps the task stack bounded.
+            eprintln!("cloud: {doc}/{page} differs after upload; leaving both copies pending");
+            return false;
+        }
         eprintln!("cloud: {doc}/{page} has unpushed local edits; pushing before pull");
         return Box::pin(push_page(state, client, config, cloud, doc, page)).await;
     }
@@ -2341,6 +2386,89 @@ mod tests {
         assert_eq!(cloud.applied_meta[&format!("{STAMP_DOC}:name")], 4);
         assert_eq!(cloud.applied_meta[&format!("{STAMP_DOC}:parent")], 5);
         assert_eq!(std::fs::read(metadata).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn divergent_legacy_page_stays_pending_after_one_conflicted_upload() {
+        use axum::{http::StatusCode, routing::put, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let gets = Arc::new(AtomicUsize::new(0));
+        let puts = Arc::new(AtomicUsize::new(0));
+        let get_count = gets.clone();
+        let put_count = puts.clone();
+        let local = b"synthetic local";
+        let remote = b"synthetic remote";
+        let remote_rev = crate::store::sha256_hex(remote);
+        let local_rev = crate::store::sha256_hex(local);
+        let remote_revision = remote_rev.clone();
+        let converged_revision = local_rev.clone();
+        let relay = Router::new().route(
+            "/api/documents/{doc}/pages/{page}/rm",
+            put(move || {
+                put_count.fetch_add(1, Ordering::Relaxed);
+                async { StatusCode::CONFLICT }
+            })
+            .get(move || {
+                let attempt = get_count.fetch_add(1, Ordering::Relaxed);
+                let (bytes, revision) = if attempt == 0 {
+                    (remote.as_slice(), remote_revision.clone())
+                } else {
+                    (local.as_slice(), converged_revision.clone())
+                };
+                async move {
+                    (
+                        [
+                            ("content-type", "application/octet-stream".to_owned()),
+                            ("x-rm-revision", revision),
+                        ],
+                        bytes,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = CloudConfig {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: String::new(),
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, relay).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let doc = "11111111-1111-4111-a111-111111111111";
+        let page = "22222222-2222-4222-a222-222222222222";
+        std::fs::create_dir(dir.path().join(doc)).unwrap();
+        let disk = dir.path().join(doc).join(format!("{page}.rm"));
+        std::fs::write(&disk, local).unwrap();
+        let state = AppState {
+            store: Store::new(dir.path().to_path_buf()),
+            dbus: None,
+            events: tokio::sync::broadcast::channel(1).0,
+            firmware: String::new(),
+            model: String::new(),
+            templates_dir: dir.path().to_path_buf(),
+        };
+        let client = reqwest::Client::new();
+        let mut cloud = CloudState::default();
+        let key = format!("{doc}/{page}");
+
+        assert!(!push_page(&state, &client, &config, &mut cloud, doc, page).await);
+        assert_eq!(puts.load(Ordering::Relaxed), 1);
+        assert_eq!(gets.load(Ordering::Relaxed), 1);
+        assert_eq!(std::fs::read(&disk).unwrap(), local);
+        assert!(!cloud.revisions.contains_key(&key));
+        assert!(!cloud.pushed.contains_key(&key));
+
+        // A scheduled retry may acknowledge identical bytes without writing the file.
+        assert!(push_page(&state, &client, &config, &mut cloud, doc, page).await);
+        assert_eq!(puts.load(Ordering::Relaxed), 2);
+        assert_eq!(gets.load(Ordering::Relaxed), 2);
+        assert_eq!(cloud.revisions[&key], local_rev);
+        assert_eq!(cloud.pushed[&key], local_rev);
+        assert_eq!(std::fs::read(&disk).unwrap(), local);
+        server.abort();
     }
 
     #[tokio::test]
