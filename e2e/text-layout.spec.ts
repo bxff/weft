@@ -13,7 +13,7 @@ const DEVICE_AUTHOR = 'aaaaaaaa-0000-4000-a000-000000000001'
 
 declare global {
     interface Window {
-        releaseDeviceFonts(): void
+        releaseDeviceFonts(): Promise<number>
         textLayoutProbe: {
             before: TLDrawShape
             counts: { created: number; deleted: number; updated: number }
@@ -22,23 +22,26 @@ declare global {
     }
 }
 
-async function delayDeviceFonts(page: Page, changeGlyphWidth = false) {
-    await page.addInitScript((changeGlyphWidth) => {
+async function delayDeviceFonts(page: Page, fakeGlyph?: string, reject = false) {
+    await page.addInitScript(({ fakeGlyph, reject }) => {
         const fonts = document.fonts
         const check = fonts.check.bind(fonts)
         const load = fonts.load.bind(fonts)
         let release!: () => void
         const wait = new Promise<void>((resolve) => { release = resolve })
         let settled = false
-        window.releaseDeviceFonts = () => {
+        const requests: Promise<FontFace[]>[] = []
+        window.releaseDeviceFonts = async () => {
             settled = true
             release()
+            await Promise.allSettled(requests)
+            return requests.length
         }
-        if (changeGlyphWidth) {
+        if (fakeGlyph) {
             const measureText = CanvasRenderingContext2D.prototype.measureText
             CanvasRenderingContext2D.prototype.measureText = function (text) {
                 const metrics = measureText.call(this, text)
-                if (text === '漢' && this.font.includes('RM Noto Sans')) {
+                if (text === fakeGlyph && this.font.includes('RM Noto Sans')) {
                     Object.defineProperty(metrics, 'width', { value: settled ? 320 : 5 })
                 }
                 return metrics
@@ -47,10 +50,14 @@ async function delayDeviceFonts(page: Page, changeGlyphWidth = false) {
         fonts.check = (font, text) => !font.includes("'RM ") && check(font, text)
         fonts.load = async (font, text) => {
             if (!font.includes("'RM ")) return load(font, text)
-            await wait
-            return [] // deterministic, including CI without device font files
+            const request = wait.then(() => {
+                if (reject) throw new Error('synthetic font-load failure')
+                return [] // deterministic, including CI without device font files
+            })
+            requests.push(request)
+            return request
         }
-    }, changeGlyphWidth)
+    }, { fakeGlyph, reject })
 }
 
 async function appendToDeviceText(page: Page, text: string) {
@@ -334,7 +341,7 @@ test('changed fallback glyph widths reflow visible text, hitboxes and anchored i
     insertText(doc, null, '漢漢漢漢漢漢', { authorUuid: DEVICE_AUTHOR })
     const id = crypto.randomUUID()
     expect((await request.put(`/api/documents/${DOC}/pages/${id}/rm`, { data: Buffer.from(doc.serialize()) })).ok()).toBe(true)
-    await delayDeviceFonts(page, true)
+    await delayDeviceFonts(page, '漢')
     await page.goto(`/app/${DOC}/${id}`)
     await expect(page.getByTestId('sync-status')).toHaveText('synced')
     const stroke = () => page.evaluate(() => {
@@ -365,6 +372,44 @@ test('changed fallback glyph widths reflow visible text, hitboxes and anchored i
     expect((afterLayout.lastBaseline - beforeLayout.lastBaseline) * RM_SCALE).toBeCloseTo(delta, 2)
     expect(afterLayout.lastHitbox - beforeLayout.lastHitbox).toBeCloseTo(delta, 1)
 })
+
+for (const reject of [false, true]) {
+    test(`table-backed text geometry stays fixed when paint-font loading ${reject ? 'fails' : 'settles'}`, async ({ page, request }) => {
+        const { first } = await anchoredReflowPushes()
+        const { RmDocument, insertText } = await import('../packages/rm-format/src/index')
+        const doc = RmDocument.parse(first as never)
+        // Public layout data already covers A. The synthetic Canvas probe returns
+        // radically different widths across settlement if it is consulted for A.
+        insertText(doc, null, 'AAAAAA', { authorUuid: DEVICE_AUTHOR })
+        const id = crypto.randomUUID()
+        expect((await request.put(`/api/documents/${DOC}/pages/${id}/rm`, { data: Buffer.from(doc.serialize()) })).ok()).toBe(true)
+        await delayDeviceFonts(page, 'A', reject)
+        await page.goto(`/app/${DOC}/${id}`)
+        await expect(page.getByTestId('sync-status')).toHaveText('synced')
+        const layout = () => page.evaluate(() => {
+            const ed = (window as unknown as { __weftEditor: Editor }).__weftEditor
+            const column = ed.getCurrentPageShapes().find(shape => shape.type === 'device-text')!
+            const stroke = ed.getCurrentPageShapes().find(shape => shape.type === 'draw')!
+            const svg = document.querySelectorAll<SVGTextElement>('.tl-shape[data-shape-type="device-text"] svg text')
+            const glyphs = Array.from(svg, node => ({
+                text: node.textContent,
+                origins: Array.from({ length: node.getNumberOfChars() }, (_, i) => {
+                    const { x, y } = node.getStartPositionOfChar(i)
+                    return { x, y }
+                }),
+            }))
+            return {
+                gen: column.meta.layoutGen,
+                geometry: { glyphs, hitboxes: column.props.lines, ink: { id: stroke.id, x: stroke.x, y: stroke.y } },
+            }
+        })
+        await expect.poll(async () => (await layout()).geometry.glyphs.find(run => run.text?.includes('AAAAAA'))?.origins.length).toBeGreaterThanOrEqual(6)
+        const before = await layout()
+        expect(await page.evaluate(() => window.releaseDeviceFonts())).toBeGreaterThan(0)
+        if (!reject) await expect.poll(async () => (await layout()).gen).not.toBe(before.gen)
+        expect((await layout()).geometry).toEqual(before.geometry)
+    })
+}
 
 test('a text edit reapplies native layer visibility without replacing the ink', async ({ page, request }) => {
     const { first } = await anchoredReflowPushes()
