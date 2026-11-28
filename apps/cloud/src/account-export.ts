@@ -70,6 +70,7 @@ export function streamNotebookExport(store: CloudStore, user: string, finish: ()
     yield* tarEntry("about.json", json({
       format: "weft-notebooks-v1", exportedAt: new Date().toISOString(),
       scope: "Current synced notebook content; not edit history, device-only files or login data.",
+      integrity: "If complete.json is missing, this download is incomplete. Request a new export.",
     }), open);
     yield* tarEntry("documents.json", json(JSON.parse(store.getDocuments(user))), open);
     for (const [i, { doc, page }] of store.accountExportPages(user).entries()) {
@@ -113,6 +114,7 @@ export function streamNotebookExport(store: CloudStore, user: string, finish: ()
       yield* tarEntry("templates/" + i + "/template.json", json(template), open);
       yield* tarEntry("templates/" + i + "/content", bytes.bytes, open);
     }
+    yield* tarEntry("complete.json", json({ complete: true }), open);
     open();
     yield new Uint8Array(1024);
   }

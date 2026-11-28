@@ -52,7 +52,7 @@
                 form.append(grant)
                 document.body.append(form)
                 try { form.submit() } finally { form.remove() }
-                status = 'Export requested. Check your downloads.'
+                status = 'Export started. Check your downloads. If the archive does not contain complete.json, it is incomplete.'
             } else if (kind === 'export' && response.status === 409 &&
                 (await response.json()).error === 'export-missing-images') {
                 if (!auth.stillCurrent()) return

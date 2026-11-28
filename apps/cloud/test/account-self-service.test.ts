@@ -154,7 +154,10 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
       return (await response.json() as { ticket: string }).ticket;
     };
     const healthy = await downloadWith(await imageTicket());
-    expect(tarEntries(new Uint8Array(await healthy.arrayBuffer())).get("pages/0/assets/0")).toEqual(Buffer.of(5));
+    const healthyFiles = tarEntries(new Uint8Array(await healthy.arrayBuffer()));
+    expect(healthyFiles.get("pages/0/assets/0")).toEqual(Buffer.of(5));
+    expect([...healthyFiles.keys()].at(-1)).toBe("complete.json");
+    expect(JSON.parse(healthyFiles.get("complete.json")!.toString())).toEqual({ complete: true });
     const lateTicket = await imageTicket();
     const db = (cloud.store as unknown as { db: Database }).db;
     db.run("DELETE FROM assets WHERE user_id=? AND doc=? AND page=? AND file=?", [imageUser, imageDoc, imagePage, imageFile]);
@@ -162,6 +165,7 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
     expect(lateDownload.status).toBe(200); // headers were sent before the stream reached the page
     const truncated = new Uint8Array(await lateDownload.arrayBuffer());
     expect(() => tarEntries(truncated)).toThrow("truncated archive");
+    expect(Buffer.from(truncated).includes("complete.json\0")).toBe(false);
     expect((await downloadWith(lateTicket)).status).toBe(404);
 
     const revokedExport = await exportTicket();
