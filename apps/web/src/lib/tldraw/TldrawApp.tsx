@@ -508,6 +508,7 @@ function PageChrome({
                 (owner: an edge-less page read as broken) and moves down as
                 the page grows. */}
             <div
+                data-testid="editor-page-border"
                 style={{
                     position: 'absolute',
                     left: geo.x,
