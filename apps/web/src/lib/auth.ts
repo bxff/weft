@@ -26,7 +26,7 @@ export interface ClerkLike {
     openSignIn(): void
     /** Hosted-portal sign-in (redirects to Clerk's Account Portal, has Google
      *  SSO, then back). Works without bundled UI components. */
-    redirectToSignIn?(opts?: { signInForceRedirectUrl?: string }): Promise<unknown> | void
+    redirectToSignIn?(opts?: { signInForceRedirectUrl?: string; signUpForceRedirectUrl?: string }): Promise<unknown> | void
     signOut(): Promise<void>
     addListener(listener: () => void): void | (() => void)
 }
@@ -371,7 +371,8 @@ export async function signIn(): Promise<void> {
     // Prefer the hosted Account Portal redirect (has Google SSO, needs no
     // bundled UI components). Fall back to the modal if unavailable.
     if (clerk.redirectToSignIn) {
-        await clerk.redirectToSignIn({ signInForceRedirectUrl: window.location.href })
+        const returnUrl = window.location.href
+        await clerk.redirectToSignIn({ signInForceRedirectUrl: returnUrl, signUpForceRedirectUrl: returnUrl })
     } else {
         clerk.openSignIn()
     }

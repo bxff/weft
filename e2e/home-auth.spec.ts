@@ -9,7 +9,7 @@ for (const signedIn of [false, true]) {
                     window.addEventListener('weft-test-auth-ready', () => {
                         resolve({
                             user: signedIn ? { id: 'fixture-user' } : null,
-                            redirectToSignIn: (opts: { signInForceRedirectUrl: string }) => {
+                            redirectToSignIn: (opts: { signInForceRedirectUrl: string; signUpForceRedirectUrl: string }) => {
                                 window.dispatchEvent(new CustomEvent('weft-test-sign-in', { detail: opts }))
                             },
                         })
@@ -31,18 +31,18 @@ for (const signedIn of [false, true]) {
             await expect(page.getByRole('button', { name: 'Sign in or sign up' })).toBeVisible()
             await expect(page.getByRole('link', { name: 'Open your notes', exact: true })).toHaveCount(0)
             await expect(page.getByText(/waitlist/i)).toHaveCount(0)
-            const directSignIns: string[] = []
-            await page.exposeFunction('recordDirectSignIn', (url: string) => directSignIns.push(url))
+            const directSignIns: Array<[string, string]> = []
+            await page.exposeFunction('recordDirectSignIn', (urls: [string, string]) => directSignIns.push(urls))
             await page.evaluate(() => {
                 window.addEventListener('weft-test-sign-in', (event) => {
                     const detail = (event as CustomEvent).detail
-                    void (window as unknown as { recordDirectSignIn(url: string): Promise<void> }).recordDirectSignIn(detail.signInForceRedirectUrl)
+                    void (window as unknown as { recordDirectSignIn(urls: [string, string]): Promise<void> }).recordDirectSignIn([detail.signInForceRedirectUrl, detail.signUpForceRedirectUrl])
                 })
             })
             for (const name of ['Sign in or sign up', 'Sign in']) {
                 await page.getByRole('button', { name, exact: true }).click()
             }
-            await expect.poll(() => directSignIns).toEqual([page.url(), page.url()])
+            await expect.poll(() => directSignIns).toEqual([[page.url(), page.url()], [page.url(), page.url()]])
         }
     })
 }
