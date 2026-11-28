@@ -89,3 +89,47 @@ for (const fault of ['failed write', 'persisted write with lost reply'] as const
         }
     })
 }
+
+test('guarded startup does not read or clear an unattributed legacy browser queue', async ({ page }) => {
+    const sheet = crypto.randomUUID()
+    const here = `/app/${doc}/${sheet}`
+    const oldText = 'Old account draft'
+    const before = await page.goto('/')
+    expect(before?.ok()).toBe(true)
+    const key = `page/${doc}/${sheet}/pending/${crypto.randomUUID()}`
+    const legacyBytes = JSON.stringify([{
+        type: 'edit-root-text', create: {}, inserts: [{ afterKey: null, text: oldText }],
+    }])
+    const openLegacy = async (write: boolean) => page.evaluate(({ key, legacyBytes, write }) =>
+        new Promise<string | null>((resolve, reject) => {
+            const open = indexedDB.open('weft', 1)
+            open.onerror = () => reject(open.error)
+            open.onupgradeneeded = () => open.result.createObjectStore('pages')
+            open.onsuccess = () => {
+                const db = open.result
+                const txn = db.transaction('pages', write ? 'readwrite' : 'readonly')
+                const data = txn.objectStore('pages')
+                const request = write ? data.put(new TextEncoder().encode(legacyBytes), key) : data.get(key)
+                txn.onabort = () => { db.close(); reject(txn.error) }
+                txn.oncomplete = () => {
+                    db.close()
+                    resolve(!write && request.result ? new TextDecoder().decode(request.result) : null)
+                }
+            }
+        }), { key, legacyBytes, write })
+    await openLegacy(true)
+    await page.goto(here)
+    await expect(page.getByTestId('sync-status')).toHaveText('synced')
+    await expect(nativeText(page)).toHaveCount(0)
+
+    await page.evaluate(async () => {
+        const controller = (window as any).__weftController
+        await controller.editRootText({ create: {}, inserts: [{ afterKey: null, text: 'New owner edit' }] })
+        await controller.saveBeforeNavigation()
+    })
+    await expect(nativeText(page)).toHaveText('New owner edit')
+    await expect(page.getByTestId('sync-status')).toHaveText('synced')
+    await page.reload()
+    await expect(nativeText(page)).toHaveText('New owner edit')
+    expect(await openLegacy(false)).toBe(legacyBytes)
+})
