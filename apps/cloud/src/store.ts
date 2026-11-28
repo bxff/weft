@@ -1619,6 +1619,50 @@ export class CloudStore {
     ).all(user);
   }
 
+  accountExportPageHasMissingImages(user: string, doc: string, page: string): boolean {
+    return this.db.transaction(() => {
+      const snapshot = this.latestSnapshotRow(user, doc, page);
+      const opSeq = this.latestOpSeq(user, doc, page);
+      const blob = snapshot || opSeq ? null : this.getPage(user, doc, page);
+      if (!snapshot && !opSeq && !blob) return false;
+      const { native } = this.readRecoveryNative(user, doc, page, snapshot, opSeq, blob);
+      const { required, unresolved } = this.recoveryImageReferences(native);
+      if (unresolved) return true;
+      if (!required.size) return false;
+      const files = new Set(this.listAssets(user, doc, page));
+      return [...required].some(file => !files.has(file));
+    })();
+  }
+
+  private recoveryImageReferences(native: Uint8Array) {
+    const required = new Set<string>();
+    let unresolved = false;
+    for (const [, item] of RmDocument.parse(native).tree().walk()) {
+      if (item.kind !== "image") continue;
+      if (item.filename) required.add(item.filename);
+      else unresolved = true;
+    }
+    return { required, unresolved };
+  }
+
+  private readRecoveryNative(
+    user: string, doc: string, page: string,
+    snapshot: ReturnType<CloudStore["latestSnapshotRow"]>,
+    opSeq: number,
+    blob: CloudPage | null,
+  ) {
+    if (this.truncationFloor(user, doc, page) > (snapshot?.op_seq ?? 0)) {
+      throw new Error("Recovery checkpoint is below the retained operation floor");
+    }
+    const checkpointPath = snapshot ? this.storedBlobPath(snapshot.path, "snapshots") : null;
+    if (snapshot && !checkpointPath) throw new Error("Invalid recovery checkpoint path");
+    const checkpoint = checkpointPath
+      ? decodeSnapshot(new Uint8Array(readFileSync(checkpointPath))) : null;
+    const ops = this.opsInRange(user, doc, page, snapshot?.op_seq ?? 0, opSeq);
+    const native = blob?.bytes ?? reconstructRm(checkpoint?.rm ?? null, ops, DEVICE_BRIDGE_AUTHOR);
+    return { checkpoint, ops, native };
+  }
+
   /** Read all members of the recovery revision in the same SQLite snapshot.
    * Missing checkpoint files fail closed instead of replaying against empty ink. */
   readRecoveryPage(
@@ -1645,25 +1689,12 @@ export class CloudStore {
         return { etag: ifNoneMatch, body: null };
       }
 
-      if (this.truncationFloor(user, doc, page) > (snapshot?.op_seq ?? 0)) {
-        throw new Error("Recovery checkpoint is below the retained operation floor");
-      }
-      const checkpointPath = snapshot ? this.storedBlobPath(snapshot.path, "snapshots") : null;
-      if (snapshot && !checkpointPath) throw new Error("Invalid recovery checkpoint path");
-      const checkpoint = checkpointPath
-        ? decodeSnapshot(new Uint8Array(readFileSync(checkpointPath))) : null;
-      const ops = this.opsInRange(user, doc, page, snapshot?.op_seq ?? 0, opSeq);
-      const native = blob?.bytes ?? reconstructRm(checkpoint?.rm ?? null, ops, DEVICE_BRIDGE_AUTHOR);
+      const { checkpoint, ops, native } = this.readRecoveryNative(user, doc, page, snapshot, opSeq, blob);
       const overlay: OverlayDocument = checkpoint?.overlay ?? (legacyOverlay ? JSON.parse(legacyOverlay) : { shapes: [] });
       foldOverlayOps(overlay, ops);
       const nativeSha256 = sha256hex(native);
-      const required = new Set<string>();
-      const missingAssets = new Set<string>();
-      for (const [, item] of RmDocument.parse(native).tree().walk()) {
-        if (item.kind !== "image") continue;
-        if (item.filename) required.add(item.filename);
-        else missingAssets.add("<unresolved image>");
-      }
+      const { required, unresolved } = this.recoveryImageReferences(native);
+      const missingAssets = new Set(unresolved ? ["<unresolved image>"] : []);
       const assets = [];
       for (const { file, etag } of rows) {
         if (!required.delete(file)) continue;

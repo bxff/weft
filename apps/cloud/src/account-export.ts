@@ -49,6 +49,18 @@ async function* tarEntry(
   if (size % 512) yield new Uint8Array(512 - size % 512);
 }
 
+/** Inspect one page at a time. Native bytes must be decoded to find image
+ * references, but no image blobs, exports or archive bytes are kept here. */
+export async function accountExportHasMissingImages(store: CloudStore, user: string, signal: AbortSignal) {
+  for (const { doc, page } of store.accountExportPages(user)) {
+    signal.throwIfAborted();
+    if (store.isAccountFenced(user)) throw new Error("Account closed during export");
+    if (store.accountExportPageHasMissingImages(user, doc, page)) return true;
+    await Bun.sleep(0); // yield between pages; unrelated relay requests can progress
+  }
+  return false;
+}
+
 export function streamNotebookExport(store: CloudStore, user: string, finish: () => void): ReadableStream<Uint8Array> {
   const open = () => {
     if (store.isAccountFenced(user)) throw new Error("Account closed during export");
@@ -65,6 +77,11 @@ export function streamNotebookExport(store: CloudStore, user: string, finish: ()
       const path = "pages/" + i;
       const recovery = store.readRecoveryPage(user, doc, page, null, null)?.body;
       const assets = store.listAssets(user, doc, page);
+      const available = new Set(assets);
+      if (recovery?.missingAssets.length ||
+          recovery?.assets.some(({ name }) => !available.has(name))) {
+        throw new Error("A referenced notebook image is missing");
+      }
       const { nativeBase64, ...pageState } = recovery ?? {};
       yield* tarEntry(path + "/page.json", json({
         doc, page, assetFiles: assets, ...pageState,

@@ -20,7 +20,7 @@ import {
   signSelfHostToken,
 } from "./auth";
 import { encodeSnapshot } from "@weft/sync-engine";
-import { streamNotebookExport } from "./account-export";
+import { accountExportHasMissingImages, streamNotebookExport } from "./account-export";
 import { parseRecoveryImport, type RecoveryImport } from "./recovery-import";
 import { builtinTemplate, builtinTemplateList } from "./builtin-templates";
 import { installProcessHooks, reportError } from "./telemetry";
@@ -887,10 +887,20 @@ export function startCloud(
         const headers = { "cache-control": "private, no-store", "referrer-policy": "no-referrer" };
         if (!hostedAccount) return json({ error: "not found" }, 404, headers);
         if (activeExports.has(user)) return json({ error: "export already running" }, 409, headers);
-        const now = Date.now();
-        for (const [ticket, grant] of accountExports) {
-          if (grant.userId === user || grant.expires <= now) accountExports.delete(ticket);
+        activeExports.add(user);
+        try {
+          for (const [ticket, grant] of accountExports) {
+            if (grant.userId === user || grant.expires <= Date.now()) accountExports.delete(ticket);
+          }
+          if (await accountExportHasMissingImages(store, user, req.signal)) {
+            return json({ error: "export-missing-images" }, 409, headers);
+          }
+          req.signal.throwIfAborted();
+          if (store.isAccountFenced(user)) return json({ error: "account-closed" }, 410, headers);
+        } finally {
+          activeExports.delete(user);
         }
+        const now = Date.now();
         const ticket = crypto.randomUUID();
         accountExports.set(ticket, { userId: user, expires: now + 30_000 });
         return json({ ticket }, 200, headers);

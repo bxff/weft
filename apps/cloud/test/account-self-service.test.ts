@@ -4,7 +4,7 @@ import { generateKeyPairSync, sign } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RmDocument } from "@weft/rm-format";
+import { RmDocument, crdtId, lww, uuidToBytesLE } from "@weft/rm-format";
 import { startCloud } from "../src/server";
 
 const owner = "user_synthetic_owner", peer = "user_synthetic_peer";
@@ -125,6 +125,45 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
     expect(files.has("pages/1/native.rm")).toBe(false);
     expect(files.has("sources/1/content")).toBe(false);
     expect((await downloadWith(ticket)).status).toBe(404);
+    // Separate account: an orphan native image must block issuance, and an
+    // orphan that appears after a healthy preflight must break the download.
+    const imageUser = "user_synthetic_image_export";
+    const imageDoc = "image-book", imagePage = "page";
+    const imageAuthor = "aaaaaaaa-0000-4000-a000-000000000001";
+    const imageId = "bbbbbbbb-0000-4000-a000-000000000002";
+    const imageFile = imageId + ".png";
+    const withImage = RmDocument.empty(imageAuthor);
+    withImage.blocks.push({
+      type: "sceneImageInfo", extraData: new Uint8Array(), version: { min: 1, current: 1 },
+      images: [{ uuid: imageId, filename: lww(crdtId(1, 11), imageFile), flags: lww(crdtId(1, 12), Uint8Array.of(17, 0)) }],
+    });
+    withImage.appendImage({
+      kind: "image", uuid: lww(crdtId(1, 12), uuidToBytesLE(imageId)), timestamp: crdtId(0, 0),
+      vertices: [0, 0, 0, 0, 10, 0, 1, 0, 10, 10, 1, 1], indices: [0, 1, 2], filename: null,
+    }, { authorUuid: imageAuthor });
+    const imageExport = () => call("/api/account/export", jwt(imageUser, 0), { method: "POST" });
+    cloud.store.putPage(imageUser, imageDoc, imagePage, "", withImage.serialize(), "fixture");
+    const refused = await imageExport();
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toEqual({ error: "export-missing-images" });
+
+    cloud.store.putAsset(imageUser, imageDoc, imagePage, imageFile, Uint8Array.of(5));
+    const imageTicket = async () => {
+      const response = await imageExport();
+      expect(response.status).toBe(200);
+      return (await response.json() as { ticket: string }).ticket;
+    };
+    const healthy = await downloadWith(await imageTicket());
+    expect(tarEntries(new Uint8Array(await healthy.arrayBuffer())).get("pages/0/assets/0")).toEqual(Buffer.of(5));
+    const lateTicket = await imageTicket();
+    const db = (cloud.store as unknown as { db: Database }).db;
+    db.run("DELETE FROM assets WHERE user_id=? AND doc=? AND page=? AND file=?", [imageUser, imageDoc, imagePage, imageFile]);
+    const lateDownload = await downloadWith(lateTicket);
+    expect(lateDownload.status).toBe(200); // headers were sent before the stream reached the page
+    const truncated = new Uint8Array(await lateDownload.arrayBuffer());
+    expect(() => tarEntries(truncated)).toThrow("truncated archive");
+    expect((await downloadWith(lateTicket)).status).toBe(404);
+
     const revokedExport = await exportTicket();
     const makeTicket = async () => {
       const r = await call("/api/ws-ticket", recent, { method: "POST" });

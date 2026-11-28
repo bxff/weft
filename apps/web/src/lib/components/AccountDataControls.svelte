@@ -53,6 +53,10 @@
                 document.body.append(form)
                 try { form.submit() } finally { form.remove() }
                 status = 'Export requested. Check your downloads.'
+            } else if (kind === 'export' && response.status === 409 &&
+                (await response.json()).error === 'export-missing-images') {
+                if (!auth.stillCurrent()) return
+                error = 'Some images are missing from synced notebooks. No archive was downloaded. Sync the affected notebooks again, then retry.'
             } else if (kind === 'delete' && response.status === 204) {
                 await signOut().catch(() => {})
                 onDeleted()
