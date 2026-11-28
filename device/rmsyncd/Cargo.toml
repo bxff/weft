@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "Weft tablet daemon: D-Bus rm-sync impersonator + sync agent (mirrors the xochitl store to the hosted cloud)"
 
+[features]
+# Preserve relay-based updates for existing source and relay builds. Official
+# attested builds cannot be overwritten by an unsigned relay response.
+default = ["legacy-relay-updates"]
+legacy-relay-updates = []
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 zbus = { version = "4", default-features = false, features = ["tokio"] }
