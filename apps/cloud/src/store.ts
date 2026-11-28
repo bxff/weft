@@ -41,6 +41,18 @@ import {
   type OverlayDocument,
 } from "@weft/sync-engine";
 
+/** Keep FULL enabled through the caller's synchronous, top-level commit. */
+function withFullDurability<T>(db: Database, publish: () => T): T {
+  if (db.inTransaction) throw new Error("Durable publication requires its own transaction");
+  const previous = db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
+  db.run("PRAGMA synchronous = FULL");
+  try {
+    return publish();
+  } finally {
+    db.run(`PRAGMA synchronous = ${previous}`);
+  }
+}
+
 /** Author naming author-table index 1 when seeding an empty reconstructed doc
  *  for the device bridge; real ink ops carry their own authors. */
 const DEVICE_BRIDGE_AUTHOR = "c10d0000-0000-4000-a000-000000000001";
@@ -953,9 +965,7 @@ export class CloudStore {
     user: string, data: RecoveryImport, digest: string,
     storageCheck: (stage: "before" | "after") => void,
   ): "created" | "replay" | "not-empty" | "unverified" {
-    if (this.db.inTransaction) throw new Error("Recovery restore requires its own transaction");
     const { notebook, pages } = data;
-    const previous = this.db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
     const restore = () => this.publishPage(user, notebook.id, pages[0]!.id, () => {
       const receipt = this.db.query<{ digest: string }, [string]>(
         "SELECT digest FROM recovery_imports WHERE user_id=?",
@@ -997,23 +1007,18 @@ export class CloudStore {
         this.recordOpChange(user, notebook.id, page.id, "recovery");
       }
       storageCheck("after");
-      for (const path of this.stagedPageFiles!) this.syncRecoveryPath(path);
+      for (const path of this.stagedPageFiles!) this.syncPath(path);
       const snapshotsDir = join(this.filesDir, "snapshots");
       // A fresh relay may have just created snapshots/ and its parent.
-      this.syncRecoveryPath(snapshotsDir);
-      this.syncRecoveryPath(this.filesDir);
-      this.syncRecoveryPath(dirname(this.filesDir));
+      this.syncPath(snapshotsDir);
+      this.syncPath(this.filesDir);
+      this.syncPath(dirname(this.filesDir));
       return "created";
     });
-    this.db.run("PRAGMA synchronous = FULL");
-    try {
-      return restore();
-    } finally {
-      this.db.run(`PRAGMA synchronous = ${previous}`);
-    }
+    return withFullDurability(this.db, restore);
   }
 
-  private syncRecoveryPath(path: string): void {
+  private syncPath(path: string): void {
     const fd = openSync(path, "r");
     try { fsyncSync(fd); }
     finally { closeSync(fd); }
@@ -1775,8 +1780,8 @@ export class CloudStore {
         } finally {
           closeSync(fd);
         }
-        this.syncRecoveryPath(this.filesDir);
-        this.syncRecoveryPath(dirname(this.filesDir));
+        this.syncPath(this.filesDir);
+        this.syncPath(dirname(this.filesDir));
         this.db.run(
           "INSERT OR REPLACE INTO files (user_id, doc, path, size, mime, etag) VALUES (?, ?, ?, ?, ?, ?)",
           [user, doc, path, bytes.length, mime, etag],
@@ -1812,13 +1817,7 @@ export class CloudStore {
   private commitSources<T>(write: () => T): T {
     // No autocommit ROW can be lost to a WAL reset after deleting its old
     // files. BEGIN IMMEDIATE also serializes quota planning with other writers.
-    const previous = this.db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
-    this.db.run("PRAGMA synchronous = FULL");
-    try {
-      return this.db.transaction(write).immediate();
-    } finally {
-      this.db.run(`PRAGMA synchronous = ${previous}`);
-    }
+    return withFullDurability(this.db, () => this.db.transaction(write).immediate());
   }
 
   private unlinkSource(stored: string): void {
