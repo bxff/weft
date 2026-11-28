@@ -299,6 +299,21 @@ export async function getAuthToken(): Promise<string | null> {
     return user ? `dev:${user}` : null
 }
 
+/** Pin a sensitive operation to the currently selected account and relay,
+ * even if an async token request races a tab/account change. The relay still
+ * verifies the signed identity and any required first-factor age. */
+export async function hostedAccountRequest() {
+    const relay = connection().cloudUrl
+    const key = clerkPublishableKey()
+    const owner = localPreferenceOwner()
+    if (!key || !owner?.startsWith('clerk:')) return null
+    const stillCurrent = () => connection().cloudUrl === relay &&
+        clerkPublishableKey() === key && localPreferenceOwner() === owner
+    const token = await getAuthToken()
+    if (!token || !stillCurrent() || tokenClaims(token)?.sub !== owner.slice(6)) return null
+    return { relay, token, stillCurrent }
+}
+
 /** Scope local preferences without refreshing credentials or storing them. */
 export function localPreferenceOwner(): string | null {
     if (clerkEnabled()) {

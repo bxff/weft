@@ -14,11 +14,14 @@ import {
 } from "./store";
 import {
   authenticate,
+  deleteHostedClerkUser,
+  isRecentClerkSession,
   selfHostEnabled,
   jwtSigningSecret,
   signSelfHostToken,
 } from "./auth";
 import { encodeSnapshot } from "@weft/sync-engine";
+import { accountExportHasMissingImages, streamNotebookExport } from "./account-export";
 import { parseRecoveryImport, type RecoveryImport } from "./recovery-import";
 import { builtinTemplate, builtinTemplateList } from "./builtin-templates";
 import { installProcessHooks, reportError } from "./telemetry";
@@ -212,9 +215,32 @@ async function serveStatic(dir: string, pathname: string, req: Request): Promise
 }
 
 export function startCloud(
-  opts: { port?: number; db?: string; staticDir?: string } = {},
+  opts: {
+    port?: number; db?: string; staticDir?: string;
+    /** Constructor-only fixtures; never sourced from a request or CLI. */
+    testClerk?: {
+      jwtKey: string;
+      deleteUser: (userId: string) => Promise<void>;
+      retryMs?: number;
+    };
+  } = {},
 ): CloudServer {
   const staticDir = opts.staticDir;
+  const accountOrigin = process.env.WEFT_ACCOUNT_AUTHORIZED_ORIGIN;
+  const providerSecret = process.env.CLERK_SECRET_KEY;
+  const providerIssuer = process.env.WEFT_ACCOUNT_PROVIDER_ISSUER;
+  // Rotating this credential deliberately pauses old pending jobs. Drain
+  // them or verify and explicitly migrate them before a provider/key change.
+  const providerTag = providerIssuer && providerSecret
+    ? new Bun.CryptoHasher("sha256").update(JSON.stringify(["weft-clerk-instance-v1", providerIssuer, providerSecret])).digest("hex")
+    : null;
+  const accountSelfService = process.env.WEFT_ACCOUNT_SELF_SERVICE === "1" &&
+    !!providerTag && !!accountOrigin;
+  const accountDeletes = new Set<string>();
+  const activeExports = new Set<string>();
+  // One outstanding ticket per requesting user, consumed before streaming.
+  // A standard browser download can't set an Authorization header.
+  const accountExports = new Map<string, { userId: string; expires: number }>();
   // One auth mode only: self-host (WEFT_PASSWORD) or hosted (CLERK_SECRET_KEY),
   // never both, else the self-host branch silently shadows Clerk.
   if (process.env.WEFT_PASSWORD && process.env.CLERK_SECRET_KEY) {
@@ -226,6 +252,48 @@ export function startCloud(
   // Drop pairing tokens unused for 30+ days (also pruned on device-list fetch)
   // so a leaked token can't live forever.
   store.pruneStaleDeviceTokens();
+
+  const deletionRetryMs = opts.testClerk?.retryMs ?? 15_000;
+  const advanceManualDeletion = async (user: string): Promise<boolean> => {
+    if (!providerTag || !providerSecret) return false;
+    if (store.manualDeletionComplete(user, providerTag)) return true;
+    if (accountDeletes.has(user) ||
+        !store.claimManualDeletion(user, providerTag, Date.now(), deletionRetryMs)) return false;
+    accountDeletes.add(user);
+    try {
+      const work = store.drainAccountPurge(user);
+      if (work.remaining > 0) {
+        if (work.removed > 0) store.continueManualDeletion(user, providerTag);
+        return false;
+      }
+      try {
+        if (opts.testClerk) await opts.testClerk.deleteUser(user);
+        else await deleteHostedClerkUser(user, providerSecret);
+      } catch (error) {
+        if (!error || typeof error !== "object" || !("status" in error) || error.status !== 404) return false;
+      }
+      store.completeManualDeletion(user, providerTag);
+      return true;
+    } finally {
+      accountDeletes.delete(user);
+    }
+  };
+  let manualPollRunning = false;
+  const pollManualDeletions = async () => {
+    if (manualPollRunning || !providerTag) return;
+    manualPollRunning = true;
+    try {
+      await Promise.allSettled(store.dueManualDeletions(providerTag, Date.now()).map(advanceManualDeletion));
+    } finally {
+      manualPollRunning = false;
+    }
+  };
+  // Only resumes explicit fenced manual requests. No age/user discovery or
+  // inactivity deletion is enabled by this worker.
+  const deletionTimer = accountSelfService ? setInterval(() => void pollManualDeletions().catch(
+    () => console.error("weft-cloud: unable to poll pending manual deletions"),
+  ), deletionRetryMs) : null;
+  deletionTimer?.unref?.();
 
   // Opt-in periodic backups: WEFT_BACKUP_DIR enables a VACUUM-INTO DB snapshot
   // plus blob-tree copy every WEFT_BACKUP_INTERVAL_MIN (60), keeping
@@ -607,6 +675,7 @@ export function startCloud(
           firmware: "",
           model: "cloud",
           authMode,
+          accountSelfService,
         });
       }
 
@@ -740,7 +809,30 @@ export function startCloud(
         return serveStatic(staticDir, path, req);
       }
 
-      let auth = await authenticate(req, store);
+      if (path === "/api/account/export/download" && req.method === "POST") {
+        const headers = { "cache-control": "private, no-store", "referrer-policy": "no-referrer" };
+        if (!accountSelfService || req.headers.get("content-type")?.split(";")[0] !==
+            "application/x-www-form-urlencoded") return json({ error: "not found" }, 404, headers);
+        const body = await readBytes(req, 128);
+        if ("error" in body) return body.error;
+        // Put the bearer grant in the form body, never a URL/access-log query.
+        const ticket = new URLSearchParams(new TextDecoder().decode(body.bytes)).get("ticket") ?? "";
+        const grant = accountExports.get(ticket);
+        accountExports.delete(ticket);
+        if (!accountSelfService || !grant || grant.expires <= Date.now() ||
+            store.isAccountFenced(grant.userId)) return json({ error: "not found" }, 404, headers);
+        if (activeExports.has(grant.userId)) return json({ error: "export already running" }, 409, headers);
+        activeExports.add(grant.userId);
+        return new Response(streamNotebookExport(store, grant.userId, () => activeExports.delete(grant.userId)), {
+          headers: {
+            ...headers, "content-type": "application/x-tar",
+            "content-disposition": 'attachment; filename="weft-notebooks.tar"',
+            "x-content-type-options": "nosniff",
+          },
+        });
+      }
+
+      let auth = await authenticate(req, store, providerSecret, opts.testClerk?.jwtKey);
       // #70: a browser WS connects with a single-use ?ticket= instead of the
       // session JWT in the URL. Resolve it here (authenticate() only knows
       // headers/JWTs). Consume the nonce unconditionally — even an expired one
@@ -757,6 +849,15 @@ export function startCloud(
       }
       if (!auth) return json({ error: "unauthorized" }, 401);
       const user = auth.userId;
+      const deleteAccount = path === "/api/account" && req.method === "DELETE";
+      const hostedAccount = accountSelfService && auth.via === "clerk" &&
+        auth.clerkAuthorizedParty === accountOrigin && auth.clerkIssuer === providerIssuer;
+      // Persisted SQL/blob fences protect writes that were already reading a
+      // body when deletion started. Block new HTTP and WS admission too;
+      // the one exception is the same signed account retrying its deletion.
+      if (store.isAccountFenced(user) && !(deleteAccount && hostedAccount)) {
+        return json({ error: "account-closed" }, 410, { "cache-control": "private, no-store" });
+      }
       // Tablet SYNC-LOOP heartbeat (per device — one live tablet must not
       // mask a dead sibling). Touched on EVERY device-authed request, not
       // just the 15s exclusions tick: during a big initial push the loop is
@@ -784,6 +885,60 @@ export function startCloud(
       counters.requests++;
       const retryMs = rateLimited(`u:${user}`, RATE_RPS, RATE_BURST);
       if (retryMs !== null) return rateError(retryMs);
+
+      if (path === "/api/account/export" && req.method === "POST") {
+        const headers = { "cache-control": "private, no-store", "referrer-policy": "no-referrer" };
+        if (!hostedAccount) return json({ error: "not found" }, 404, headers);
+        if (activeExports.has(user)) return json({ error: "export already running" }, 409, headers);
+        activeExports.add(user);
+        try {
+          for (const [ticket, grant] of accountExports) {
+            if (grant.userId === user || grant.expires <= Date.now()) accountExports.delete(ticket);
+          }
+          if (await accountExportHasMissingImages(store, user, req.signal)) {
+            return json({ error: "export-missing-images" }, 409, headers);
+          }
+          req.signal.throwIfAborted();
+          if (store.isAccountFenced(user)) return json({ error: "account-closed" }, 410, headers);
+        } finally {
+          activeExports.delete(user);
+        }
+        const now = Date.now();
+        const ticket = crypto.randomUUID();
+        accountExports.set(ticket, { userId: user, expires: now + 30_000 });
+        return json({ ticket }, 200, headers);
+      }
+
+      if (deleteAccount) {
+        const noStore = { "cache-control": "private, no-store" };
+        if (!hostedAccount || !providerTag) {
+          return json({ error: "not found" }, 404, noStore);
+        }
+        const result = await readJson(req, 128);
+        if ("error" in result) return result.error;
+        const body = JSON.parse(result.text) as { confirm?: unknown } | null;
+        if (body?.confirm !== "DELETE") return json({ error: "confirmation-required" }, 400, noStore);
+        // Check at the irreversible step, not before an asynchronous body read.
+        if (!isRecentClerkSession(auth)) return json({ error: "recent-sign-in-required" }, 403, noStore);
+        try {
+          store.stageAccountPurge(user, providerTag);
+          closeSockets(user, () => true);
+          syncHeartbeats.delete(user);
+          for (const [ticket, identity] of wsTickets) {
+            if (identity.userId === user) wsTickets.delete(ticket);
+          }
+          for (const [ticket, grant] of accountExports) {
+            if (grant.userId === user) accountExports.delete(ticket);
+          }
+          if (!await advanceManualDeletion(user)) return json({ status: "pending" }, 202, noStore);
+          return new Response(null, { status: 204, headers: { ...CORS, ...noStore } });
+        } catch {
+          // If already fenced, never reopen the account or claim completion.
+          return store.isAccountFenced(user)
+            ? json({ status: "pending" }, 202, noStore)
+            : json({ error: "account-deletion-unavailable" }, 503, noStore);
+        }
+      }
 
       // Admin quota control (STORAGE-PLAN §1): set/clear one user's per-class
       // override without ssh+sqlite. Body: { userId, class, bytes } — bytes
@@ -2213,6 +2368,10 @@ export function startCloud(
     },
     websocket: {
       open(ws) {
+        if (store.isAccountFenced(ws.data.userId)) {
+          ws.close(1008, "account closed");
+          return;
+        }
         const set = sockets.get(ws.data.userId) ?? new Set();
         // Per-user connection cap (abuse guard): sockets hold server memory
         // and fanout work, and nothing else bounded how many one account
@@ -2280,6 +2439,7 @@ export function startCloud(
     stop: () => {
       if (backupTimer) clearInterval(backupTimer);
       if (changesPruneTimer) clearInterval(changesPruneTimer);
+      if (deletionTimer) clearInterval(deletionTimer);
       server.stop(true);
     },
   };

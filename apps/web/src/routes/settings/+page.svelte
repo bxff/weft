@@ -3,6 +3,7 @@
     import { connection, setCloudUrl, isSelfHosted, docsUrl } from '$lib/settings'
     import { clerkEnabled, currentUserLabel, ensureClerk, signIn, signOut } from '$lib/auth'
     import SiteHeader from '$lib/components/SiteHeader.svelte'
+    import AccountDataControls from '$lib/components/AccountDataControls.svelte'
     import SiteFooter from '$lib/components/SiteFooter.svelte'
 
     let selfHost = $state(false)
@@ -235,6 +236,7 @@
                 <button onclick={() => void signOut().then(refreshUser)} class="wf-link mt-4 cursor-pointer">
                     Sign out →
                 </button>
+                <AccountDataControls onDeleted={() => { userLabel = null; location.assign('/') }} />
             {:else}
                 <p class="mt-2 text-[14px] leading-relaxed" style="color: var(--gray-7)">
                     Sign in and your reMarkable notebooks sync to your account, free, from

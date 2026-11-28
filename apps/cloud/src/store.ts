@@ -6,7 +6,7 @@
 import { Database } from "bun:sqlite";
 import { withFullDurability } from "./sqlite-durability";
 import { publishBackup } from "./backup";
-import { drainAccountPurge, initAccountPurge, isAccountFenced, stageAccountPurge, withAccountBlobWrite } from "./account-purge";
+import { drainAccountPurge, durableAccountWrite, initAccountPurge, isAccountFenced, stageAccountPurge, withAccountBlobWrite } from "./account-purge";
 import {
   closeSync,
   fsyncSync,
@@ -406,13 +406,48 @@ export class CloudStore {
     return isAccountFenced(this.db, userId);
   }
 
-  /** Storage-only foundation; not connected to request handlers. */
-  stageAccountPurge(userId: string): void {
-    stageAccountPurge(this.db, userId);
+  stageAccountPurge(userId: string, providerTag?: string): void {
+    stageAccountPurge(this.db, userId, providerTag);
   }
 
   drainAccountPurge(userId: string): { removed: number; remaining: number } {
     return drainAccountPurge(this.db, this.filesDir, userId);
+  }
+
+  dueManualDeletions(providerTag: string, now: number): string[] {
+    return this.db.query<{ user_id: string }, [string, number]>(
+      "SELECT user_id FROM account_manual_deletions WHERE provider_tag=? AND completed_at IS NULL AND due_at<=? ORDER BY due_at LIMIT 4",
+    ).all(providerTag, now).map(({ user_id }) => user_id);
+  }
+
+  claimManualDeletion(user: string, providerTag: string, now: number, base: number): boolean {
+    // Claim only an explicitly pending, fenced subject. The timed claim keeps
+    // concurrent or restarted workers bounded; provider deletion is idempotent.
+    return this.db.query<{ attempts: number }, [number, number, string, number, string]>(`
+      UPDATE account_manual_deletions
+      SET due_at = ?1 + min(3600000, ?2 * (1 << min(attempts, 7))), attempts=attempts+1
+      WHERE user_id=?3 AND completed_at IS NULL AND due_at<=?4 AND provider_tag=?5
+      AND EXISTS (SELECT 1 FROM account_purge_fences WHERE user_id=?3)
+      RETURNING attempts
+    `).get(now, base, user, now, providerTag) !== null;
+  }
+
+  continueManualDeletion(user: string, providerTag: string): void {
+    this.db.run("UPDATE account_manual_deletions SET attempts=0, due_at=? WHERE user_id=? AND provider_tag=? AND completed_at IS NULL",
+      [Date.now(), user, providerTag]);
+  }
+
+  completeManualDeletion(user: string, providerTag: string): void {
+    durableAccountWrite(this.db, () => this.db.run(
+      "UPDATE account_manual_deletions SET completed_at=? WHERE user_id=? AND provider_tag=? AND completed_at IS NULL",
+      [Date.now(), user, providerTag],
+    ));
+  }
+
+  manualDeletionComplete(user: string, providerTag: string): boolean {
+    return this.db.query(
+      "SELECT 1 FROM account_manual_deletions WHERE user_id=? AND provider_tag=? AND completed_at IS NOT NULL",
+    ).get(user, providerTag) !== null;
   }
 
   // ----- per-user storage usage (two classes) -----
@@ -1623,6 +1658,67 @@ export class CloudStore {
     })();
   }
 
+  accountExportPages(user: string): Array<{ doc: string; page: string }> {
+    return this.db.query<{ doc: string; page: string }, [string]>(`
+      SELECT doc, page FROM pages WHERE user_id=?1
+      UNION SELECT doc, page FROM page_snapshots WHERE user_id=?1
+      UNION SELECT doc, page FROM page_ops WHERE user_id=?1
+      UNION SELECT doc, page FROM overlays WHERE user_id=?1
+      UNION SELECT doc, page FROM assets WHERE user_id=?1
+      ORDER BY doc, page
+    `).all(user);
+  }
+
+  accountExportTemplates(user: string): Array<{ name: string; mime: string }> {
+    return this.db.query<{ name: string; mime: string }, [string]>(
+      "SELECT name, mime FROM templates WHERE user_id=? ORDER BY name",
+    ).all(user);
+  }
+
+  accountExportPageHasMissingImages(user: string, doc: string, page: string): boolean {
+    return this.db.transaction(() => {
+      const snapshot = this.latestSnapshotRow(user, doc, page);
+      const opSeq = this.latestOpSeq(user, doc, page);
+      const blob = snapshot || opSeq ? null : this.getPage(user, doc, page);
+      if (!snapshot && !opSeq && !blob) return false;
+      const { native } = this.readRecoveryNative(user, doc, page, snapshot, opSeq, blob);
+      const { required, unresolved } = this.recoveryImageReferences(native);
+      if (unresolved) return true;
+      if (!required.size) return false;
+      const files = new Set(this.listAssets(user, doc, page));
+      return [...required].some(file => !files.has(file));
+    })();
+  }
+
+  private recoveryImageReferences(native: Uint8Array) {
+    const required = new Set<string>();
+    let unresolved = false;
+    for (const [, item] of RmDocument.parse(native).tree().walk()) {
+      if (item.kind !== "image") continue;
+      if (item.filename) required.add(item.filename);
+      else unresolved = true;
+    }
+    return { required, unresolved };
+  }
+
+  private readRecoveryNative(
+    user: string, doc: string, page: string,
+    snapshot: ReturnType<CloudStore["latestSnapshotRow"]>,
+    opSeq: number,
+    blob: CloudPage | null,
+  ) {
+    if (this.truncationFloor(user, doc, page) > (snapshot?.op_seq ?? 0)) {
+      throw new Error("Recovery checkpoint is below the retained operation floor");
+    }
+    const checkpointPath = snapshot ? this.storedBlobPath(snapshot.path, "snapshots") : null;
+    if (snapshot && !checkpointPath) throw new Error("Invalid recovery checkpoint path");
+    const checkpoint = checkpointPath
+      ? decodeSnapshot(new Uint8Array(readFileSync(checkpointPath))) : null;
+    const ops = this.opsInRange(user, doc, page, snapshot?.op_seq ?? 0, opSeq);
+    const native = blob?.bytes ?? reconstructRm(checkpoint?.rm ?? null, ops, DEVICE_BRIDGE_AUTHOR);
+    return { checkpoint, ops, native };
+  }
+
   /** Read all members of the recovery revision in the same SQLite snapshot.
    * Missing checkpoint files fail closed instead of replaying against empty ink. */
   readRecoveryPage(
@@ -1649,25 +1745,12 @@ export class CloudStore {
         return { etag: ifNoneMatch, body: null };
       }
 
-      if (this.truncationFloor(user, doc, page) > (snapshot?.op_seq ?? 0)) {
-        throw new Error("Recovery checkpoint is below the retained operation floor");
-      }
-      const checkpointPath = snapshot ? this.storedBlobPath(snapshot.path, "snapshots") : null;
-      if (snapshot && !checkpointPath) throw new Error("Invalid recovery checkpoint path");
-      const checkpoint = checkpointPath
-        ? decodeSnapshot(new Uint8Array(readFileSync(checkpointPath))) : null;
-      const ops = this.opsInRange(user, doc, page, snapshot?.op_seq ?? 0, opSeq);
-      const native = blob?.bytes ?? reconstructRm(checkpoint?.rm ?? null, ops, DEVICE_BRIDGE_AUTHOR);
+      const { checkpoint, ops, native } = this.readRecoveryNative(user, doc, page, snapshot, opSeq, blob);
       const overlay: OverlayDocument = checkpoint?.overlay ?? (legacyOverlay ? JSON.parse(legacyOverlay) : { shapes: [] });
       foldOverlayOps(overlay, ops);
       const nativeSha256 = sha256hex(native);
-      const required = new Set<string>();
-      const missingAssets = new Set<string>();
-      for (const [, item] of RmDocument.parse(native).tree().walk()) {
-        if (item.kind !== "image") continue;
-        if (item.filename) required.add(item.filename);
-        else missingAssets.add("<unresolved image>");
-      }
+      const { required, unresolved } = this.recoveryImageReferences(native);
+      const missingAssets = new Set(unresolved ? ["<unresolved image>"] : []);
       const assets = [];
       for (const { file, etag } of rows) {
         if (!required.delete(file)) continue;

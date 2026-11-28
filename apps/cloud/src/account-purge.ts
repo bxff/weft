@@ -24,6 +24,11 @@ export function initAccountPurge(db: Database): void {
       user_id TEXT NOT NULL, folder TEXT NOT NULL CHECK(folder IN ('', 'snapshots')),
       name TEXT NOT NULL, PRIMARY KEY(user_id, folder, name)
     ) WITHOUT ROWID`);
+    db.run(`CREATE TABLE IF NOT EXISTS account_manual_deletions (
+      user_id TEXT PRIMARY KEY, provider_tag TEXT NOT NULL, due_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+      completed_at INTEGER
+    ) WITHOUT ROWID`);
+    db.run("CREATE INDEX IF NOT EXISTS account_manual_deletions_due ON account_manual_deletions(provider_tag, due_at) WHERE completed_at IS NULL");
     // Authoritative admission even for body reads that started before the
     // fence was written. Device tokens/configuration alone cannot recreate it.
     for (const table of [...ACCOUNT_PURGE_ORDER, ...accountReceiptTables(db)]) {
@@ -47,27 +52,29 @@ export function withAccountBlobWrite<T>(db: Database, userId: string, write: () 
   return db.inTransaction ? guarded() : db.transaction(guarded).immediate();
 }
 
-export function stageAccountPurge(db: Database, userId: string): void {
-  // Do not acknowledge the fence/queue at NORMAL: an older DB cannot point
-  // at permanently unlinked files after power loss.
-  withFullDurability(db, () =>
-    db.transaction(() => {
-      if (isAccountFenced(db, userId)) return;
+export function stageAccountPurge(db: Database, userId: string, providerTag?: string): void {
+  durableAccountWrite(db, () => {
+    if (!isAccountFenced(db, userId)) {
       const plan = planRelayAccountPurge(db, userId);
       const record = db.query("INSERT OR IGNORE INTO account_purge_files VALUES (?,?,?)");
       for (const { folder, name } of plan.blobs) record.run(userId, folder, name);
       for (const { table } of plan.rows) {
         // A compatible migration may have run since this connection opened.
-        // Install all expected triggers under the same lock before fencing.
         installAccountWriteFence(db, table);
         db.run(`DELETE FROM ${table} WHERE user_id=?`, [userId]);
       }
-      // DELETE triggers above can derive account rows until their turn in
-      // the purge order. Publish the fence last under the same writer lock.
+      // Derived trigger rows must be removed before the fence starts blocking writes.
       db.run("INSERT INTO account_purge_fences VALUES (?,?)", [userId, Date.now()]);
-    }).immediate(),
-    "at-least-FULL",
-  );
+    }
+    // This marker is written ONLY by the verified, explicit manual route.
+    // Its commit and the fence must survive or roll back together.
+    if (providerTag) db.run("INSERT OR IGNORE INTO account_manual_deletions (user_id,provider_tag,due_at) VALUES (?,?,?)",
+      [userId, providerTag, Date.now()]);
+  });
+}
+
+export function durableAccountWrite(db: Database, change: () => void): void {
+  withFullDurability(db, () => db.transaction(change).immediate(), "at-least-FULL");
 }
 
 function isMissing(error: unknown): boolean {

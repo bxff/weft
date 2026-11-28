@@ -42,7 +42,7 @@ export function accountReceiptTables(db: Database): ReceiptTable[] {
 }
 
 const REQUIRED_TABLES = [...ACCOUNT_PURGE_ORDER, "config"];
-const TABLES = new Set<string>([...REQUIRED_TABLES, ...RECEIPT_NAMES, "account_purge_fences", "account_purge_files"]);
+const TABLES = new Set<string>([...REQUIRED_TABLES, ...RECEIPT_NAMES, "account_purge_fences", "account_purge_files", "account_manual_deletions"]);
 
 interface RelayAccountPurgePlan {
   rows: ReadonlyArray<{ table: typeof ACCOUNT_PURGE_ORDER[number] | ReceiptTable; count: number }>;
