@@ -161,11 +161,19 @@ test("hosted delete verifies signed recent auth, fences HTTP and WS, and can res
     const lateTicket = await imageTicket();
     const db = (cloud.store as unknown as { db: Database }).db;
     db.run("DELETE FROM assets WHERE user_id=? AND doc=? AND page=? AND file=?", [imageUser, imageDoc, imagePage, imageFile]);
-    const lateDownload = await downloadWith(lateTicket);
-    expect(lateDownload.status).toBe(200); // headers were sent before the stream reached the page
-    const truncated = new Uint8Array(await lateDownload.arrayBuffer());
-    expect(() => tarEntries(truncated)).toThrow("truncated archive");
-    expect(Buffer.from(truncated).includes("complete.json\0")).toBe(false);
+    const late = await downloadWith(lateTicket).then(async response => ({
+      status: response.status, bytes: new Uint8Array(await response.arrayBuffer()),
+    })).catch((error: unknown) => {
+      // Linux Bun can reset before headers; macOS Bun can expose a partial
+      // 200 body. Do not accept arbitrary network, application or test errors.
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "ECONNRESET") throw error;
+      return null;
+    });
+    if (late) {
+      expect(late.status).toBe(200);
+      expect(() => tarEntries(late.bytes)).toThrow("truncated archive");
+      expect(Buffer.from(late.bytes).includes("complete.json\0")).toBe(false);
+    }
     expect((await downloadWith(lateTicket)).status).toBe(404);
 
     const revokedExport = await exportTicket();
