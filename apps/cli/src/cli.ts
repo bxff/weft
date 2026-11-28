@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
+import { stageTabletDaemon } from './tablet-release'
 
 const command = process.argv[2]
 const flags = (() => {
@@ -30,6 +31,7 @@ const flags = (() => {
                 password: { type: 'string' },
                 cloud: { type: 'string' },
                 token: { type: 'string' },
+                release: { type: 'string' },
                 notebook: { type: 'string' },
                 'recovery-dir': { type: 'string' },
                 'native-dir': { type: 'string' },
@@ -262,15 +264,41 @@ WantedBy=multi-user.target
 `
 
 /** Activate either setup mode in one remote operation; a failure restores the old install. */
-function activateSetup(configured: boolean, autoReinstall: boolean, stageDir: string): void {
+function activateSetup(
+    configured: boolean, autoReinstall: boolean, stageDir: string,
+    release?: { tag: string; commit: string; sha256: string },
+): void {
+    const receipt = `${INSTALL_DIR}/verified-release`
+    const restoreXochitl = autoReinstall || release !== undefined
     const lock = `${INSTALL_DIR}/setup-activation.lock`
     const activate = `set -e
 mkdir ${lock} || { echo 'Another setup activation is in progress.' >&2; exit 1; }
 trap 'rmdir ${lock} || :' 0
+${release ? `printf '%s  %s\n' '${release.sha256}' '${stageDir}/rmsyncd.new' | sha256sum -c - >/dev/null
+if [ -e ${receipt} ] || [ -L ${receipt} ]; then
+    if ! awk -v incoming='${release.tag}' -v commit='${release.commit}' '
+        NR == 1 && NF == 2 && $1 ~ /^tablet-v[0-9]+[.][0-9]+[.][0-9]+$/ &&
+            $2 ~ /^[0-9a-f]+$/ && length($2) == 40 {
+            split(substr($1, 9), old, ".")
+            split(substr(incoming, 9), next_version, ".")
+            valid = 1
+            for (i = 1; i <= 3; i++) {
+                if (length(old[i]) > 9 || old[i] ~ /^0[0-9]/) valid = 0
+                if (!cmp && (old[i]+0) != (next_version[i]+0))
+                    cmp = (old[i]+0) > (next_version[i]+0) ? 1 : -1
+            }
+            permitted = cmp < 0 || (cmp == 0 && ("sha:" $2) == ("sha:" commit))
+        }
+        END { exit !(NR == 1 && valid && permitted) }
+    ' ${receipt}; then
+        echo 'Verified release is older, retagged, or the installed release receipt is invalid.' >&2
+        exit 1
+    fi
+fi` : ''}
 stock_mask=$(systemctl is-enabled rm-sync.service 2>/dev/null) || :
 stock_active=$(systemctl is-active rm-sync.service 2>/dev/null) || :
 weft_active=$(systemctl is-active weft.service 2>/dev/null) || :
-${autoReinstall ? `xochitl_active=$(systemctl is-active xochitl.service 2>/dev/null) || :
+${restoreXochitl ? `xochitl_active=$(systemctl is-active xochitl.service 2>/dev/null) || :
 case "$xochitl_active" in
     active|inactive|failed) ;;
     *) echo 'Could not determine a stable xochitl state.' >&2; exit 1 ;;
@@ -289,7 +317,8 @@ esac
 
 mount -o remount,rw / 2>/dev/null || true
 backup=$(mktemp -d "${INSTALL_DIR}/setup-rollback.XXXXXX")
-paths="${INSTALL_DIR}/rmsyncd${autoReinstall ? `
+paths="${INSTALL_DIR}/rmsyncd${release ? `
+${receipt}` : ''}${autoReinstall ? `
 ${INSTALL_DIR}/boot-guard.sh
 ${INSTALL_DIR}/firmware-mismatch
 ${INSTALL_DIR}/install-service.sh
@@ -334,7 +363,7 @@ rollback() {
     if [ "$weft_active" = active ] && [ "$weft_attempted" -eq 1 ]; then
         systemctl start weft.service || failed=1
     fi
-    ${autoReinstall ? `if [ "$xochitl_attempted" -eq 1 ]; then
+    ${restoreXochitl ? `if [ "$xochitl_attempted" -eq 1 ]; then
         if [ "$xochitl_active" = active ]; then systemctl start xochitl.service || failed=1
         else systemctl stop xochitl.service || failed=1
         fi
@@ -394,6 +423,9 @@ systemctl is-active --quiet weft.service
 wget -q -O- http://127.0.0.1:9000/api/health
 xochitl_attempted=1
 systemctl restart xochitl
+${release ? `printf '%s %s\n' '${release.tag}' '${release.commit}' > ${stageDir}/receipt.new
+mv ${stageDir}/receipt.new ${receipt}
+` : ''}
 `
     setupStep('activate setup', run([...sshBase(), 'sh -s'], activate))
 }
@@ -406,6 +438,9 @@ function setupStep(label: string, result: { ok: boolean; out: string }): void {
 // ----- commands -----
 
 async function setup(): Promise<void> {
+    if (flags.release !== undefined && AUTO_REINSTALL) {
+        throw Error('Verified GitHub releases require --no-auto-reinstall for rollback-safe installation.')
+    }
     console.log(`Installing weft on ${HOST}${DRY ? ' (dry run)' : ''}\n`)
 
     // Probe BEFORE fetching a binary or touching the device: the arch decides
@@ -434,7 +469,10 @@ async function setup(): Promise<void> {
         process.exit(1)
     }
     step('check firmware compatibility', ssh(firmwarePreflight))
-    const daemonBin = DRY ? DAEMON_BIN : await daemonBinary(isArm32 ? 'armv7' : 'aarch64')
+    const arch = isArm32 ? 'armv7' : 'aarch64'
+    const release = !DRY && flags.release !== undefined ? stageTabletDaemon(arch, flags.release) : undefined
+    const daemonBin = release?.path ?? (DRY ? DAEMON_BIN : await daemonBinary(arch))
+    if (release) console.log(`  verified GitHub release ${release.tag}`)
     const stageDir = `${INSTALL_DIR}/setup-stage-${crypto.randomUUID()}`
     try {
         setupStep('create private staging dir', ssh(`mkdir -p ${INSTALL_DIR} && mkdir -m 700 ${stageDir}`))
@@ -453,8 +491,9 @@ async function setup(): Promise<void> {
                 [...sshBase(), `umask 077; cat > ${stageDir}/cloud.json.new`], JSON.stringify({ url: CLOUD, token: TOKEN }),
             ))
         }
-        activateSetup(Boolean(CLOUD && TOKEN), AUTO_REINSTALL, stageDir)
+        activateSetup(Boolean(CLOUD && TOKEN), AUTO_REINSTALL, stageDir, release)
     } finally {
+        release?.remove()
         const cleanup = ssh(`rm -rf ${stageDir}`)
         if (!cleanup.ok) console.error(`Could not clean up temporary setup files at ${stageDir}.`)
     }
@@ -590,6 +629,6 @@ switch (command) {
         catch (e) { console.error(e instanceof Error ? e.message : 'Restore failed'); process.exitCode = 1 }
         break
     default:
-        console.log('usage: weft <setup [--store-timeout ms] [--no-auto-reinstall] [--experimental-rm2] [--cloud URL --token chd_...]|doctor|uninstall|link|restore-notebook> --host root@10.11.99.1 [--password X] [--dry-run]')
+        console.log('usage: weft <setup [--release tablet-vMAJOR.MINOR.PATCH --no-auto-reinstall] [--store-timeout ms] [--no-auto-reinstall] [--experimental-rm2] [--cloud URL --token chd_...]|doctor|uninstall|link|restore-notebook> --host root@10.11.99.1 [--password X] [--dry-run]')
         process.exit(command && command !== '--help' && command !== '-h' ? 1 : 0)
 }

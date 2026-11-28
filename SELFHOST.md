@@ -245,3 +245,19 @@ Disabling capture, changing the link, or deleting data from the relay does
 not delete local backups. To remove them, stop the daemon and delete the
 recovery directory deliberately; ordinary notebook and sync state are
 separate. Recovery is supplementary, not a replacement for a separate backup.
+
+### Explicit GitHub release install
+
+Once a stable tablet release is published, opt in from a computer with a
+trusted, signed-in GitHub CLI:
+
+```sh
+bunx @bxff/weft setup --release tablet-vMAJOR.MINOR.PATCH --no-auto-reinstall
+```
+
+This checks the exact binary's GitHub provenance, architecture, release tag
+and source commit before uploading it. Verified installs use the manual
+rollback path and reject older verified releases or a moved tag previously
+installed at the same version. The first verified install establishes the
+version floor; legacy deployments have no verified version receipt. Plain
+`setup` still uses the existing source/relay install path.
