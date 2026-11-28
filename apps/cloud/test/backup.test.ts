@@ -3,8 +3,9 @@
  * plus a copy of the on-disk blob tree; pruning keeps the most recent N.
  */
 
-import { expect, setSystemTime, test } from 'bun:test'
+import { expect, setSystemTime, spyOn, test } from 'bun:test'
 import { cpSync, mkdtempSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { Database } from 'bun:sqlite'
@@ -252,3 +253,92 @@ test('two stores publishing in the same millisecond keep distinct completed arch
         rmSync(dir, { recursive: true, force: true })
     }
 })
+
+test('a same-size change to a hash-pinned recovered snapshot cannot replace the valid backup', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'weft-backup-pinned-'))
+    try {
+        const db = join(dir, 'live.db')
+        const store = new CloudStore(db)
+        const dest = join(dir, 'archives')
+        const native = RmDocument.empty(author).serialize()
+        expect(store.restoreRecoveryNotebook('u', {
+            notebook: { id: 'd1', name: 'Synthetic', pages: [{ id: 'p1', template: 'Blank' }] },
+            pages: [{ id: 'p1', native, overlay: { shapes: [] }, assets: [] }],
+        }, 'synthetic', () => {})).toBe('created')
+        const dirOfSnapshots = join(db + '-files', 'snapshots')
+        const [name] = readdirSync(dirOfSnapshots)
+        const path = join(dirOfSnapshots, name!)
+        const original = readFileSync(path)
+        const good = store.backup(dest)
+        const capture = new Database(join(good, 'weft.db'), { readonly: true })
+        try {
+            const row = capture.query('SELECT sha256 FROM page_snapshots').get()
+            expect(row).toEqual({ sha256: new Bun.CryptoHasher('sha256').update(original).digest('hex') })
+        } finally {
+            capture.close()
+        }
+        const different = Buffer.from(original)
+        different[different.length - 1] ^= 1
+        writeFileSync(path, different)
+        expect(() => store.backup(dest)).toThrow('Backup blob differs from its saved revision')
+        expect(readdirSync(dest)).toEqual([basename(good)])
+        expect(readFileSync(join(good, 'files', 'snapshots', name!))).toEqual(original)
+    } finally {
+        rmSync(dir, { recursive: true, force: true })
+    }
+})
+
+test.each(['staged blob', 'staged directory', 'published directory'] as const)(
+    'a failed fsync of the %s retains the last valid archive and does not prune it',
+    (phase) => {
+        const dir = mkdtempSync(join(tmpdir(), 'weft-backup-fsync-'))
+        const dest = join(dir, 'archives')
+        try {
+            const store = new CloudStore(join(dir, 'live.db'))
+            store.putFile('u', 'd1', body)
+            const first = store.backup(dest)
+            const firstName = basename(first)
+            const next = new Uint8Array(body.length).fill(8)
+            store.putFile('u', 'd1', next)
+            // Model the real periodic backup caller: retention runs only on success.
+            const rotate = () => {
+                const result = store.backup(dest)
+                store.pruneBackups(dest, 1)
+                return result
+            }
+            const sync = fs.fsyncSync
+            const rename = fs.renameSync
+            let published = false
+            let injected = false
+            const renamed = spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+                rename(from, to)
+                if (String(from).includes('.incomplete-')) published = true
+            })
+            const syncing = spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+                const file = fs.fstatSync(fd).isFile()
+                if ((!published && file && phase === 'staged blob') ||
+                    (!published && !file && phase === 'staged directory') ||
+                    (published && !file && phase === 'published directory')) {
+                    injected = true
+                    throw new Error('Injected backup fsync failure')
+                }
+                sync(fd)
+            })
+            try {
+                expect(rotate).toThrow('Injected backup fsync failure')
+                expect(injected).toBe(true)
+            } finally {
+                renamed.mockRestore()
+                syncing.mockRestore()
+            }
+            expect(readdirSync(dest)).toEqual([firstName])
+            expect(restoreBackup(first, join(dir, 'first-restore')).getFile('u', 'd1')).toEqual(body)
+
+            const retried = rotate()
+            expect(readdirSync(dest)).toEqual([basename(retried)])
+            expect(restoreBackup(retried, join(dir, 'retry-restore')).getFile('u', 'd1')).toEqual(next)
+        } finally {
+            rmSync(dir, { recursive: true, force: true })
+        }
+    },
+)
