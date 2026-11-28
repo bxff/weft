@@ -234,8 +234,11 @@ rm -f /etc/systemd/system/xochitl.service.d/weft.conf \
       /etc/systemd/system/multi-user.target.wants/weft.service 2>/dev/null || true
 rm -f /home/root/weft/install-service.sh 2>/dev/null || true
 
-# keep stock cloud sync out of the way (we own the bus name)
-systemctl mask rm-sync 2>/dev/null || true
+# Keep stock sync out of the way without escalating an existing runtime mask.
+case "$(systemctl is-enabled rm-sync 2>/dev/null)" in
+  masked|masked-runtime) ;;
+  *) systemctl mask rm-sync 2>/dev/null || true ;;
+esac
 systemctl stop rm-sync 2>/dev/null || true
 
 systemctl daemon-reload

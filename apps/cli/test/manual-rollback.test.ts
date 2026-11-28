@@ -3,7 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlin
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-test.each(['success', 'mask', 'stop', 'restart', 'health', 'upgrade', 'auto-success', 'auto-health', 'auto-upgrade-health', 'auto-xochitl', 'auto-no-config-health', 'auto-config-stage', 'auto-activation-busy'])('manual setup restores stock state when activation fails (%s)', failure => {
+test.each(['success', 'mask', 'stop', 'restart', 'health', 'upgrade', 'auto-success', 'auto-health', 'auto-upgrade-health', 'auto-xochitl', 'auto-no-config-health', 'auto-config-stage', 'auto-activation-busy', 'auto-runtime-mask-health'])('manual setup restores stock state when activation fails (%s)', failure => {
     const dir = mkdtempSync(join(tmpdir(), 'weft-manual-rollback-'))
     const path = (name: string) => join(dir, name)
     try {
@@ -29,7 +29,8 @@ test.each(['success', 'mask', 'stop', 'restart', 'health', 'upgrade', 'auto-succ
             writeFileSync(path('home/root/weft/install-service.sh'), 'original legacy script')
             writeFileSync(path('home/root/weft/firmware-mismatch'), 'original mismatch marker')
         }
-        writeFileSync(path(upgrade ? 'stock-mask' : 'stock-active'), '')
+        const runtimeMask = failure === 'auto-runtime-mask-health'
+        writeFileSync(path(runtimeMask ? 'stock-mask-runtime' : upgrade ? 'stock-mask' : 'stock-active'), '')
         if (failure === 'auto-activation-busy') mkdirSync(path('home/root/weft/setup-activation.lock'))
         const mock = (name: string, script: string) =>
             writeFileSync(path(name), `#!/bin/sh\n${script}\n`, { mode: 0o755 })
@@ -60,10 +61,13 @@ esac
         mock('systemctl', `
 printf '%s\\n' "$*" >> "$TABLET/systemctl.log"
 case "$*" in
-    "is-enabled rm-sync.service")
+    "is-enabled rm-sync.service"|"is-enabled rm-sync")
+        if [ -f "$TABLET/stock-mask" ]; then echo masked; exit 1; fi
+        if [ -f "$TABLET/stock-mask-runtime" ]; then echo masked-runtime; exit 1; fi
         if { [ "$FAILURE" = upgrade ] || [ "$FAILURE" = auto-upgrade-health ]; }; then echo masked; exit 1; fi
         echo enabled ;;
     "is-active rm-sync.service")
+        if [ -f "$TABLET/stock-mask-runtime" ]; then echo inactive; exit 3; fi
         if { [ "$FAILURE" = upgrade ] || [ "$FAILURE" = auto-upgrade-health ]; }; then echo inactive; exit 3; fi
         echo active ;;
     "is-active xochitl.service") echo active ;;
@@ -78,7 +82,7 @@ case "$*" in
         test "$FAILURE" != stop ;;
     "start rm-sync.service") touch "$TABLET/stock-active" ;;
     "restart weft.service")
-        test -f "$TABLET/stock-mask" && test ! -f "$TABLET/stock-active" || exit 1
+        { test -f "$TABLET/stock-mask" || test -f "$TABLET/stock-mask-runtime"; } && test ! -f "$TABLET/stock-active" || exit 1
         test "$FAILURE" != restart && test "$FAILURE" != upgrade || exit 1
         case "$FAILURE" in
             auto*) sed -e "s|/usr/|$TABLET/usr/|g" -e "s|/etc/|$TABLET/etc/|g" -e "s|/home/root/|$TABLET/home/root/|g" "$TABLET/home/root/weft/boot-guard.sh" | /bin/sh ;;
@@ -109,7 +113,8 @@ esac
         } else {
             expect(run.exitCode).toBe(1)
             expect(existsSync(path('stock-mask'))).toBe(upgrade)
-            expect(existsSync(path('stock-active'))).toBe(!upgrade)
+            expect(existsSync(path('stock-active'))).toBe(!upgrade && !runtimeMask)
+            expect(existsSync(path('stock-mask-runtime'))).toBe(runtimeMask)
             if (upgrade) {
                 expect(calls).toContain('start weft.service\n')
                 expect(calls).not.toContain('unmask rm-sync.service')
