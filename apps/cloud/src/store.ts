@@ -130,10 +130,10 @@ export class BelowFloorError extends Error {
   }
 }
 
-/** A required checkpoint is represented in history but cannot be read safely. */
-export class HistoryCheckpointError extends Error {
+/** A known checkpoint cannot be read safely. */
+export class CheckpointUnavailableError extends Error {
   constructor(cause?: unknown) {
-    super("required history checkpoint is unavailable", { cause });
+    super("required checkpoint is unavailable", { cause });
   }
 }
 
@@ -1117,7 +1117,7 @@ export class CloudStore {
   /** Materialize the current .rm for the daemon's GET /rm from the latest
    *  snapshot + the ops after it. Revision is an op-head marker (ops commute,
    *  so the daemon's CAS base is advisory, not enforced — see applyDevicePut). */
-  reconstructDevicePage(user: string, doc: string, page: string): CloudPage {
+  reconstructDevicePage(user: string, doc: string, page: string, requireAvailable = false): CloudPage {
     let missingCheckpoint = 0;
     const replaced = (seq: number): boolean => {
       const firstRetained = this.db.query<{ seq: number }, [string, string, string, number]>(
@@ -1131,7 +1131,9 @@ export class CloudStore {
       if (retry && !replaced(retry.seq)) throw retry.error;
       const head = this.latestOpSeq(user, doc, page);
       let checkpoint: Uint8Array | null = null;
-      if (snap) {
+      if (snap && requireAvailable) {
+        checkpoint = this.readRequiredCheckpoint(snap);
+      } else if (snap) {
         const path = this.storedBlobPath(snap.path, "snapshots");
         if (!path) throw new Error("Invalid tablet checkpoint path");
         try {
@@ -1461,15 +1463,17 @@ export class CloudStore {
     container: Uint8Array,
   ): { seq: number; merged: boolean } {
     const hasBase =
-      this.latestSnapshot(user, doc, page) !== null ||
+      this.latestSnapshotRow(user, doc, page) !== null ||
       this.latestOpSeq(user, doc, page) > 0;
     if (!hasBase)
       return { seq: this.putSnapshot(user, doc, page, container), merged: false };
     let bytes: Uint8Array;
     let merged: boolean;
     try {
+      // Validate the committed storage basis before attempting the optional
+      // format merge: an opaque incoming container must not hide storage loss.
+      const prev = this.reconstructDevicePage(user, doc, page, true).bytes;
       const snap = decodeSnapshot(container);
-      const prev = this.reconstructDevicePage(user, doc, page).bytes;
       // web publishers keep explicit tombstones for every deletion, so an
       // absent item can only mean "never seen" — always re-add ("never").
       const mergedRm = mergeForSnapshot(snap.rm, prev, "never");
@@ -1485,7 +1489,7 @@ export class CloudStore {
       // publisher merely lacks (no tombstone) survives; a real deletion (a
       // newer tombstone) still wins — the same rule the client uses on adoption.
       const mergedOverlay = mergeOverlayDocuments(
-        this.overlayAtHead(user, doc, page),
+        this.overlayAtHead(user, doc, page, true),
         snap.overlay,
       );
       bytes = encodeSnapshot(mergedRm, mergedOverlay);
@@ -1501,7 +1505,7 @@ export class CloudStore {
       // add visible content, so avoid decoding them again to prove that.
       merged = Buffer.compare(snap.rm, mergedRm) !== 0 && contentBeyond(snap.rm, mergedRm);
     } catch (error) {
-      if (error instanceof RootTextAuthorConflict) throw error;
+      if (error instanceof RootTextAuthorConflict || error instanceof CheckpointUnavailableError) throw error;
       // the snapshot channel is contractually OPAQUE: anything we cannot
       // parse (tests, future formats) stores verbatim, exactly as before —
       // the merge is best-effort protection for real .rm containers
@@ -2612,8 +2616,9 @@ export class CloudStore {
     user: string,
     doc: string,
     page: string,
+    requireAvailable = false,
   ): { seq: number; opSeq: number; revert: boolean; bytes: Uint8Array } | null {
-    const snap = this.latestSnapshotReference(user, doc, page);
+    const snap = this.latestSnapshotReference(user, doc, page, requireAvailable);
     if (!snap) return null;
     const { readBytes, complete: _complete, ...metadata } = snap;
     return { ...metadata, bytes: readBytes() };
@@ -2629,11 +2634,15 @@ export class CloudStore {
     user: string,
     doc: string,
     page: string,
+    requireAvailable = false,
   ): { seq: number; opSeq: number; revert: boolean; complete: boolean; readBytes: () => Uint8Array } | null {
     const row = this.latestSnapshotRow(user, doc, page);
     if (!row) return null;
     const path = this.existingSnapshotPath(row.path);
-    if (!path) return null;
+    if (!path) {
+      if (requireAvailable) throw new CheckpointUnavailableError();
+      return null;
+    }
     return {
       seq: row.seq,
       opSeq: row.op_seq,
@@ -2642,17 +2651,17 @@ export class CloudStore {
       // newer pre-revert shapes and the audit would then destroy them)
       revert: row.revert === 1,
       complete: row.complete === 1,
-      readBytes: () => new Uint8Array(readFileSync(path)),
+      readBytes: () => requireAvailable ? this.readRequiredCheckpoint(row) : new Uint8Array(readFileSync(path)),
     };
   }
 
   private latestSnapshotRow(user: string, doc: string, page: string) {
     return this.db
       .query<
-        { seq: number; op_seq: number; revert: number; path: string; complete: number; sha256: string | null },
+        { seq: number; op_seq: number; revert: number; path: string; size: number; complete: number; sha256: string | null },
         [string, string, string]
       >(
-        `SELECT s.seq, s.op_seq, s.revert, s.path, s.sha256,
+        `SELECT s.seq, s.op_seq, s.revert, s.path, s.size, s.sha256,
            (s.op_seq >= COALESCE((SELECT floor_seq FROM page_floors
              WHERE user_id=?1 AND doc=?2 AND page=?3), 0)
             AND NOT EXISTS (SELECT 1 FROM page_ops
@@ -2778,10 +2787,10 @@ export class CloudStore {
       )
       .get(user, doc, page, target);
     if (!row) return null;
-    return { opSeq: row.op_seq, bytes: this.readHistoryCheckpoint(row) };
+    return { opSeq: row.op_seq, bytes: this.readRequiredCheckpoint(row) };
   }
 
-  private readHistoryCheckpoint(row: { path: string; size: number; sha256: string | null }): Uint8Array {
+  private readRequiredCheckpoint(row: { path: string; size: number; sha256: string | null }): Uint8Array {
     try {
       const path = this.existingSnapshotPath(row.path);
       if (!path) throw new Error("missing checkpoint file");
@@ -2791,7 +2800,7 @@ export class CloudStore {
       }
       return bytes;
     } catch (cause) {
-      throw new HistoryCheckpointError(cause);
+      throw new CheckpointUnavailableError(cause);
     }
   }
 
@@ -2801,7 +2810,7 @@ export class CloudStore {
       if (!Array.isArray(checkpoint.overlay?.shapes)) throw new Error("invalid checkpoint overlay");
       return checkpoint;
     } catch (cause) {
-      throw new HistoryCheckpointError(cause);
+      throw new CheckpointUnavailableError(cause);
     }
   }
 
@@ -2846,8 +2855,8 @@ export class CloudStore {
    *  needs the snapshot's overlay + the object ops after it, and stateAt's
    *  reconstructRm over the same range was pure throwaway work on every
    *  overlay read of a heavy page. */
-  overlayAtHead(user: string, doc: string, page: string): OverlayDocument {
-    const snap = this.latestSnapshot(user, doc, page);
+  overlayAtHead(user: string, doc: string, page: string, requireAvailable = false): OverlayDocument {
+    const snap = this.latestSnapshot(user, doc, page, requireAvailable);
     const base = snap ? decodeSnapshot(snap.bytes) : null;
     const overlay: OverlayDocument = base?.overlay
       ? (JSON.parse(JSON.stringify(base.overlay)) as OverlayDocument)
@@ -2868,7 +2877,7 @@ export class CloudStore {
     const floor = this.truncationFloor(user, doc, page);
     if (floor > 0 && target < floor) throw new BelowFloorError(floor, target);
     const snap = this.snapshotForSeq(user, doc, page, target);
-    if (floor > 0 && (!snap || snap.opSeq < floor)) throw new HistoryCheckpointError();
+    if (floor > 0 && (!snap || snap.opSeq < floor)) throw new CheckpointUnavailableError();
     const base = snap ? this.decodeHistoryCheckpoint(snap.bytes) : null;
     const ops = this.opsInRange(user, doc, page, snap?.opSeq ?? 0, target);
     const rm = reconstructRm(base?.rm ?? null, ops, DEVICE_BRIDGE_AUTHOR);
@@ -2958,12 +2967,12 @@ export class CloudStore {
       .get(user, doc, page, snapSeq);
     if (!row) return null;
     if (verifyHistory) {
-      const bytes = this.readHistoryCheckpoint(row);
+      const bytes = this.readRequiredCheckpoint(row);
       try {
         const { rm } = this.decodeHistoryCheckpoint(bytes);
         RmDocument.parse(rm);
       } catch (cause) {
-        throw new HistoryCheckpointError(cause);
+        throw new CheckpointUnavailableError(cause);
       }
       return bytes;
     }
