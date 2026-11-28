@@ -267,9 +267,13 @@ test('a failed checkpoint flush rolls back guarded operations and their receipt'
     try {
         const blank = RmDocument.empty(crypto.randomUUID()).serialize()
         const seq = cloud.store.putSnapshot(...KEY, encodeSnapshot(blank, { shapes: [] }))
-        const raw = cloud.store as unknown as { syncRecoveryPath(path: string): void }
+        using inspect = cloud.inspect()
+        const checkpoint = inspect.query<{ path: string }, [number]>('SELECT path FROM page_snapshots WHERE seq=?').get(seq)!
+        const raw = cloud.store as unknown as { syncPath(path: string): void }
+        const syncPath = raw.syncPath.bind(raw)
         let faulted = false
-        raw.syncRecoveryPath = () => {
+        raw.syncPath = (path) => {
+            if (path !== checkpoint.path) return syncPath(path)
             faulted = true
             throw new Error('injected guarded ops durability failure')
         }
@@ -278,7 +282,6 @@ test('a failed checkpoint flush rolls back guarded operations and their receipt'
         catch { failed = true }
         expect(faulted).toBe(true)
         expect(failed).toBe(true)
-        using inspect = cloud.inspect()
         expect(inspect.query('SELECT * FROM page_op_batch_receipts').all()).toEqual([])
         expect(cloud.store.latestOpSeq(...KEY)).toBe(0)
         expect(cloud.store.latestSnapshotSeq(...KEY)).toBe(seq)
