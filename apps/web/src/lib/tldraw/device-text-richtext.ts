@@ -45,6 +45,19 @@ export type NodeKind =
     | 'ordered'
     | 'ordered2'
 
+/** Indent is an unsigned 32-bit property on the native wire. */
+export function parseDeviceIndent(value: unknown): number | undefined {
+    if (typeof value !== 'number' && (typeof value !== 'string' || !/^\d+$/.test(value))) {
+        return undefined
+    }
+    const n = Number(value)
+    return Number.isInteger(n) && n >= 0 && n <= 0xffffffff ? n : undefined
+}
+
+export function isNativeIndentedPlain(style: number | null, indent?: number): boolean {
+    return (style === 0 || style === 1) && indent !== undefined && indent >= 1
+}
+
 export function nodeKindForParagraph(p: {
     style: number
     sizeCode?: number
@@ -60,9 +73,8 @@ export function nodeKindForParagraph(p: {
     if (p.style === 10) return 'ordered'
     if (p.style === 11) return 'ordered2'
     // plain + indent property renders as a bullet at that depth
-    if (p.indentLevel !== undefined && (p.style === 0 || p.style === 1)) {
-        return p.indentLevel >= 1 ? 'bullet2' : 'bullet'
-    }
+    if (isNativeIndentedPlain(p.style, p.indentLevel)) return 'bullet2'
+    if (p.indentLevel === 0 && (p.style === 0 || p.style === 1)) return 'bullet'
     return 'paragraph'
 }
 
@@ -227,15 +239,13 @@ export function richTextToLines(rt: TLRichText): RichLine[] {
     const lines: RichLine[] = []
     const pushBlock = (node: Node, kind: NodeKind) => {
         const segments = segmentsOf(node)
-        const ind = node.attrs?.deviceIndent
+        const ind = parseDeviceIndent(node.attrs?.deviceIndent)
         lines.push({
             text: segments.map((s) => s.text).join(''),
             kind,
             segments,
             deviceStyle: deviceStyleOf(node),
-            ...(typeof ind === 'number' || (typeof ind === 'string' && ind !== '')
-                ? { indentLevel: Number(ind) }
-                : {}),
+            ...(ind !== undefined ? { indentLevel: ind } : {}),
         })
     }
     const walkList = (listNode: Node, ordered: boolean, depth: number) => {
@@ -253,7 +263,8 @@ export function richTextToLines(rt: TLRichText): RichLine[] {
                 const kind: NodeKind =
                     depth >= 2
                         ? nestedKind
-                        : attr === 5 || attr === 11
+                        : attr === 5 || attr === 11 ||
+                            (!ordered && isNativeIndentedPlain(attr, parseDeviceIndent(child.attrs?.deviceIndent)))
                           ? nestedKind
                           : flatKind
                 pushBlock(child, kind)
