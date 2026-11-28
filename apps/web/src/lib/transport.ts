@@ -2,7 +2,7 @@
  *  self-hosted) with a bearer token; the tablet is a sync agent, not an app server. */
 import { HttpTransport, EngineFailure, type DocumentInfo, type Transport } from '@weft/sync-engine'
 import { connection, isSelfHosted, watchRelayChange } from './settings'
-import { getAuthToken } from './auth'
+import { getAuthToken, guardedBearer, type GuardedPageScope } from './auth'
 import { cacheDocumentList, clearCachedDocumentList, libraryCacheScope, readCachedDocumentList } from './library-cache'
 
 let instance: { relay: string; transport: HttpTransport } | null = null
@@ -28,6 +28,25 @@ export function transport(): HttpTransport {
         instance = { relay, transport }
     }
     return instance.transport
+}
+
+export function guardedPageTransport(scope: GuardedPageScope) {
+    let active = true
+    const transport = new HttpTransport({
+        baseUrl: scope.relay,
+        getAuthToken: async () => {
+            const bearer = active ? await guardedBearer(scope) : null
+            if (!active || !bearer) throw new EngineFailure({ _tag: 'Unauthorized' })
+            return bearer
+        },
+    })
+    return {
+        transport,
+        revoke: () => {
+            active = false
+            transport.close()
+        },
+    }
 }
 
 /** Close the transport (and its WebSocket) and drop the singleton. Required on

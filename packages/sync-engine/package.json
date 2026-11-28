@@ -7,7 +7,8 @@
   },
   "dependencies": {
     "@weft/rm-format": "workspace:*",
-    "@weft/rm-ink": "workspace:*"
+    "@weft/rm-ink": "workspace:*",
+    "fast-sha256": "1.3.0"
   },
   "description": "Offline editor sessions, edit reconciliation, and transport to the Weft relay."
 }

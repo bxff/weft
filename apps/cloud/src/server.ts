@@ -9,6 +9,8 @@ import {
   BelowFloorError,
   CheckpointUnavailableError,
   CloudStore,
+  SnapshotUnavailable,
+  type SnapshotPublication,
   type StorageClass,
   type StoredFailureReport,
 } from "./store";
@@ -18,7 +20,7 @@ import {
   jwtSigningSecret,
   signSelfHostToken,
 } from "./auth";
-import { encodeSnapshot } from "@weft/sync-engine";
+import { decodeSnapshotBatch, encodeSnapshot, SNAPSHOT_BATCH_CONTENT_TYPE } from "@weft/sync-engine";
 import { parseRecoveryImport, type RecoveryImport } from "./recovery-import";
 import { builtinTemplate, builtinTemplateList } from "./builtin-templates";
 import { installProcessHooks, reportError } from "./telemetry";
@@ -334,7 +336,7 @@ export function startCloud(
   const CORS = {
     "access-control-allow-origin": "*",
     "access-control-allow-headers":
-      "authorization, content-type, x-base-revision, x-client-id, x-device-token, x-api-key, range, if-none-match, x-if-snapshot-seq-gt, x-weft-recovery, x-weft-native-sha256",
+      "authorization, content-type, x-base-revision, x-client-id, x-device-token, x-api-key, range, if-none-match, x-if-snapshot-seq-gt, x-weft-recovery, x-weft-native-sha256, x-snapshot-publication-id, x-snapshot-base-seq, x-op-batch-id",
     "access-control-allow-methods": "GET, PUT, POST, PATCH, DELETE, OPTIONS",
     // headers pdf.js + client caches read cross-origin (Range, revalidation etags)
     "access-control-expose-headers":
@@ -1693,36 +1695,58 @@ export function startCloud(
         return json({ ok: true });
       }
 
-      const opsMatch = /^\/api\/documents\/([^/]+)\/pages\/([^/]+)\/ops$/.exec(
+      const opsMatch = /^\/api\/documents\/([^/]+)\/pages\/([^/]+)\/(ops|ops-batch)$/.exec(
         path,
       );
       if (opsMatch) {
         const { doc, page } = pageParams(opsMatch);
+        const endpoint = opsMatch[3];
         if (req.method === "POST") {
-          const body = await readJson(req, MAX_RM, touchDevice);
-          if ("error" in body) return body.error;
-          const parsed = JSON.parse(body.text) as {
-            ops?: unknown;
-            author?: unknown;
-          };
-          if (!Array.isArray(parsed.ops))
-            return json({ error: "ops must be an array" }, 400);
-          if (parsed.ops.length > MAX_OPS_PER_POST)
-            return json(
-              {
-                error: `too many ops in one batch (max ${MAX_OPS_PER_POST})`,
-              },
-              400,
-            );
-          const ops: Uint8Array[] = [];
-          for (const b of parsed.ops) {
-            if (typeof b !== "string")
-              return json({ error: "op must be base64" }, 400);
-            ops.push(new Uint8Array(Buffer.from(b, "base64")));
+          const id = req.headers.get("x-op-batch-id");
+          const guarded = endpoint === "ops-batch";
+          if (guarded && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id ?? "")) {
+            return json({ error: "invalid op batch ID" }, 400);
           }
-          const author =
-            typeof parsed.author === "string" ? parsed.author : null;
-          const range = store.publishPage(user, doc, page, () => {
+          const body = await readBytes(req, MAX_RM, touchDevice);
+          if ("error" in body) return body.error;
+          type OpBody = { ops?: unknown; author?: unknown };
+          let parsed: (OpBody & { baseSeq?: unknown; batch?: OpBody }) | null = null;
+          let invalidJson = false;
+          try {
+            parsed = JSON.parse(new TextDecoder().decode(body.bytes));
+          } catch {
+            invalidJson = true;
+          }
+          const baseSeq = guarded ? parsed?.baseSeq : undefined;
+          const validBase = typeof baseSeq === "number" && Number.isSafeInteger(baseSeq) && baseSeq >= 0;
+          const append = () => {
+            if (invalidJson) return json({ error: "invalid json" }, 400);
+            if (guarded && !validBase) return json({ error: "invalid op batch base" }, 400);
+            const payload = guarded ? parsed?.batch : parsed;
+            if (guarded && (!payload || (payload.author !== null && typeof payload.author !== "string"))) {
+              return json({ error: "invalid op batch author" }, 400);
+            }
+            if (!Array.isArray(payload!.ops))
+              return json({ error: "ops must be an array" }, 400);
+            if (guarded && payload!.ops.length === 0)
+              return json({ error: "empty op batch" }, 400);
+            if (payload!.ops.length > MAX_OPS_PER_POST)
+              return json(
+                {
+                  error: `too many ops in one batch (max ${MAX_OPS_PER_POST})`,
+                },
+                400,
+              );
+            const ops: Uint8Array[] = [];
+            for (const b of payload!.ops) {
+              if (typeof b !== "string")
+                return json({ error: "op must be base64" }, 400);
+              const bytes = Buffer.from(b, "base64");
+              if (guarded && (bytes.length === 0 || bytes.toString("base64") !== b))
+                return json({ error: "invalid base64 op" }, 400);
+              ops.push(new Uint8Array(bytes));
+            }
+            const author = typeof payload!.author === "string" ? payload!.author : null;
             store.seedSnapshotFromBlob(user, doc, page);
             {
               const g = storageGuard(
@@ -1740,8 +1764,31 @@ export function startCloud(
               store.recordOpChange(user, doc, page, "web");
             }
             return range;
-          });
-          if (range instanceof Response) return range;
+          };
+          let range;
+          if (guarded) {
+            try {
+              const result = store.publishOpsOnce(user, doc, page, id!.toLowerCase(), body.bytes, () => {
+                const outcome = append();
+                // Roll back a lazy base seed if its append fails the quota check.
+                if (outcome instanceof Response) throw outcome;
+                return outcome;
+              }, validBase ? baseSeq : undefined);
+              if (result.kind === "stale") return json({
+                error: "snapshot base advanced", reason: "snapshot-base", currentSeq: result.currentSeq,
+              }, 409);
+              if (result.kind === "reused") return json({ error: "op batch ID already used", reason: "batch-id-reused" }, 409);
+              if (result.duplicate) return json(result.range);
+              range = result.range;
+            } catch (error) {
+              if (error instanceof Response) return error;
+              throw error;
+            }
+          } else {
+            const result = store.publishPage(user, doc, page, append);
+            if (result instanceof Response) return result;
+            range = result;
+          }
           emit(user, {
             type: "ops.appended",
             doc,
@@ -1750,7 +1797,7 @@ export function startCloud(
           });
           return json(range);
         }
-        if (req.method === "GET") {
+        if (endpoint === "ops" && req.method === "GET") {
           store.seedSnapshotFromBlob(user, doc, page);
           const since = Number(url.searchParams.get("since") ?? 0);
           // Truncation-gap signal (#52): a cursor below the page's floor (the
@@ -1785,21 +1832,63 @@ export function startCloud(
 
       // Snapshot channel (#45): whole-page compacted .rm at a version.
       const snapMatch =
-        /^\/api\/documents\/([^/]+)\/pages\/([^/]+)\/snapshot$/.exec(path);
+        /^\/api\/documents\/([^/]+)\/pages\/([^/]+)\/(snapshot|snapshot-batch)$/.exec(path);
       if (snapMatch) {
         const { doc, page } = pageParams(snapMatch);
-        if (req.method === "PUT") {
-          const body = await readBytes(req, MAX_RM, touchDevice);
+        const endpoint = snapMatch[3];
+        const isBatch = endpoint === "snapshot-batch";
+        if (req.method === "POST" || (!isBatch && req.method === "PUT")) {
+          const publicationId = req.headers.get("x-snapshot-publication-id");
+          const base = req.headers.get("x-snapshot-base-seq");
+          let publication: SnapshotPublication | null = null;
+          // Older relays reject POST without writing, rather than silently
+          // accepting a guarded request as an ordinary snapshot replacement.
+          if (req.method === "POST") {
+            const baseSeq = Number(base);
+            if (
+              publicationId === null ||
+              !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(publicationId) ||
+              base === null ||
+              !/^\d+$/.test(base) ||
+              !Number.isSafeInteger(baseSeq)
+            ) {
+              return json({ error: "invalid snapshot publication headers" }, 400);
+            }
+            publication = { id: publicationId.toLowerCase(), baseSeq };
+          }
+          if (isBatch && req.headers.get("content-type") !== SNAPSHOT_BATCH_CONTENT_TYPE) {
+            return json({ error: "unsupported snapshot batch format" }, 415);
+          }
+          const body = await readBytes(req, isBatch ? 2 * MAX_RM : MAX_RM, touchDevice);
           if ("error" in body) return body.error;
-          { const g = storageGuard(user, body.bytes.length, doc); if (g) return g; }
-          // merge-published: concurrent tablet edits (text/anchors) that this
-          // client has not seen union in instead of being clobbered
-          const { seq, merged } = store.publishPage(user, doc, page, () => {
-            const result = store.putSnapshotMerged(user, doc, page, body.bytes);
-            store.recordOpChange(user, doc, page, "web");
-            return result;
-          });
-          emit(user, {
+          let batch;
+          if (isBatch) {
+            try {
+              batch = decodeSnapshotBatch(body.bytes);
+            } catch {
+              return json({ error: "invalid snapshot batch" }, 400);
+            }
+            if (
+              batch.snapshot.length > MAX_RM ||
+              batch.deltas.length > MAX_OPS_PER_POST ||
+              body.bytes.length - batch.snapshot.length > MAX_RM
+            ) return json({ error: "snapshot batch too large" }, 413);
+          }
+          const result = store.publishSnapshot(
+            user, doc, page, body.bytes, publication,
+            () => storageGuard(user, body.bytes.length, doc), batch,
+          );
+          if (result.kind === "blocked") return result.response;
+          if (result.kind === "reused") {
+            return json({ error: "snapshot publication ID already used", reason: "publication-id-reused" }, 409);
+          }
+          if (result.kind === "stale") {
+            return json({
+              error: "snapshot base advanced", reason: "snapshot-base", currentSeq: result.currentSeq,
+            }, 409);
+          }
+          const { seq, merged, duplicate } = result;
+          if (!duplicate) emit(user, {
             type: "page.changed",
             doc,
             page,
@@ -1812,7 +1901,7 @@ export function startCloud(
           // must pull it back or its replica misses that content.
           return json({ seq, merged });
         }
-        if (req.method === "GET") {
+        if (!isBatch && req.method === "GET") {
           // lazy blob->snapshot migration (5d): an op-mode client bootstrapping
           // a legacy blob page must receive its content, not a 404-empty page.
           store.seedSnapshotFromBlob(user, doc, page);
@@ -2189,6 +2278,9 @@ export function startCloud(
     // request lands here — report to GlitchTip (telemetry.ts) and answer a
     // clean 500 instead of Bun's default HTML error page.
     error(err) {
+      if (err instanceof SnapshotUnavailable) {
+        return json({ error: "Current page checkpoint is unavailable" }, 503);
+      }
       if (err instanceof CheckpointUnavailableError) {
         console.error("weft-cloud: checkpoint unavailable", err.cause);
         return json({ error: "required checkpoint is unavailable; try again after it is restored" }, 503);

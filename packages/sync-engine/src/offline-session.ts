@@ -4,11 +4,13 @@
  * KeyValueStorage; reconcile() syncs with the tablet as a peer, tolerant of any offline duration.
  */
 
-import { RmDocument } from '@weft/rm-format'
-import { applyOps, type ApplyOptions, type LocalOp } from './apply-ops'
+import { encodePublicationBytes, newPublicationId, type BrowserPublication } from './browser-publication'
+import { RmDocument, type CrdtId } from '@weft/rm-format'
+import { NativeTextReferenceConflict, acceptedTextEdit, applyOps, captureTextReferences, mapRootTextReferences, nativeTextPlanBasis, publicationTextReferences, type ApplyOptions, type LocalOp, type RootTextEdit } from './apply-ops'
 import { diffPage, snapshotKnownState } from './differ'
 import {
     applyInkDeltas,
+    compareVersion,
     decodeOp,
     encodeOp,
     mergeOverlayOp,
@@ -17,9 +19,9 @@ import {
     type Op,
     type TombstoneOp,
 } from './ops'
-import { decodeSnapshot, encodeSnapshot } from './snapshot'
+import { decodeSnapshot, encodeSnapshot, encodeSnapshotBatch } from './snapshot'
 import { applyMoveRewrites, auditOverlay, reconcile as reconcilePolicy } from './reconciler'
-import type { KeyValueStorage } from './storage'
+import { sameBytes, type KeyValueStorage, type StoragePair } from './storage'
 import type { OpRecord, PageEvent, Transport } from './transport'
 import {
     EngineFailure,
@@ -28,6 +30,26 @@ import {
     type OverlayShape,
     type ViewPatch,
 } from './types'
+
+function decodePending(bytes: Uint8Array): { ops: LocalOp[]; publication: BrowserPublication | undefined } {
+    const saved = JSON.parse(new TextDecoder().decode(bytes))
+    const ops = Array.isArray(saved) ? saved : saved?.version === 1 ? saved.ops : null
+    if (!Array.isArray(ops) || !ops.every(op => op && typeof op.type === 'string')) {
+        throw new Error('Invalid pending save queue')
+    }
+    const publication = Array.isArray(saved) ? undefined : saved.publication as BrowserPublication
+    if (publication && (
+        typeof publication.id !== 'string' || typeof publication.payload !== 'string' ||
+        (publication.kind !== 'ops' && publication.kind !== 'snapshot') ||
+        !Number.isSafeInteger(publication.count) || publication.count < 1 || publication.count > ops.length ||
+        !Number.isSafeInteger(publication.baseSeq) || publication.baseSeq < 0
+    )) throw new Error('Invalid prepared save')
+    return { ops, publication }
+}
+
+function encodePending(ops: LocalOp[], publication?: BrowserPublication): Uint8Array {
+    return new TextEncoder().encode(JSON.stringify(publication ? { version: 1, ops, publication } : ops))
+}
 
 interface PersistedState {
     baseRevision: string
@@ -93,13 +115,22 @@ export interface OfflineSessionOptions extends ApplyOptions {
      * never set it (third-party apps should pass their app name).
      */
     historyAuthor?: string
+    /** Enable only after the relay supports guarded save receipts. */
+    guardedSaves?: boolean
+    /** The visible editor may still have an edit not yet staged in the engine. */
+    canApplyGuardedRepair?: (basis: OverlayShape) => boolean
 }
 
 export class OfflineSession {
     private baseDoc!: RmDocument
     private baseRevision = ''
     private pendingOps: LocalOp[] = []
+    private publication: BrowserPublication | undefined
+    private confirmedPrefix = 0
+    private readonly parkedRepairs = new Set<string>()
+    private deferredOrphan = false
     private checkpointDirty = false
+    private diskCheckpoint: StoragePair = [null, null]
     private pendingWrites = Promise.resolve()
     private overlay: OverlayDocument = { shapes: [] }
     private opCursor = 0
@@ -143,11 +174,17 @@ export class OfflineSession {
         await session.adoptOrphanPending()
         // the page may have changed while NO session was watching (tablet
         // moves/erases of our rendered shapes): audit before the view binds
-        if (session.runAudit()) await session.persist()
+        if (session.runAudit(patch => {
+            if ((opts.guardedSaves || session.publication) && patch.type === 'shape-edited') session.emitGuardedRepair(patch)
+            else opts.onPatch(patch)
+        })) await session.persist()
         if (session.bootstrapped || session.pendingOps.length) opts.onPageAvailable?.()
         session.unsubscribe = transport.subscribe((event) => void session.onRemote(event), () => void session.reconcile())
         session.retryTimer = setInterval(
-            () => void session.reconcile(),
+            () => {
+                if (session.opts.guardedSaves && session.cachePrimary) session.deferredOrphan = true
+                void session.reconcile()
+            },
             opts.retryIntervalMs ?? 15_000,
         )
         // first reconcile in the background; local state is usable immediately
@@ -160,21 +197,22 @@ export class OfflineSession {
     }
 
     private async load(): Promise<void> {
-        const [baseBytes, stateRaw] = await this.storage.getPair(this.key('base'), this.key('state'))
+        const [baseBytes, stateRaw] = this.diskCheckpoint = await this.storage.getPair(this.key('base'), this.key('state'))
         // per-author key: two tabs can never clobber each other's unflushed ops
         const pendingRaw = await this.storage.get(this.pendingKey())
         if (pendingRaw) {
-            try {
-                this.pendingOps = JSON.parse(new TextDecoder().decode(pendingRaw)) as LocalOp[]
-            } catch {
-                this.pendingOps = [] // corrupt queue: nothing safe to replay
-            }
+            const saved = decodePending(pendingRaw)
+            this.pendingOps = saved.ops
+            this.publication = saved.publication
         }
         if (baseBytes && stateRaw) {
             // local replica exists: offline-capable immediately
             this.baseDoc = RmDocument.parse(baseBytes)
             const state = JSON.parse(new TextDecoder().decode(stateRaw)) as PersistedState
             this.baseRevision = state.baseRevision
+            this.overlay = state.overlay
+            this.opCursor = state.opCursor ?? 0
+            this.lastSnapshotSeq = state.lastSnapshotSeq ?? 0
             // LEGACY migration: pending ops used to live in the state blob.
             // Only the cache primary adopts them (a second tab adopting too
             // would double-flush; each applyOps run mints fresh ids, so the
@@ -185,9 +223,6 @@ export class OfflineSession {
                 await this.persistPending()
                 await this.persist()
             }
-            this.overlay = state.overlay
-            this.opCursor = state.opCursor ?? 0
-            this.lastSnapshotSeq = state.lastSnapshotSeq ?? 0
             // a persisted replica is already bootstrapped (it has a cursor +
             // base); pull resumes from opCursor.
             this.bootstrapped = true
@@ -203,13 +238,7 @@ export class OfflineSession {
         this.opCursor = 0
     }
 
-    private async persist(gen = this.generation, nativeBytes?: Uint8Array): Promise<void> {
-        // one maintainer per page across tabs (the cache primary); a second
-        // writer would interleave a base from one tab with a cursor from
-        // another. Pending ops live under per-author keys (persistPending).
-        const active = () => gen === this.generation && (!this.disposed || this.drainingWrites) && this.cachePrimary
-        if (this.disposed || !active()) return
-        this.checkpointDirty = true
+    private checkpointEntries(nativeBytes?: Uint8Array) {
         const base = nativeBytes ?? this.baseDoc.serialize()
         const state: PersistedState = {
             baseRevision: this.baseRevision,
@@ -218,7 +247,52 @@ export class OfflineSession {
             lastSnapshotSeq: this.lastSnapshotSeq,
         }
         const stateBytes = new TextEncoder().encode(JSON.stringify(state))
-        const write = this.storage.setPair([this.key('base'), base], [this.key('state'), stateBytes], active)
+        return [[this.key('base'), base], [this.key('state'), stateBytes]] as const
+    }
+
+    /** All guarded cache writes share one exact-predecessor rule. A tab
+     * that lost the race cannot clear its immutable journal or overwrite the
+     * winning replica. Reopen from the winner rather than guessing lineage. */
+    private async commitGuardedCheckpoint(
+        checkpoint: ReturnType<OfflineSession['checkpointEntries']>,
+        mayWrite: () => boolean,
+        queue?: { key: string; bytes: Uint8Array | null },
+    ): Promise<boolean> {
+        if (!this.storage.commitSave) throw new Error('Atomic save storage unavailable')
+        const expected = this.diskCheckpoint
+        if ((expected[0] === null) !== (expected[1] === null) ||
+            ![this.lastSnapshotSeq, this.opCursor].every(value => Number.isSafeInteger(value) && value >= 0)) {
+            throw new Error('Cannot replace incomplete checkpoint')
+        }
+        if (expected[1]) {
+            const previous = JSON.parse(new TextDecoder().decode(expected[1])) as PersistedState
+            const oldSnapshot = previous.lastSnapshotSeq ?? 0
+            const oldCursor = previous.opCursor ?? 0
+            if (![oldSnapshot, oldCursor].every(value => Number.isSafeInteger(value) && value >= 0) ||
+                this.lastSnapshotSeq < oldSnapshot || this.opCursor < oldCursor ||
+                (this.lastSnapshotSeq === oldSnapshot && this.opCursor === oldCursor &&
+                    (!sameBytes(checkpoint[0][1], expected[0]) || !sameBytes(checkpoint[1][1], expected[1])))) {
+                throw new Error('Cannot replace checkpoint: relay frontier changed')
+            }
+        }
+        const result = await this.storage.commitSave({ expected, checkpoint, ...(queue ? { queue } : {}), mayWrite })
+        if (result === 'conflict') throw new Error('Another tab saved a newer checkpoint. Reopen this page to retry.')
+        if (result === 'inactive') return false
+        this.diskCheckpoint = [checkpoint[0][1], checkpoint[1][1]]
+        return true
+    }
+
+    private async persist(gen = this.generation, nativeBytes?: Uint8Array): Promise<void> {
+        // one maintainer per page across tabs (the cache primary); a second
+        // writer would interleave a base from one tab with a cursor from
+        // another. Pending ops live under per-author keys (persistPending).
+        const active = () => gen === this.generation && (!this.disposed || this.drainingWrites) && this.cachePrimary
+        if (this.disposed || !active()) return
+        this.checkpointDirty = true
+        const checkpoint = this.checkpointEntries(nativeBytes)
+        const write = (this.opts.guardedSaves || this.publication)
+            ? this.commitGuardedCheckpoint(checkpoint, active).then(() => {})
+            : this.storage.setPair(...checkpoint, active)
         this.checkpointWrites.add(write)
         try {
             await write
@@ -246,7 +320,7 @@ export class OfflineSession {
         }
         await this.storage.set(
             this.pendingKey(),
-            new TextEncoder().encode(JSON.stringify(this.pendingOps)),
+            encodePending(this.pendingOps, this.publication),
         )
     }
 
@@ -258,6 +332,7 @@ export class OfflineSession {
     private async adoptOrphanPending(): Promise<void> {
         const transfer = this.storage.setAndDelete?.bind(this.storage)
         if (!this.cachePrimary || !this.opts.adoptOrphanAuthor || !transfer) return
+        this.deferredOrphan = false
         const prefix = this.key('pending/')
         for (const key of await this.storage.keys(prefix)) {
             if (this.disposed) return
@@ -266,25 +341,25 @@ export class OfflineSession {
             await this.opts.adoptOrphanAuthor(author, async () => {
                 const raw = await this.storage.get(key)
                 if (!raw) return
-                let ops: LocalOp[]
-                try {
-                    ops = JSON.parse(new TextDecoder().decode(raw)) as LocalOp[]
-                } catch {
-                    return // preserve unreadable source bytes
-                }
-                if (!Array.isArray(ops) || !ops.every((op) => op && typeof op.type === 'string')) {
-                    return
-                }
+                let saved: ReturnType<typeof decodePending>
+                try { saved = decodePending(raw) } catch { return } // keep unreadable bytes
+                const { ops, publication } = saved
                 await this.writePending(async () => {
                     if (this.disposed) return
                     if (ops.length === 0) {
                         await this.storage.delete(key)
                         return
                     }
+                    // An immutable prefix cannot be inserted behind other edits.
+                    if (publication && this.pendingOps.length) {
+                        this.deferredOrphan = true
+                        return
+                    }
                     const combined = [...this.pendingOps, ...ops]
-                    const bytes = new TextEncoder().encode(JSON.stringify(combined))
-                    await transfer(this.pendingKey(), bytes, key)
+                    const adopted = publication ?? this.publication
+                    await transfer(this.pendingKey(), encodePending(combined, adopted), key)
                     this.pendingOps = combined
+                    this.publication = adopted
                     this.pendingVersion++
                 })
             })
@@ -326,7 +401,7 @@ export class OfflineSession {
      */
     private pendingVersion = 0
     private overlayVersion = 0
-    private viewCache: { key: string; doc: RmDocument; overlay: OverlayDocument } | null = null
+    private viewCache: { key: string; doc: RmDocument; overlay: OverlayDocument; mintedText?: Map<string, CrdtId> } | null = null
     /** Working copy for the pending slow path: base+overlay identity it was
      *  built from, plus the exact pending ops already applied to it. */
     private viewIncr: {
@@ -335,6 +410,7 @@ export class OfflineSession {
         base: RmDocument
         overlayVersion: number
         applied: LocalOp[]
+        mintedText: Map<string, CrdtId>
     } | null = null
 
     /** Cheap change-detection key: any content-affecting mutation moves it.
@@ -343,7 +419,26 @@ export class OfflineSession {
         return `${this.baseRevision}|${this.pendingVersion}|${this.overlayVersion}`
     }
 
-    private buildView(): { doc: RmDocument; overlay: OverlayDocument } {
+    private buildView(): { doc: RmDocument; overlay: OverlayDocument; mintedText?: Map<string, CrdtId> } {
+        try {
+            return this.buildPendingView()
+        } catch (error) {
+            if (!(error instanceof NativeTextReferenceConflict)) throw error
+            // Pending replay can fail after changing its private working copy.
+            // Never paint that partial result or remove the durable queue.
+            this.viewIncr = null
+            this.viewCache = {
+                key: this.viewKey, doc: this.baseDoc, overlay: structuredClone(this.overlay),
+            }
+            return this.viewCache
+        }
+    }
+
+    private buildPendingView(): { doc: RmDocument; overlay: OverlayDocument; mintedText?: Map<string, CrdtId> } {
+        const pending = this.confirmedPrefix
+            ? this.pendingOps.slice(this.confirmedPrefix).map(op => this.publication?.textRefs
+                ? acceptedTextEdit(op, this.publication.textRefs) : op)
+            : this.pendingOps
         const key = this.viewKey
         if (this.viewCache && this.viewCache.key === key) return this.viewCache
         // Fast path: with no pending local ops, the view IS the base — return
@@ -355,7 +450,7 @@ export class OfflineSession {
         // which can't be frozen, but freezing the block array stops the main
         // add/remove/replace vector. Safe because base is only ever read or
         // replaced wholesale, never mutated in place.
-        if (this.pendingOps.length === 0) {
+        if (pending.length === 0) {
             if (!Object.isFrozen(this.baseDoc)) {
                 Object.freeze(this.baseDoc.blocks)
                 Object.freeze(this.baseDoc)
@@ -374,25 +469,27 @@ export class OfflineSession {
             incr &&
             incr.base === this.baseDoc &&
             incr.overlayVersion === this.overlayVersion &&
-            incr.applied.length <= this.pendingOps.length &&
-            incr.applied.every((op, i) => op === this.pendingOps[i])
+            incr.applied.length <= pending.length &&
+            incr.applied.every((op, i) => op === pending[i])
         ) {
-            applyOps(incr.doc, incr.overlay, this.pendingOps.slice(incr.applied.length), this.opts)
-            incr.applied = [...this.pendingOps]
-            this.viewCache = { key, doc: incr.doc, overlay: incr.overlay }
+            applyOps(incr.doc, incr.overlay, pending.slice(incr.applied.length), this.opts, incr.mintedText)
+            incr.applied = [...pending]
+            this.viewCache = { key, doc: incr.doc, overlay: incr.overlay, mintedText: incr.mintedText }
             return this.viewCache
         }
         const doc = RmDocument.parse(this.baseDoc.serialize())
         const overlay = structuredClone(this.overlay)
-        applyOps(doc, overlay, this.pendingOps, this.opts)
+        const mintedText = new Map<string, CrdtId>()
+        applyOps(doc, overlay, pending, this.opts, mintedText)
         this.viewIncr = {
             doc,
             overlay,
             base: this.baseDoc,
             overlayVersion: this.overlayVersion,
-            applied: [...this.pendingOps],
+            applied: [...pending],
+            mintedText,
         }
-        this.viewCache = { key, doc, overlay }
+        this.viewCache = { key, doc, overlay, mintedText }
         return this.viewCache
     }
 
@@ -415,13 +512,99 @@ export class OfflineSession {
         if (this.pendingOps.length > 0) void this.reconcile()
     }
 
+    // The controller may hold a captured edit while flushing ink. Keep that
+    // edit addressable if a dependency is acknowledged before it gets queued.
+    private capturedRootText = new Map<string, RootTextEdit>()
+
+    /** Capture before any controller awaits: numeric slots belong to the current edited view. */
+    captureRootTextEdit(edit: RootTextEdit, basis?: RootTextEdit): RootTextEdit {
+        if (!this.opts.guardedSaves || edit.textIntentId) return edit
+        const intent = newPublicationId()
+        let captured: RootTextEdit
+        if (basis?.textIntentId) {
+            const held = this.capturedRootText.get(basis.textIntentId)
+            if (!held) throw new NativeTextReferenceConflict('Rendered native text basis is unavailable')
+            const references = new Map(basis.deleteKeys?.map((key, i) => [key, held.deleteKeys![i]!]))
+            captured = {
+                ...mapRootTextReferences(edit, key => {
+                    const ref = references.get(key)
+                    if (ref === undefined) throw new NativeTextReferenceConflict('Rendered native character is unavailable')
+                    return ref
+                }),
+                textIntentId: intent,
+            }
+        } else {
+            const view = this.buildView()
+            captured = captureTextReferences(view.doc, edit, intent, view.mintedText ?? new Map())
+        }
+        this.capturedRootText.set(captured.textIntentId!, captured)
+        return captured
+    }
+
+    captureRootTextBasis(keys: string[]): RootTextEdit {
+        const source: RootTextEdit = { type: 'edit-root-text', deleteKeys: keys }
+        const captured = this.captureRootTextEdit(source)
+        return captured.textIntentId ? { ...source, textIntentId: captured.textIntentId } : source
+    }
+
+    /** Build dependent text, paragraph and mark writes on an isolated page.
+     * The first write fences the entire semantic basis during later replay,
+     * including a remote head that arrives while the journal is being saved. */
+    planRootText(
+        compose: (doc: RmDocument, add: (edit: RootTextEdit, basis?: RootTextEdit) => void) => void,
+    ): RootTextEdit[] {
+        if (!this.opts.guardedSaves) throw new Error('Guarded native text planning is unavailable')
+        const view = this.buildView()
+        const doc = RmDocument.parse(view.doc.serialize())
+        const minted = new Map(view.mintedText)
+        const overlay = { shapes: [] }
+        const plan: RootTextEdit[] = []
+        const expectedTextBasis = nativeTextPlanBasis(doc)
+        try {
+            compose(doc, (edit, basis) => {
+                const fenced = !plan.length
+                    ? { ...edit, expectedTextBasis } : edit
+                const captured = basis ? this.captureRootTextEdit(fenced, basis)
+                    : captureTextReferences(doc, fenced, newPublicationId(), minted)
+                this.capturedRootText.set(captured.textIntentId!, captured)
+                plan.push(captured)
+                applyOps(doc, overlay, [captured], this.opts, minted)
+            })
+            return plan
+        } catch (error) {
+            for (const edit of plan) this.releaseCapturedRootText(edit)
+            throw error
+        }
+    }
+
+    releaseCapturedRootText(edit: RootTextEdit): void {
+        if (edit.textIntentId) this.capturedRootText.delete(edit.textIntentId)
+    }
+
     /** Apply local edits: instant and durable, tablet not required. */
-    async apply(ops: LocalOp[]): Promise<void> {
-        await this.writePending(async () => {
-            this.pendingOps.push(...ops)
-            this.pendingVersion++
-            await this.persistPending()
-        })
+    async apply(ops: LocalOp[], beforeEnqueue?: () => void): Promise<void> {
+        const captured = ops.map(op => op.type === 'edit-root-text' ? this.captureRootTextEdit(op) : op)
+        try {
+            await this.writePending(async () => {
+                beforeEnqueue?.()
+                const next = captured.map(op => op.type === 'edit-root-text' && op.textIntentId
+                    ? this.capturedRootText.get(op.textIntentId) ?? op : op)
+                if (next.some(op => op.type === 'edit-root-text' && op.expectedTextBasis !== undefined)) {
+                    // A failed write must not leave a partially enqueued rich
+                    // plan in memory for the next commit to enqueue again.
+                    const pending = [...this.pendingOps, ...next]
+                    await this.storage.set(this.pendingKey(), encodePending(pending, this.publication))
+                    this.pendingOps = pending
+                    this.pendingVersion++
+                } else {
+                    this.pendingOps.push(...next)
+                    this.pendingVersion++
+                    await this.persistPending()
+                }
+            })
+        } finally {
+            for (const op of captured) if (op.type === 'edit-root-text') this.releaseCapturedRootText(op)
+        }
         this.status({ state: 'pending', ops: this.pendingOps.length })
         void this.reconcile()
     }
@@ -513,6 +696,29 @@ export class OfflineSession {
             // to record its acknowledgement behind a storage transfer.
             await this.pendingWrites
             if (gen !== this.generation || this.disposed) return
+            // A saved request may already have committed. Resolve it before
+            // observing new state and minting more IDs from raw actions.
+            if (this.publication || this.opts.guardedSaves) {
+                if (!this.transport.publishBrowserSave || !this.storage.commitSave) {
+                    throw new Error('Guarded save support unavailable')
+                }
+                if (!this.pendingOps.length && this.deferredOrphan) await this.adoptOrphanPending()
+                if (!this.publication) {
+                    const skipped = await this.pullOps(gen)
+                    await this.pendingWrites
+                    if (skipped && this.pendingOps.length && gen === this.generation && !this.disposed) {
+                        await this.pullOps(gen, true)
+                    }
+                    await this.preparePublication(gen)
+                }
+                const retry = await this.deliverPublication(gen)
+                if (gen !== this.generation || this.disposed) return
+                this.status(this.pendingOps.length ? { state: 'pending', ops: this.pendingOps.length } : { state: 'synced' })
+                if (retry) this.scheduleQuickRetry()
+                else if (this.pendingOps.length || this.deferredOrphan) void this.reconcile()
+                else this.quickRetryBackoff = 1_000
+                return
+            }
             // pull BEFORE push: caught up to the head first means a snapshot we
             // publish for an incomplete op reflects all foreign state, and the
             // common case (foreign changes, no local pending) is one round-trip.
@@ -561,6 +767,90 @@ export class OfflineSession {
             this.quickRetryTimer = null
             void this.reconcile()
         }, delay)
+    }
+
+    private async preparePublication(gen: number): Promise<void> {
+        await this.writePending(async () => {
+            if (this.disposed || gen !== this.generation || !this.pendingOps.length || this.publication) return
+            if (this.pendingOps.some(op => op.type === 'edit-root-text' && !op.textIntentId && (
+                op.inserts?.some(insert => insert.afterKey !== null) || op.deleteKeys?.length || op.styles?.length
+            ))) throw new Error('Legacy native text references need recovery before publishing')
+            const doc = RmDocument.parse(this.baseDoc.serialize())
+            const overlay = structuredClone(this.overlay)
+            const mintedText = new Map<string, CrdtId>()
+            const { deltas, complete } = applyOps(doc, overlay, this.pendingOps, this.opts, mintedText)
+            const blobs = deltas.map(encodeOp)
+            const baseSeq = this.lastSnapshotSeq
+            const author = this.opts.historyAuthor ?? this.opts.authorUuid
+            const isOps = complete && blobs.length > 0
+            const publication: BrowserPublication = {
+                id: newPublicationId(), baseSeq, count: this.pendingOps.length,
+                kind: isOps ? 'ops' : 'snapshot',
+                ...(mintedText.size ? { textRefs: publicationTextReferences(doc, mintedText) } : {}),
+                payload: isOps ? JSON.stringify({ baseSeq, batch: { ops: blobs.map(encodePublicationBytes), author } })
+                    : encodePublicationBytes(encodeSnapshotBatch({ snapshot: encodeSnapshot(doc.serialize(), overlay), deltas: blobs, author })),
+            }
+            await this.storage.set(this.pendingKey(), encodePending(this.pendingOps, publication))
+            this.publication = publication
+        })
+    }
+
+    /** true means retry with backoff; only an explicit unaccepted stale
+     * response permits throwing away wire bytes or preparing a new request. */
+    private async deliverPublication(gen: number): Promise<boolean> {
+        const publication = this.publication
+        const active = () => !this.disposed && gen === this.generation && this.publication === publication
+        if (!publication || !active()) return false
+        const receipt = await this.transport.publishBrowserSave!(this.docId, this.pageId, publication)
+        if (!active()) return false
+        if (receipt.kind === 'stale' && this.pendingOps.some(op =>
+            op.type === 'edit-root-text' && !op.textIntentId && (
+                op.inserts?.some(insert => insert.afterKey !== null) ||
+                op.deleteKeys?.length || op.styles?.length
+            )
+        )) {
+            // These intents still contain file-local author indexes. A
+            // replacement can reorder authors; do not write to a wrong anchor.
+            throw new Error('Cannot yet rebase pending native text anchors safely')
+        }
+        if (receipt.kind !== 'stale') {
+            await this.pullOps(gen, true, {
+                verify: (seq, cursor) => {
+                    const present = receipt.kind === 'ops' ? cursor >= receipt.lastSeq : seq >= receipt.seq
+                    if (!present) throw new Error('Relay save is not yet readable')
+                },
+                complete: () => {
+                    // Hide the optimistic copy only after the authority has
+                    // been folded successfully, before the view is notified.
+                    this.confirmedPrefix = publication.count
+                    this.pendingVersion++
+                },
+            }, false)
+        }
+        await this.writePending(async () => {
+            if (!active()) return
+            const rest = receipt.kind === 'stale' ? this.pendingOps : this.pendingOps.slice(publication.count)
+                .map(op => publication.textRefs ? acceptedTextEdit(op, publication.textRefs) : op)
+            const queue = rest.length ? encodePending(rest) : null
+            if (receipt.kind === 'stale') {
+                if (queue) await this.storage.set(this.pendingKey(), queue)
+            } else {
+                if (!await this.commitGuardedCheckpoint(this.checkpointEntries(), active, {
+                    key: this.pendingKey(), bytes: queue,
+                })) return
+                this.checkpointDirty = false
+                if (publication.textRefs) {
+                    for (const [id, edit] of this.capturedRootText) {
+                        this.capturedRootText.set(id, acceptedTextEdit(edit, publication.textRefs) as RootTextEdit)
+                    }
+                }
+            }
+            this.pendingOps = rest
+            this.publication = undefined
+            this.confirmedPrefix = 0
+            this.pendingVersion++
+        })
+        return receipt.kind === 'stale'
     }
 
     /** Push pending local ops as commutative deltas. opCursor is NOT advanced
@@ -622,8 +912,32 @@ export class OfflineSession {
         }
     }
 
+    /** A semantic inverse is only valid against the shape that produced its
+     * glyph indices. Park a blocked repair until the next authoritative audit;
+     * never replay stale indices over a newer optimistic local projection. */
+    private emitGuardedRepair(patch: Extract<ViewPatch, { type: 'shape-edited' }>): void {
+        const basis = this.overlay.shapes.find(shape => shape.shapeId === patch.shapeId)
+        const visible = this.currentOverlay.shapes.find(shape => shape.shapeId === patch.shapeId)
+        if (!basis || !visible || compareVersion(basis.version, visible.version) !== 0 ||
+            basis.renderRevision !== visible.renderRevision || basis.state !== visible.state ||
+            this.opts.canApplyGuardedRepair?.(basis) === false) {
+            this.parkedRepairs.add(patch.shapeId)
+            return
+        }
+        this.opts.onPatch(patch)
+        this.parkedRepairs.delete(patch.shapeId)
+    }
+
     /** Stage the snapshot and its operation tail before replacing the current page. */
-    private async pullOps(gen: number): Promise<boolean> {
+    private async pullOps(
+        gen: number,
+        forceTail = false,
+        receiptFold?: {
+            verify: (snapshotSeq: number, cursor: number) => void
+            complete: () => void
+        },
+        persistCheckpoint = true,
+    ): Promise<boolean> {
         const active = () => gen === this.generation && !this.disposed
         const connection = this.transport.pageEventsConnection
         const sinceSnapshot = this.bootstrapped ? this.lastSnapshotSeq : undefined
@@ -631,7 +945,7 @@ export class OfflineSession {
         if (!active()) return false
         if (snap && sinceSnapshot !== undefined && snap.seq <= sinceSnapshot) snap = null
         // A live socket covers edits accepted after this checkpoint was read.
-        const skipTail = sinceSnapshot === undefined && snap?.complete === true &&
+        const skipTail = !forceTail && sinceSnapshot === undefined && snap?.complete === true &&
             connection !== undefined && connection === this.transport.pageEventsConnection &&
             this.pendingOps.length === 0
         let records: OpRecord[]
@@ -648,60 +962,130 @@ export class OfflineSession {
         if (!active()) return false
 
         const batch = records.map((r) => decodeOp(r.op))
-        // A replacement paints the final checkpoint and tail together. Keep
-        // follow-up repairs separate, after the source shapes are installed.
-        const publishReplacement = snap ? this.opts.onPatchBatch : undefined
-        const repairs: ViewPatch[] = []
-        const collectReplacement = snap ? (patch: ViewPatch) => {
-            if (patch.type === 'shape-edited') repairs.push(patch)
-            else if (!publishReplacement) this.opts.onPatch(patch)
-        } : undefined
-        const previous = snap && !snap.revert && this.bootstrapped ? this.baseDoc : null
+        const replacement = snap ? decodeSnapshot(snap.bytes) : null
+        const replacementDoc = replacement ? RmDocument.parse(replacement.rm) : null
+        receiptFold?.verify(snap?.seq ?? this.lastSnapshotSeq, records.at(-1)?.seq ?? snap?.opSeq ?? this.opCursor)
+        // A receipt proves remote durability, not successful local folding.
+        // Defer observers and keep a rollback copy until the complete
+        // authoritative state exists. A failed fold leaves the outbox visible.
+        const guardedView = !!(this.opts.guardedSaves || receiptFold)
+        const canonicalGuarded = guardedView && (!!snap || records.length > 0 || this.parkedRepairs.size > 0)
+        const prior = canonicalGuarded ? {
+            baseDoc: this.baseDoc,
+            overlay: this.overlay,
+            opCursor: this.opCursor,
+            lastSnapshotSeq: this.lastSnapshotSeq,
+            overlayVersion: this.overlayVersion,
+        } : null
+        const notifications: Array<() => void> = []
+        const notify = (fn: () => void) => {
+            if (guardedView) notifications.push(fn)
+            else fn()
+        }
+        const notifyPatch = (patch: ViewPatch) => notify(() => this.opts.onPatch(patch))
+        const notifyBatch = this.opts.onPatchBatch
+            ? (patches: readonly ViewPatch[]) => notify(() => this.opts.onPatchBatch!(patches))
+            : undefined
         let nativeBytes: Uint8Array | undefined
-        if (snap) {
-            const { rm, overlay } = decodeSnapshot(snap.bytes)
-            this.baseDoc = RmDocument.parse(rm)
-            nativeBytes = rm
-            // The explicit revert can rewind versions. Ordinary checkpoints merge
-            // with the existing overlay to retain already-known newer records.
-            this.overlay = snap.revert ? overlay : mergeOverlayDocuments(this.overlay, overlay)
-            this.opCursor = snap.opSeq
-            this.lastSnapshotSeq = snap.seq
-            this.overlayVersion++
+        let repaired: boolean
+        const repairs: Array<Extract<ViewPatch, { type: 'shape-edited' }>> = []
+        if (prior) this.overlay = structuredClone(prior.overlay)
+        try {
+            // Follow one canonical guarded projection. Queued upsert objects
+            // can be mutated by native move audit; replaying their mirror move
+            // after a post-audit upsert would translate the same shape twice.
+            const publishReplacement = snap && !canonicalGuarded ? this.opts.onPatchBatch : undefined
+            const auditFolded = !!snap || canonicalGuarded
+            const collectReplacement = auditFolded ? (patch: ViewPatch) => {
+                if (patch.type === 'shape-edited') repairs.push(patch)
+                else if (!publishReplacement && !canonicalGuarded) notifyPatch(patch)
+            } : undefined
+            const previous = auditFolded && !snap?.revert && this.bootstrapped ? this.baseDoc : null
+            if (snap && replacement && replacementDoc) {
+                const { rm, overlay } = replacement
+                this.baseDoc = replacementDoc
+                nativeBytes = rm
+                // The explicit revert can rewind versions. Ordinary checkpoints merge
+                // with the existing overlay to retain already-known newer records.
+                this.overlay = snap.revert ? overlay : mergeOverlayDocuments(this.overlay, overlay)
+                this.opCursor = snap.opSeq
+                this.lastSnapshotSeq = snap.seq
+                this.overlayVersion++
+            }
+            const snapshotBase = snap ? this.baseDoc : null
+            // A single-patch subscriber also observes the individual changes since
+            // this checkpoint. Compare ink after the tail has established ownership.
+            const priorInk = snap && !publishReplacement && !canonicalGuarded &&
+                batch.some(op => op.op === 'add' || op.op === 'tombstone')
+                ? snapshotKnownState(this.baseDoc) : null
+            if (records.length) {
+                this.applyOpBatch(batch, collectReplacement, notifyPatch, notifyBatch)
+                this.opCursor = records[records.length - 1]!.seq
+            }
+            const replayedInk = snapshotBase && snapshotBase !== this.baseDoc
+            repaired = auditFolded ? this.runAudit(collectReplacement, {
+                previous: replayedInk ? snapshotBase : previous,
+                beforeSnapshot: replayedInk ? previous : null,
+            }) : false
+            if (priorInk) {
+                const diff = diffPage(priorInk, this.baseDoc, this.overlay)
+                if (diff.foreignAdds.length) notifyPatch({ type: 'ink-added', items: diff.foreignAdds })
+                if (diff.foreignDeletes.length) notifyPatch({ type: 'ink-removed', items: diff.foreignDeletes })
+            }
+            if (snap || canonicalGuarded) {
+                const patch = { type: 'document-replaced' } as const
+                if (notifyBatch) notifyBatch([patch])
+                else notifyPatch(patch)
+            }
+            if (!guardedView) for (const repair of repairs) notifyPatch(repair)
+        } catch (error) {
+            if (prior) {
+                this.baseDoc = prior.baseDoc
+                this.overlay = prior.overlay
+                this.opCursor = prior.opCursor
+                this.lastSnapshotSeq = prior.lastSnapshotSeq
+                this.overlayVersion = prior.overlayVersion
+            }
+            throw error
         }
-        const snapshotBase = snap ? this.baseDoc : null
-        // A single-patch subscriber also observes the individual changes since
-        // this checkpoint. Compare ink after the tail has established ownership.
-        const priorInk = snap && !publishReplacement && batch.some(op => op.op === 'add' || op.op === 'tombstone')
-            ? snapshotKnownState(this.baseDoc) : null
-        if (records.length) {
-            this.applyOpBatch(batch, collectReplacement)
-            this.opCursor = records[records.length - 1]!.seq
+        receiptFold?.complete()
+        let repaintNeeded = false
+        const observeConfirmed = (callback: () => void) => {
+            try {
+                callback()
+            } catch {
+                // A paint failure cannot unwind an accepted publication or
+                // stop its exact checkpoint and journal retirement. Exceptions
+                // from view code can embed note text; don't report their detail.
+                this.reportFailure('codec', 'ViewPatch', 'Guarded view observer failed')
+                repaintNeeded = true
+            }
         }
-        const replayedInk = snapshotBase && snapshotBase !== this.baseDoc
-        const repaired = snap ? this.runAudit(collectReplacement, {
-            previous: replayedInk ? snapshotBase : previous,
-            beforeSnapshot: replayedInk ? previous : null,
-        }) : false
-        if (priorInk) {
-            const diff = diffPage(priorInk, this.baseDoc, this.overlay)
-            if (diff.foreignAdds.length) this.opts.onPatch({ type: 'ink-added', items: diff.foreignAdds })
-            if (diff.foreignDeletes.length) this.opts.onPatch({ type: 'ink-removed', items: diff.foreignDeletes })
-        }
-        if (snap) {
-            const patch = { type: 'document-replaced' } as const
-            if (publishReplacement) publishReplacement([patch])
-            else this.opts.onPatch(patch)
-            for (const repair of repairs) this.opts.onPatch(repair)
+        for (const callback of notifications) observeConfirmed(callback)
+        if (canonicalGuarded) {
+            // A superseding projection or native edit can eliminate the old
+            // repair. The final audit, not this in-memory set, is authoritative.
+            const repairIds = new Set(repairs.map(repair => repair.shapeId))
+            for (const id of this.parkedRepairs) if (!repairIds.has(id)) this.parkedRepairs.delete(id)
+            for (const repair of repairs) observeConfirmed(() => this.emitGuardedRepair(repair))
         }
         const first = !this.bootstrapped
-        if (first || snap || records.length || this.checkpointDirty) {
+        if (persistCheckpoint && (first || snap || records.length || this.checkpointDirty)) {
             await this.persist(gen, records.length || repaired ? undefined : nativeBytes)
         }
         if (!active()) return false
         if (first) {
             this.bootstrapped = true
-            this.opts.onPageAvailable?.()
+            if (guardedView) observeConfirmed(() => this.opts.onPageAvailable?.())
+            else this.opts.onPageAvailable?.()
+        }
+        if (repaintNeeded && active()) {
+            // One bounded full reconciliation of the visible page. Never retry
+            // a partial semantic repair or use repaint as an ack requirement.
+            const patch = { type: 'document-replaced' } as const
+            observeConfirmed(() => this.opts.onPatchBatch
+                ? this.opts.onPatchBatch([patch])
+                : this.opts.onPatch(patch))
         }
         return skipTail
     }
@@ -712,20 +1096,25 @@ export class OfflineSession {
      *  actually changed the live overlay — a STALE op (lower version) or our own
      *  echo (equal version) is dropped, so the view never churns or "flips back"
      *  to an older edit. */
-    private applyOpBatch(batch: Op[], capture?: (patch: ViewPatch) => void): void {
+    private applyOpBatch(
+        batch: Op[],
+        capture?: (patch: ViewPatch) => void,
+        notifyPatch = this.opts.onPatch,
+        notifyBatch = this.opts.onPatchBatch,
+    ): void {
         const patches: ViewPatch[] = []
         const publish = () => {
-            if (patches.length) this.opts.onPatchBatch?.(patches.splice(0))
+            if (patches.length) notifyBatch?.(patches.splice(0))
         }
         const emit = capture ?? ((patch: ViewPatch) => {
-            if (this.opts.onPatchBatch && patch.type !== 'shape-edited') {
+            if (notifyBatch && patch.type !== 'shape-edited') {
                 patches.push(patch)
                 return
             }
             // A repair projects a local write using the state at this point in
             // the pull. Apply earlier paints before handing off the repair.
             publish()
-            this.opts.onPatch(patch)
+            notifyPatch(patch)
         })
         const inkOps = batch.filter(
             (o): o is AddItemOp | TombstoneOp => o.op === 'add' || o.op === 'tombstone',

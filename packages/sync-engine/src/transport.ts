@@ -3,6 +3,7 @@
  * a relay in hosted mode, or the in-memory fake for tests/demo).
  */
 
+import type { BrowserPublication, BrowserReceipt } from './browser-publication'
 import type { OverlayDocument } from './types'
 
 export interface DocumentInfo {
@@ -104,6 +105,8 @@ export interface Transport {
         page: string,
         ifSeqGt?: number,
     ): Promise<{ seq: number; opSeq: number; revert?: boolean; complete?: boolean; bytes: Uint8Array } | null>
+    /** Send a previously staged publication, with no legacy fallback. */
+    publishBrowserSave?(doc: string, page: string, save: BrowserPublication): Promise<BrowserReceipt>
     /** Store a whole-page snapshot; returns its seq. */
     putSnapshot?(doc: string, page: string, bytes: Uint8Array): Promise<{ seq: number; merged?: boolean }>
 }

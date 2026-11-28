@@ -8,7 +8,9 @@ import { withFullDurability } from "./sqlite-durability";
 import { publishBackup } from "./backup";
 import { drainAccountPurge, initAccountPurge, isAccountFenced, stageAccountPurge, withAccountBlobWrite } from "./account-purge";
 import {
+  accessSync,
   closeSync,
+  constants as fsConstants,
   fsyncSync,
   openSync,
   mkdirSync,
@@ -22,6 +24,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve, win32 } from "node:path";
 import { tmpdir } from "node:os";
+import { isDeepStrictEqual } from "node:util";
 import type { RecoveryImport } from "./recovery-import";
 import { RmDocument, RootTextAuthorConflict } from "@weft/rm-format";
 import {
@@ -41,6 +44,7 @@ import {
   foldOverlayOps,
   type Op,
   type OverlayDocument,
+  type SnapshotBatch,
 } from "@weft/sync-engine";
 
 /** Author naming author-table index 1 when seeding an empty reconstructed doc
@@ -144,6 +148,21 @@ function sha256hex(bytes: Uint8Array): string {
   hasher.update(bytes);
   return hasher.digest("hex");
 }
+
+export interface SnapshotPublication {
+  id: string;
+  baseSeq: number;
+}
+
+// Keep the guarded endpoint's error response while letting all strict
+// checkpoint reads bypass ordinary snapshot publication's opaque fallback.
+export class SnapshotUnavailable extends CheckpointUnavailableError {}
+
+type SnapshotPublicationResult<T> =
+  | { kind: "accepted"; seq: number; merged: boolean; duplicate: boolean }
+  | { kind: "stale"; currentSeq: number }
+  | { kind: "reused" }
+  | { kind: "blocked"; response: T };
 
 /**
  * The two storage classes. `created` is the user's own irreplaceable output
@@ -293,6 +312,12 @@ export class CloudStore {
                 op BLOB NOT NULL, author TEXT, ts INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS page_ops_page ON page_ops(user_id, doc, page, seq);
+            CREATE TABLE IF NOT EXISTS page_op_batch_receipts (
+                user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
+                batch_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+                first_seq INTEGER NOT NULL, last_seq INTEGER NOT NULL,
+                PRIMARY KEY (user_id, doc, page, batch_id)
+            ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS page_snapshots (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
@@ -311,6 +336,44 @@ export class CloudStore {
                 sha256 TEXT
             );
             CREATE INDEX IF NOT EXISTS page_snapshots_page ON page_snapshots(user_id, doc, page, seq);
+            -- A receipt must outlive snapshot pruning: a browser may restart
+            -- and retry an already accepted upload long after it was pruned.
+            CREATE TABLE IF NOT EXISTS page_snapshot_receipts (
+                user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
+                publication_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+                base_seq INTEGER NOT NULL, seq INTEGER NOT NULL, merged INTEGER NOT NULL,
+                PRIMARY KEY (user_id, doc, page, publication_id)
+            ) WITHOUT ROWID;
+            -- Pruning retains a head. Removing the entire snapshot stream
+            -- ends the page's lifetime and must also remove its receipts.
+            CREATE TRIGGER IF NOT EXISTS page_snapshot_receipts_after_delete
+            AFTER DELETE ON page_snapshots WHEN NOT EXISTS (
+                SELECT 1 FROM page_snapshots
+                WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page
+            ) BEGIN
+                DELETE FROM page_snapshot_receipts
+                WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page;
+            END;
+            -- History pruning retains a page stream. Clear append receipts
+            -- only when both its ops and its snapshots have been removed.
+            CREATE TRIGGER IF NOT EXISTS page_op_batches_after_ops_delete
+            AFTER DELETE ON page_ops WHEN NOT EXISTS (
+                SELECT 1 FROM page_ops WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page
+            ) AND NOT EXISTS (
+                SELECT 1 FROM page_snapshots WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page
+            ) BEGIN
+                DELETE FROM page_op_batch_receipts
+                WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page;
+            END;
+            CREATE TRIGGER IF NOT EXISTS page_op_batches_after_snapshot_delete
+            AFTER DELETE ON page_snapshots WHEN NOT EXISTS (
+                SELECT 1 FROM page_snapshots WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page
+            ) AND NOT EXISTS (
+                SELECT 1 FROM page_ops WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page
+            ) BEGIN
+                DELETE FROM page_op_batch_receipts
+                WHERE user_id=OLD.user_id AND doc=OLD.doc AND page=OLD.page;
+            END;
             -- Truncation floor: the highest op seq retention deleted for a page
             -- (absent/0 = nothing truncated). Persisted explicitly, never derived
             -- from MIN(page_ops.seq), which cannot distinguish "truncated below X"
@@ -1453,6 +1516,133 @@ export class CloudStore {
     ]));
   }
 
+  /** An append receipt survives history truncation and suppresses a retry's
+   * effects before even checking storage quota. */
+  /** A receipt may outlive the HTTP connection. Before SQLite certifies it,
+   * sync any new checkpoint files plus the current dependency and its
+   * directory entries. Do not change the normal publication path. */
+  private publishGuardedPage<T extends { kind: string }>(
+    user: string, doc: string, page: string, write: () => T,
+  ): T {
+    if (this.db.inTransaction) throw new Error("Guarded receipt requires an outer durable transaction");
+    return withFullDurability(this.db, () => this.publishPage(user, doc, page, () => {
+      const result = write();
+      if (result.kind !== "accepted") return result;
+      const staged = new Set(this.stagedPageFiles);
+      const head = this.latestSnapshotRow(user, doc, page);
+      if (head) {
+        const path = this.existingSnapshotPath(head.path);
+        if (!path || statSync(path).size !== head.size) throw new SnapshotUnavailable();
+        staged.add(path);
+      }
+      if (staged.size) {
+        for (const path of staged) this.syncPath(path);
+        this.syncPath(join(this.filesDir, "snapshots"));
+        this.syncPath(this.filesDir);
+        this.syncPath(dirname(this.filesDir));
+      }
+      return result;
+    }));
+  }
+
+  publishOpsOnce(
+    user: string,
+    doc: string,
+    page: string,
+    batchId: string,
+    bytes: Uint8Array,
+    append: () => { firstSeq: number; lastSeq: number },
+    baseSeq?: number,
+  ):
+    | { kind: "accepted"; range: { firstSeq: number; lastSeq: number }; duplicate: boolean }
+    | { kind: "reused" }
+    | { kind: "stale"; currentSeq: number } {
+    const hash = (baseSeq === undefined ? "" : `base:${baseSeq}:`) + sha256hex(bytes);
+    return this.publishGuardedPage(user, doc, page, () => {
+      const key: [string, string, string, string] = [user, doc, page, batchId];
+      const prior = this.db.query<
+        { request_hash: string; first_seq: number; last_seq: number },
+        typeof key
+      >(
+        `SELECT request_hash, first_seq, last_seq FROM page_op_batch_receipts
+         WHERE user_id=? AND doc=? AND page=? AND batch_id=?`,
+      ).get(...key);
+      if (prior) {
+        if (prior.request_hash !== hash) return { kind: "reused" };
+        this.latestSnapshotReference(user, doc, page, true);
+        return { kind: "accepted", range: { firstSeq: prior.first_seq, lastSeq: prior.last_seq }, duplicate: true };
+      }
+      if (baseSeq !== undefined) {
+        const currentSeq = this.latestSnapshotReference(user, doc, page, true)?.seq ?? 0;
+        if (currentSeq !== baseSeq) return { kind: "stale", currentSeq };
+      }
+      const range = append();
+      this.db.run(
+        `INSERT INTO page_op_batch_receipts
+         (user_id, doc, page, batch_id, request_hash, first_seq, last_seq) VALUES (?,?,?,?,?,?,?)`,
+        [...key, hash, range.firstSeq, range.lastSeq],
+      );
+      return { kind: "accepted", range, duplicate: false };
+    });
+  }
+
+  /** Accept a client snapshot and its delivery marker in one publication.
+   * Receipt matching precedes the base check: a retry of an accepted request
+   * is an acknowledgement, even after another writer advanced the page. */
+  publishSnapshot<T>(
+    user: string,
+    doc: string,
+    page: string,
+    bytes: Uint8Array,
+    publication: SnapshotPublication | null,
+    checkStorage: () => T | null,
+    batch?: SnapshotBatch,
+  ): SnapshotPublicationResult<T> {
+    const requestHash = publication ? (batch ? "batch:" : "") + sha256hex(bytes) : null;
+    const publish = publication ? this.publishGuardedPage.bind(this) : this.publishPage.bind(this);
+    return publish(user, doc, page, () => {
+      if (publication) {
+        const receipt = this.db.query<
+          { request_hash: string; base_seq: number; seq: number; merged: number },
+          [string, string, string, string]
+        >(`SELECT request_hash, base_seq, seq, merged FROM page_snapshot_receipts
+           WHERE user_id=? AND doc=? AND page=? AND publication_id=?`)
+          .get(user, doc, page, publication.id);
+        if (receipt) {
+          if (receipt.request_hash !== requestHash || receipt.base_seq !== publication.baseSeq) {
+            return { kind: "reused" };
+          }
+          // The receipt’s own checkpoint may have been pruned; the current
+          // head must still be readable to acknowledge the publication.
+          this.latestSnapshotReference(user, doc, page, true);
+          return { kind: "accepted", seq: receipt.seq, merged: receipt.merged === 1, duplicate: true };
+        }
+        const currentSeq = this.latestSnapshotReference(user, doc, page, true)?.seq ?? 0;
+        if (publication.baseSeq !== currentSeq) return { kind: "stale", currentSeq };
+      }
+
+      const blocked = checkStorage();
+      if (blocked !== null) return { kind: "blocked", response: blocked };
+
+      if (batch) this.appendOps(user, doc, page, batch.deltas, batch.author);
+      // Guarded publications may pin past both existing and newly appended
+      // deltas. Do not acknowledge a checkpoint we could not safely merge.
+      const { seq, merged } = this.putSnapshotMerged(
+        user, doc, page, batch?.snapshot ?? bytes, { requireMerge: publication !== null },
+      );
+      if (publication) {
+        this.db.run(
+          `INSERT INTO page_snapshot_receipts
+             (user_id, doc, page, publication_id, request_hash, base_seq, seq, merged)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [user, doc, page, publication.id, requestHash, publication.baseSeq, seq, merged ? 1 : 0],
+        );
+      }
+      this.recordOpChange(user, doc, page, "web");
+      return { kind: "accepted", seq, merged, duplicate: false };
+    });
+  }
+
   /**
    * Snapshot publication from a CLIENT (the web's PUT /snapshot): union-merge
    * the incoming container with the current reconstruction before storing,
@@ -1465,12 +1655,19 @@ export class CloudStore {
     doc: string,
     page: string,
     container: Uint8Array,
+    { requireMerge = false }: { requireMerge?: boolean } = {},
   ): { seq: number; merged: boolean } {
     const hasBase =
       this.latestSnapshotRow(user, doc, page) !== null ||
       this.latestOpSeq(user, doc, page) > 0;
-    if (!hasBase)
+    if (!hasBase) {
+      if (requireMerge) {
+        const snapshot = decodeSnapshot(container);
+        RmDocument.parse(snapshot.rm);
+        if (!Array.isArray(snapshot.overlay?.shapes)) throw new Error("Invalid snapshot overlay");
+      }
       return { seq: this.putSnapshot(user, doc, page, container), merged: false };
+    }
     let bytes: Uint8Array;
     let merged: boolean;
     try {
@@ -1478,6 +1675,10 @@ export class CloudStore {
       // format merge: an opaque incoming container must not hide storage loss.
       const prev = this.reconstructDevicePage(user, doc, page, true).bytes;
       const snap = decodeSnapshot(container);
+      if (requireMerge && (!prev || Buffer.compare(snap.rm, prev) === 0)) {
+        // The merge fast path otherwise returns these bytes without parsing.
+        RmDocument.parse(snap.rm);
+      }
       // web publishers keep explicit tombstones for every deletion, so an
       // absent item can only mean "never seen" — always re-add ("never").
       const mergedRm = mergeForSnapshot(snap.rm, prev, "never");
@@ -1507,9 +1708,14 @@ export class CloudStore {
       // reads merged=false and never churns.
       // The merge already validated these bytes. Identical drawings cannot
       // add visible content, so avoid decoding them again to prove that.
-      merged = Buffer.compare(snap.rm, mergedRm) !== 0 && contentBeyond(snap.rm, mergedRm);
+      const byId = (shapes: typeof snap.overlay.shapes) =>
+        new Map(shapes.map((shape) => [shape.shapeId, shape]));
+      merged =
+        (Buffer.compare(snap.rm, mergedRm) !== 0 && contentBeyond(snap.rm, mergedRm)) ||
+        !isDeepStrictEqual(byId(snap.overlay.shapes), byId(mergedOverlay.shapes)) ||
+        !isDeepStrictEqual(snap.overlay.tombstones ?? {}, mergedOverlay.tombstones ?? {});
     } catch (error) {
-      if (error instanceof RootTextAuthorConflict || error instanceof CheckpointUnavailableError) throw error;
+      if (requireMerge || error instanceof RootTextAuthorConflict || error instanceof CheckpointUnavailableError) throw error;
       // the snapshot channel is contractually OPAQUE: anything we cannot
       // parse (tests, future formats) stores verbatim, exactly as before —
       // the merge is best-effort protection for real .rm containers
@@ -2649,8 +2855,17 @@ export class CloudStore {
     if (!row) return null;
     const path = this.existingSnapshotPath(row.path);
     if (!path) {
-      if (requireAvailable) throw new CheckpointUnavailableError();
+      if (requireAvailable) throw new SnapshotUnavailable();
       return null;
+    }
+    if (requireAvailable) {
+      try {
+        accessSync(path, fsConstants.R_OK);
+        const stat = statSync(path);
+        if (!stat.isFile() || stat.size !== row.size) throw new SnapshotUnavailable();
+      } catch {
+        throw new SnapshotUnavailable();
+      }
     }
     return {
       seq: row.seq,

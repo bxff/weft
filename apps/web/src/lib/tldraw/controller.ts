@@ -5,6 +5,7 @@
  */
 
 import { libraryCacheScope, readCachedDocumentList } from '../library-cache'
+import { guardedPageScope, watchGuardedPageScope } from '../auth'
 import {
     AssetRecordType,
     createShapeId,
@@ -54,7 +55,7 @@ import {
     RM_SCALE,
     type InkStroke,
 } from '@weft/rm-ink'
-import { RefResolver, remapImagesByUuid, type LiveImage } from '@weft/sync-engine'
+import { nativeTextPlanBasis, RefResolver, remapImagesByUuid, type LiveImage } from '@weft/sync-engine'
 import {
     crdtIdKey,
     type Point,
@@ -65,6 +66,7 @@ import {
     END_MARKER,
     Pen,
     type Line,
+    type Text,
 } from '@weft/rm-format'
 import {
     nodeKindForParagraph,
@@ -88,7 +90,7 @@ import { adoptOrphanAuthor, cachedDocuments, ensureUniqueAuthorUuid, uuidv4 } fr
 import { fetchDataUrl, seedAssetBytes } from '../authedAsset'
 import { getPointsFromDrawSegments } from 'tldraw'
 import { decodeRmPointData } from '@weft/rm-ink'
-import { idb as storage } from '../idb'
+import { guardedReplicaStorage, idb as storage } from '../idb'
 import {
     clearReplicaInUse,
     primaryLockName,
@@ -127,6 +129,9 @@ function overlayShapeType(kind: OverlayShape['kind']): TLShape['type'] {
 
 export interface ControllerOptions {
     transport: Transport
+    // undefined = legacy build; null = guarded but the owner is not known.
+    guardedScope?: string | null
+    revokeGuardedTransport?: () => void
     docId: string
     pageId: string
     clientId: string
@@ -234,6 +239,11 @@ export class StudioController {
     private renderAfterRetry = new Set<() => void>()
     private deviceTextWork: Promise<void> | null = null
     private deviceTextDraft: unknown = undefined
+    private renderedDeviceText: {
+        richText: ReturnType<typeof paragraphsToRichText>
+        nativeBasis: string
+        anchorBasis: Extract<LocalOp, { type: 'edit-root-text' }>
+    } | null = null
     /** Editor store listener unsubscribe. The editor outlives the controller,
      *  so this must be removed on dispose or dead controllers keep reacting to
      *  the next page's edits. */
@@ -248,6 +258,12 @@ export class StudioController {
     private assetUnsub: (() => void) | null = null
     private docListUnsub: (() => void) | null = null
 
+    private guardedScopeBlocked = false
+    private guardedScopeCurrent(): boolean {
+        return this.opts.guardedScope === undefined ||
+            (!this.guardedScopeBlocked && this.opts.guardedScope === guardedPageScope()?.key)
+    }
+
     constructor(private readonly opts: ControllerOptions) {}
 
     /**
@@ -260,7 +276,8 @@ export class StudioController {
     private async electCachePrimary(): Promise<boolean> {
         const locks = (globalThis.navigator as Navigator | undefined)?.locks
         if (!locks) return true
-        const name = primaryLockName(`${this.opts.docId}/${this.opts.pageId}`)
+        const prefix = this.opts.guardedScope ? `guarded-v1/${this.opts.guardedScope}/` : ''
+        const name = primaryLockName(`${prefix}${this.opts.docId}/${this.opts.pageId}`)
         const immediate = await new Promise<boolean>((resolve) => {
             locks
                 .request(name, { ifAvailable: true }, (lock) => {
@@ -335,6 +352,20 @@ export class StudioController {
         )
         this.editor = editor
         this.photoOwner = libraryCacheScope()
+        const scope = this.opts.guardedScope
+        if (scope === null) throw new Error('Sign in to open a guarded notebook')
+        const pageStorage = scope === undefined ? storage : guardedReplicaStorage(scope)
+        if (scope !== undefined) {
+            const fence = () => {
+                if (!this.guardedScopeBlocked && !this.guardedScopeCurrent()) {
+                    this.guardedScopeBlocked = true
+                    this.opts.revokeGuardedTransport?.()
+                    for (const pending of this.loadingNativeImages.values()) pending.abort()
+                }
+            }
+            watchGuardedPageScope(fence, this.replicaUse.signal)
+            fence()
+        }
         // Device + document metadata (geometry convention, template, pdf index).
         // Not awaited: the session opens from the local replica and needs no
         // network. The cached doclist is adopted synchronously (template/pdf rect
@@ -343,7 +374,7 @@ export class StudioController {
         lap('meta-cache')
         const loadDocs = () => {
             void cachedDocuments(this.opts.transport).then((docs) => {
-                if (this.disposed) return
+                if (this.disposed || !this.guardedScopeCurrent()) return
                 this.adoptDocs(docs)
                 if (this.session) this.onMetaChanged?.()
                 lap('doclist (background)')
@@ -368,18 +399,18 @@ export class StudioController {
         }) ?? null
         // mark in-use synchronously so a concurrent app-start sweep can never
         // delete the replica we are about to open
-        try {
-            await useReplica(`${this.opts.docId}/${this.opts.pageId}`, this.replicaUse.signal)
-        } catch (error) {
+        if (scope === undefined) {
+            try {
+                await useReplica(`${this.opts.docId}/${this.opts.pageId}`, this.replicaUse.signal)
+            } catch (error) {
+                if (this.disposed) return
+                throw error
+            }
             if (this.disposed) return
-            throw error
+            markReplicaInUse(this.opts.docId, this.opts.pageId)
+            this.replicaMarkedInUse = true
+            void noteReplicaOpened(this.opts.docId, this.opts.pageId)
         }
-        if (this.disposed) return
-        markReplicaInUse(this.opts.docId, this.opts.pageId)
-        this.replicaMarkedInUse = true
-        // recency bookkeeping, off the open path: replica-sweep LRU index, and
-        // the cloud web-open record (flows into the tablet's lastOpened).
-        void noteReplicaOpened(this.opts.docId, this.opts.pageId)
         void this.recordWebOpen()
         // per-tab author (a duplicated tab mints a fresh identity) + cache-
         // primary election
@@ -390,7 +421,7 @@ export class StudioController {
         if (this.disposed) return
         const primaryAtOpen = cachePrimary || this.pageLockRelease !== null
         this.sessionOpening = OfflineSession.open(
-            storage,
+            pageStorage,
             this.opts.transport,
             this.opts.docId,
             this.opts.pageId,
@@ -399,6 +430,8 @@ export class StudioController {
                 authorUuid: author,
                 // history timeline label; CRDT identity stays authorUuid
                 historyAuthor: 'web',
+                guardedSaves: scope !== undefined,
+                ...(scope !== undefined && { canApplyGuardedRepair: (shape: OverlayShape) => this.canApplyGuardedRepair(shape) }),
                 cachePrimary: primaryAtOpen,
                 adoptOrphanAuthor,
                 onPatch: (patch) => this.onPatches([patch]),
@@ -1467,6 +1500,7 @@ export class StudioController {
     private readonly loadingNativeImages = new Map<TLAssetId, AbortController>()
 
     private loadNativeImage(id: TLAssetId, filename: string, refresh = false): void {
+        if (!this.guardedScopeCurrent()) return
         const scope = libraryCacheScope()
         if (this.photoOwner && this.photoOwner !== scope) return
         this.photoOwner ??= scope
@@ -1483,7 +1517,7 @@ export class StudioController {
         this.loadingNativeImages.set(id, loading)
         const path = `/api/documents/${this.opts.docId}/pages/${this.opts.pageId}/assets/${encodeURIComponent(filename)}`
         const install = (url: string | null) => {
-            if (this.disposed || loading.signal.aborted || !url) return
+            if (this.disposed || !this.guardedScopeCurrent() || loading.signal.aborted || !url) return
             const live = this.editor.getAsset(id)
             if (live?.type === 'image' && live.props.name === filename && live.props.src !== url) {
                 this.remote(() => this.editor.updateAssets([{ ...live, props: { ...live.props, src: url } }]))
@@ -1611,10 +1645,10 @@ export class StudioController {
         return work
     }
 
-    private async applyLocal(ops: LocalOp[], render?: () => void): Promise<void> {
+    private async applyLocal(ops: LocalOp[], render?: () => void, beforeEnqueue?: () => void): Promise<void> {
         if (this.disposed) return
         try {
-            await this.session.apply(ops)
+            await this.session.apply(ops, beforeEnqueue)
         } catch (error) {
             if (!this.disposed) {
                 this.saveFailure = Symbol()
@@ -1887,20 +1921,29 @@ export class StudioController {
         return this.trackCommand(this.applyRootText(edit))
     }
 
-    private async applyRootText(edit: Omit<Extract<LocalOp, { type: 'edit-root-text' }>, 'type'>): Promise<void> {
+    private async applyRootText(
+        edit: Omit<Extract<LocalOp, { type: 'edit-root-text' }>, 'type'>,
+        basis?: Extract<LocalOp, { type: 'edit-root-text' }>,
+        beforeEnqueue?: () => void,
+    ): Promise<void> {
         if (this.disposed) return
-        // Project edits against their original anchor offsets before
-        // applying the text change that will reflow the scene.
-        if (this.debounce) clearTimeout(this.debounce)
-        await this.ensureFont()
-        if (this.disposed) return
-        this.editor.store._flushHistory()
-        await this.flush()
-        if (this.disposed) return
-        await this.applyLocal([{ type: 'edit-root-text', ...edit }], () => {
-            this.requestSceneRebuild()
-            this.onMetaChanged?.()
-        })
+        const op = this.session.captureRootTextEdit({ type: 'edit-root-text', ...edit }, basis)
+        try {
+            // Project edits against their original anchor offsets before
+            // applying the text change that will reflow the scene.
+            if (this.debounce) clearTimeout(this.debounce)
+            await this.ensureFont()
+            if (this.disposed) return
+            this.editor.store._flushHistory()
+            await this.flush()
+            if (this.disposed) return
+            await this.applyLocal([op], () => {
+                this.requestSceneRebuild()
+                this.onMetaChanged?.()
+            }, beforeEnqueue)
+        } finally {
+            this.session.releaseCapturedRootText(op)
+        }
     }
 
     /** Ordered live char id keys of the root text — the positional map the
@@ -1925,15 +1968,25 @@ export class StudioController {
         // next characters landed at position 0 (" EDITEDHello device...").
         // The commit diff aligns against the live char ids at commit time, so
         // skipping here just defers convergence to the commit/blur.
-        if (this.editor.getEditingShapeId() === id) return
+        if (this.editor.getEditingShapeId() === id || (this.renderedDeviceText && this.deviceTextDraft !== undefined)) return
         const text = this.session.document.tree().rootText
         const existing = this.editor.getShape(id)
+        if (this.renderedDeviceText) this.session.releaseCapturedRootText(this.renderedDeviceText.anchorBasis)
+        this.renderedDeviceText = null
         if (!text) {
             if (existing) this.remote(() => this.editor.deleteShapes([id]))
             return
         }
         const paragraphs = linearizeRootText(text)
         const richText = paragraphsToRichText(paragraphs)
+        if (import.meta.env.PUBLIC_GUARDED_SAVES === '1') {
+            this.renderedDeviceText = {
+                richText,
+                nativeBasis: this.nativeTextSignature(),
+                anchorBasis: this.session.captureRootTextBasis(rootTextCharPositions(text)
+                    .filter(char => !char.deleted).map(char => crdtIdKey(char.id))),
+            }
+        }
         const measure = canvasMeasure()
         const layout = layoutText(paragraphs, text.width, measure)
         // per-LINE hit boxes (shape-space px): the shape is clickable on its
@@ -1987,14 +2040,40 @@ export class StudioController {
         })
     }
 
+    /** The old editor stays visible while a draft is waiting for storage.
+     * A second editing session must not start from that same stale baseline. */
+    canStartDeviceTextEdit(): boolean {
+        return import.meta.env.PUBLIC_GUARDED_SAVES !== '1' || this.deviceTextDraft === undefined
+    }
+
+    private nativeTextSignature(): string {
+        return nativeTextPlanBasis(this.session.document)
+    }
+
+    private nativeTextFence(): () => void {
+        const expected = this.nativeTextSignature()
+        return () => {
+            if (this.nativeTextSignature() !== expected) {
+                throw new Error('This text changed while you were editing. The local draft is still open.')
+            }
+        }
+    }
+
     /** Commit a finished device-text edit (tldraw's TipTap doc): flatten to
      *  lines, diff the text (one insert + one delete range), then align
      *  paragraph styles where the user changed a node KIND. */
     commitDeviceText(richText: unknown): Promise<void> {
+        if (import.meta.env.PUBLIC_GUARDED_SAVES === '1' && this.deviceTextWork) {
+            if (this.deviceTextDraft === richText) return this.deviceTextWork
+            return Promise.reject(new Error('Finish saving the current text before editing it again'))
+        }
         this.deviceTextDraft = richText
         const work = (this.deviceTextWork ?? Promise.resolve()).catch(() => {}).then(async () => {
             await this.commitDeviceTextNow(richText)
-            if (this.deviceTextDraft === richText) this.deviceTextDraft = undefined
+            if (this.deviceTextDraft === richText) {
+                this.deviceTextDraft = undefined
+                if (!this.disposed) this.syncDeviceTextShape()
+            }
         })
         this.deviceTextWork = work
         void work.finally(() => {
@@ -2006,105 +2085,159 @@ export class StudioController {
     private async commitDeviceTextNow(richText: unknown): Promise<void> {
         try {
             const lines = richTextToLines(richText as never)
-            const draft = lines.map((l) => l.text).join('\n')
-            const text = this.session.document.tree().rootText
-            const current = text
-                ? linearizeRootText(text)
-                      .map((p) => p.spans.map((sp) => sp.text).join(''))
-                      .join('\n')
-                : ''
-            if (draft !== current || !text) {
-                const positions = text
-                    ? this.rootTextPositions()
-                    : ([] as { key: string }[])
-                // positions has one entry per VISIBLE code point of `current`
-                // (including the '\n' separators). Compare in code points, not
-                // UTF-16 units, so an emoji/astral char doesn't desync the map
-                // and drop the edit (#79). `current`'s only '\n' are separators.
-                const currentCp = [...current]
-                if (text && positions.length !== currentCp.length) {
-                    throw new Error('Device text position map is out of sync')
-                }
-                // Multi-region diff (Myers): touch ONLY the code points that
-                // changed, leaving untouched '\n' separators matched so their
-                // paragraph style + anchored ink survive an edit that spans two
-                // non-adjacent lines (#78). Each insert anchors after a
-                // surviving code point (never one being deleted).
-                const diff = diffCodePoints(currentCp, [...draft])
-                const deleteKeys = diff.deletes.map((i) => positions[i]!.key)
-                const inserts = diff.inserts.map((ins) => ({
-                    afterKey: ins.after >= 0 ? positions[ins.after]!.key : null,
-                    text: ins.text,
-                }))
-                await this.editRootText({
-                    ...(text ? {} : { create: {} }),
-                    ...(inserts.length ? { inserts } : {}),
-                    ...(deleteKeys.length ? { deleteKeys } : {}),
-                })
+            if (this.renderedDeviceText) {
+                await this.commitGuardedDeviceText(lines, this.renderedDeviceText)
+                return
             }
-            // style pass: apply only where the node KIND differs from the
-            // stored style's kind. The deviceStyle attr (the style the node
-            // was BUILT from, carried through TipTap edits) breaks ties so
-            // BOLD/CHECKBOX/CHECKED survive splits and reorders.
+
+            // Keep the existing default-path save behavior unchanged. Its
+            // older queue format does not support immutable rich edit plans.
+            const text = this.session.document.tree().rootText
+            const current = text ? linearizeRootText(text)
+                .map(p => p.spans.map(span => span.text).join('')).join('\n') : ''
+            const positions = text ? this.rootTextPositions().map(({ key }) => key) : []
+            const edit = this.planDeviceTextContent(current, positions, lines, !!text)
+            if (edit) await this.editRootText(edit)
             const after = this.session.document.tree().rootText
             if (!after) return
-            const paras = linearizeRootText(after)
-            const anchors: string[] = [crdtIdKey(END_MARKER)]
-            for (const c of rootTextCharPositions(after)) {
-                if (c.offset === -1 && !c.deleted) anchors.push(crdtIdKey(c.id))
-            }
-            // xochitl keys EACH paragraph's style to its opener id, which can be
-            // a TOMBSTONED char (restyle-then-retype leaves the old style on the
-            // dead opener — a first-char for para 0, a '\n' for later ones). A
-            // stale style on that shadow OVERRIDES the anchor the web writes to,
-            // so the device renders the wrong style forever even though our own
-            // read agrees with our write (no kind-diff fires). Reconcile every
-            // paragraph's shadow anchors to its target style (device-probed
-            // 2026-07-10/12, PROBE-v1..v4 / PROBE-nonfirst / PROBE-npfix).
-            const shadowsByPara = paragraphStyleShadows(after)
-            const styles: [string, number, number[] | undefined][] = []
-            for (let i = 0; i < Math.min(lines.length, paras.length); i++) {
-                const line = lines[i]!
-                const old = line.deviceStyle ?? paras[i]!.style
-                const write = styleForNodeKind(line.kind, old)
-                const extra = write.extra ? [...write.extra] : undefined
-                if (nodeKindForParagraph(paras[i]!) !== line.kind) {
-                    styles.push([anchors[i]!, write.value, extra])
-                }
-                // Reconcile this paragraph's shadow anchors. Fires independent of
-                // the kind-diff above, since the device can disagree with our
-                // anchor read while our model looks self-consistent.
-                for (const key of shadowsByPara.get(i) ?? []) {
-                    const cur = after.styles.get(key)
-                    // compare VALUE and the style EXTRA (size/indent): H2/H3 are
-                    // value 1 + a size extra, so a shadow already at value 1
-                    // (plain) still needs the extra or it renders as plain.
-                    const curExtra = cur?.extra
-                    const expected = paragraphStyleWriteExtra(curExtra, write.extra)
-                    const differs =
-                        !cur ||
-                        cur.value !== write.value ||
-                        (curExtra?.length ?? 0) !== (expected?.length ?? 0) ||
-                        (expected?.some((b, j) => b !== curExtra![j]) ?? false)
-                    if (differs) styles.push([key, write.value, extra])
-                }
-            }
+            const styles = this.planDeviceParagraphStyles(after, lines)
             if (styles.length) await this.editRootText({ styles })
-            // marks pass: reconcile inline bold/italic (rm format codes 1-4)
-            await this.commitDeviceTextMarks(lines)
+            const formatted = this.session.document.tree().rootText
+            if (!formatted) return
+            const marks = this.planDeviceInlineMarks(formatted, lines, false)
+            if (marks) await this.editRootText(marks)
         } catch (err) {
+            if (!this.disposed) this.opts.onStatus?.({ state: 'error', detail: String(err) })
             console.error('weft: device-text commit failed:', err)
             throw err
         }
-        // Replay the render that was skipped while the caret was active.
-        if (!this.disposed) this.syncDeviceTextShape()
     }
 
-    /** Make the stored format codes produce the editor's bold/italic runs.
-     *  No-op when they already match (planFormatEdits is idempotent). */
-    private async commitDeviceTextMarks(lines: RichLine[]): Promise<void> {
-        const text = this.session.document.tree().rootText
-        if (!text) return
+    private async commitGuardedDeviceText(
+        lines: RichLine[],
+        basis: NonNullable<StudioController['renderedDeviceText']>,
+    ): Promise<void> {
+        const before = richTextToLines(basis.richText)
+        const current = before.map(line => line.text).join('\n')
+        const concurrent = basis.nativeBasis !== this.nativeTextSignature()
+        const plain = (lines: RichLine[]) => lines.every(line => line.kind === 'paragraph' &&
+            (line.deviceStyle === null || line.deviceStyle === 0 || line.deviceStyle === 1) &&
+            line.indentLevel === undefined && line.segments.every(segment => !segment.bold && !segment.italic))
+        const compatible = plain(before) && plain(lines) && before.length === lines.length
+        if (concurrent && JSON.stringify(before) === JSON.stringify(lines)) return
+        if (concurrent && !compatible) {
+            throw new Error('This text changed on the tablet while you were editing. The local draft was kept.')
+        }
+        const edit = this.planDeviceTextContent(current, basis.anchorBasis.deleteKeys!, lines,
+            !!this.session.document.rootTextBlock)
+        // A compatible plain change doesn't replace tablet paragraph or
+        // inline styles, and needs no extra planning clone.
+        if (compatible) {
+            if (edit) await this.applyRootText(edit, basis.anchorBasis)
+            return
+        }
+        const fence = this.nativeTextFence()
+        const plan = this.session.planRootText((doc, add) => {
+            if (edit) add({ type: 'edit-root-text', ...edit }, basis.anchorBasis)
+            const text = doc.rootTextBlock?.text
+            if (!text || linearizeRootText(text).length !== lines.length) {
+                throw new Error('Could not plan native paragraphs against the pinned edit')
+            }
+            const styles = this.planDeviceParagraphStyles(text, lines)
+            if (styles.length) add({ type: 'edit-root-text', styles })
+            const marks = this.planDeviceInlineMarks(text, lines, true)
+            if (marks) add({ type: 'edit-root-text', ...marks })
+        })
+        if (!plan.length) return
+        try {
+            if (this.debounce) clearTimeout(this.debounce)
+            await this.ensureFont()
+            if (this.disposed) return
+            this.editor.store._flushHistory()
+            await this.flush()
+            if (this.disposed) return
+            await this.applyLocal(plan, () => {
+                this.requestSceneRebuild()
+                this.onMetaChanged?.()
+            }, fence)
+        } finally {
+            for (const edit of plan) this.session.releaseCapturedRootText(edit)
+        }
+    }
+
+    private planDeviceTextContent(current: string, positions: readonly string[], lines: RichLine[], hasText: boolean) {
+        const draft = lines.map(line => line.text).join('\n')
+        if (draft === current && hasText) return null
+        // Native IDs are indexed by code points, including newline separators.
+        // Untouched separators keep their paragraph style and anchored ink.
+        const currentCp = [...current]
+        if (positions.length !== currentCp.length) throw new Error('Device text position map is out of sync')
+        const diff = diffCodePoints(currentCp, [...draft])
+        const deleteKeys = diff.deletes.map(index => positions[index]!)
+        const inserts = diff.inserts.map(ins => ({
+            afterKey: ins.after >= 0 ? positions[ins.after]! : null,
+            text: ins.text,
+        }))
+        return {
+            ...(hasText ? {} : { create: {} }),
+            ...(inserts.length ? { inserts } : {}),
+            ...(deleteKeys.length ? { deleteKeys } : {}),
+        }
+    }
+
+    private planDeviceParagraphStyles(
+        after: Text,
+        lines: RichLine[],
+    ) {
+        const paras = linearizeRootText(after)
+        const anchors: string[] = [crdtIdKey(END_MARKER)]
+        for (const c of rootTextCharPositions(after)) {
+            if (c.offset === -1 && !c.deleted) anchors.push(crdtIdKey(c.id))
+        }
+        // xochitl keys EACH paragraph's style to its opener id, which can be
+        // a TOMBSTONED char (restyle-then-retype leaves the old style on the
+        // dead opener — a first-char for para 0, a '\n' for later ones). A
+        // stale style on that shadow OVERRIDES the anchor the web writes to,
+        // so the device renders the wrong style forever even though our own
+        // read agrees with our write (no kind-diff fires). Reconcile every
+        // paragraph's shadow anchors to its target style (device-probed
+        // 2026-07-10/12, PROBE-v1..v4 / PROBE-nonfirst / PROBE-npfix).
+        const shadowsByPara = paragraphStyleShadows(after)
+        const styles: [string, number, number[] | undefined][] = []
+        for (let i = 0; i < Math.min(lines.length, paras.length); i++) {
+            const line = lines[i]!
+            const old = line.deviceStyle ?? paras[i]!.style
+            const write = styleForNodeKind(line.kind, old)
+            const extra = write.extra ? [...write.extra] : undefined
+            if (nodeKindForParagraph(paras[i]!) !== line.kind) {
+                styles.push([anchors[i]!, write.value, extra])
+            }
+            // Reconcile this paragraph's shadow anchors. Fires independent of
+            // the kind-diff above, since the device can disagree with our
+            // anchor read while our model looks self-consistent.
+            for (const key of shadowsByPara.get(i) ?? []) {
+                const cur = after.styles.get(key)
+                // compare VALUE and the style EXTRA (size/indent): H2/H3 are
+                // value 1 + a size extra, so a shadow already at value 1
+                // (plain) still needs the extra or it renders as plain.
+                const curExtra = cur?.extra
+                const expected = paragraphStyleWriteExtra(curExtra, write.extra)
+                const differs =
+                    !cur ||
+                    cur.value !== write.value ||
+                    (curExtra?.length ?? 0) !== (expected?.length ?? 0) ||
+                    (expected?.some((b, j) => b !== curExtra![j]) ?? false)
+                if (differs) styles.push([key, write.value, extra])
+            }
+        }
+        return styles
+    }
+
+    private planDeviceInlineMarks(
+        text: Text,
+        lines: RichLine[],
+        strict: boolean,
+    ) {
         const target: { bold: boolean; italic: boolean }[] = []
         for (const line of lines) {
             for (const seg of line.segments) {
@@ -2118,11 +2251,12 @@ export class StudioController {
         }
         const plan = planFormatEdits(text, target)
         if (!plan) {
+            if (strict) throw new Error('Could not plan native marks against the pinned edit')
             console.error('weft: mark reconcile skipped (text diff not settled)')
             return
         }
         if (plan.deleteIds.length === 0 && plan.inserts.length === 0) return
-        await this.editRootText({
+        const edits = {
             ...(plan.deleteIds.length
                 ? { deleteKeys: plan.deleteIds.map((id) => crdtIdKey(id)) }
                 : {}),
@@ -2134,7 +2268,8 @@ export class StudioController {
                       })),
                   }
                 : {}),
-        })
+        }
+        return edits
     }
 
     // ----- layers -----
@@ -3217,7 +3352,7 @@ export class StudioController {
         if (this.disposed) return
         // A peer update can land before the SDK delivers this frame's user
         // changes. Record those edits before resolving their display gaps.
-        if (this.browserOrderTies.size) this.editor.store._flushHistory()
+        if (this.opts.guardedScope !== undefined || this.browserOrderTies.size) this.editor.store._flushHistory()
         let inkChanged = false
         let visibilityChanged = false
         let orderChanged = false
@@ -3384,6 +3519,18 @@ export class StudioController {
             if (orderChanged) this.applyBrowserOrderTies()
             if (visibilityChanged) this.applyLayerVisibility()
         }), { history: 'ignore' })
+    }
+
+    private canApplyGuardedRepair(basis: OverlayShape): boolean {
+        if (this.disposed || !this.session || !this.guardedScopeCurrent()) return false
+        // The SDK listener is frame-batched. An edit can be visible before
+        // pendingShapeIds is populated, or before the engine can stage it.
+        this.editor.store._flushHistory()
+        if (this.hasUnprojectedShape(basis.shapeId) || this.editor.getEditingShapeId() === basis.shapeId) return false
+        const live = this.editor.getShape(basis.shapeId as TLShapeId)
+        const props = browserOverlayProps(basis) as { richText?: unknown } | null
+        return live?.type === 'text' && props?.richText !== undefined &&
+            JSON.stringify(canonicalRichText(live.props.richText)) === JSON.stringify(canonicalRichText(props.richText))
     }
 
     /** ABCD -> ABC: apply the inverse edit to the live text shape. */
