@@ -17,7 +17,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BelowFloorError, CloudStore, HistoryCheckpointError } from "../src/store";
+import { BelowFloorError, CloudStore, CheckpointUnavailableError } from "../src/store";
 import { startCloud, type CloudServer } from "../src/server";
 import { Pen, PenColor, RmDocument, crdtId } from "@weft/rm-format";
 import { polylineToPoints, type Xy } from "@weft/rm-ink/pure";
@@ -580,8 +580,8 @@ test("missing or corrupt history checkpoint refuses reads, reverts and trimming 
     const checkpoint = readFileSync(path);
     unlinkSync(path);
 
-    expect(() => s.stateAt(USER, D, P, head)).toThrow(HistoryCheckpointError);
-    expect(() => s.compact(USER, D, P, { keepAll: false, keepRecentOps: 5 })).toThrow(HistoryCheckpointError);
+    expect(() => s.stateAt(USER, D, P, head)).toThrow(CheckpointUnavailableError);
+    expect(() => s.compact(USER, D, P, { keepAll: false, keepRecentOps: 5 })).toThrow(CheckpointUnavailableError);
     expect((await call(`/at?seq=${head}`)).status).toBe(503);
     expect((await call("/revert", { toSeq: head })).status).toBe(503);
     expect((await call("/revert", { toSnapshot: snapSeq })).status).toBe(503);
@@ -602,7 +602,7 @@ test("missing or corrupt history checkpoint refuses reads, reverts and trimming 
     changed[shape] = 0x53; // "shape:" -> "Shape:"; valid JSON, same byte count.
     expect(decodeSnapshot(changed).rm).toEqual(decodeSnapshot(checkpoint).rm);
     writeFileSync(path, changed);
-    expect(() => s.compact(USER, D, P)).toThrow(HistoryCheckpointError);
+    expect(() => s.compact(USER, D, P)).toThrow(CheckpointUnavailableError);
     expect(s.historyPoints(USER, D, P, 100)).toEqual(points);
     expect(s.opsSince(USER, D, P, 0)).toEqual(ops);
     expect(s.truncationFloor(USER, D, P)).toBe(initialFloor);
@@ -651,4 +651,59 @@ test("history does not replace a known missing zero-op checkpoint with an older 
   const retry = await fetch(`${base}/api/documents/${doc}/pages/${page}/at?seq=0`, { headers: h() });
   expect(retry.status).toBe(200);
   expect(liveLines(decodeSnapshot(new Uint8Array(await retry.arrayBuffer())).rm)).toBe(1);
+});
+
+test("browser bootstrap and publish distinguish a lost checkpoint from fresh or opaque snapshots", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "weft-live-checkpoint-"));
+  const relay = startCloud({ port: 0, db: join(dir, "t.db") });
+  const s = relay.store;
+  const db = (s as unknown as { db: import("bun:sqlite").Database }).db;
+  const call = (page: string, body?: Uint8Array) =>
+    fetch(`http://localhost:${relay.port}/api/documents/${D}/pages/${page}/snapshot`, body
+      ? { method: "PUT", headers: h(), body: Buffer.from(body) }
+      : { headers: h() });
+  const empty = encodeSnapshot(RmDocument.empty(WEB_AUTHOR).serialize(), { shapes: [] });
+  const opaque = new TextEncoder().encode("synthetic-future-snapshot-format");
+  try {
+    expect((await call("untouched")).status).toBe(204);
+    expect((await call("untouched", empty)).status).toBe(200);
+    expect((await call("untouched", opaque)).status).toBe(200);
+    expect(new Uint8Array(await (await call("untouched")).arrayBuffer())).toEqual(opaque);
+    for (const count of [0, 3]) {
+      const page = `lost-${count}`;
+      const author = "bbbbbbbb-0000-4000-b000-000000000002";
+      const native = RmDocument.empty(author);
+      native.appendLine({
+        kind: "line", color: PenColor.BLACK, tool: Pen.FINELINER_1,
+        points: polylineToPoints([{ x: 400, y: 410 }, { x: 450, y: 470 }], { width: 40 }),
+        thicknessScale: 1, startingLength: 0, timestamp: crdtId(0, 0), moveId: null,
+      }, { authorUuid: author });
+      const checkpoint = encodeSnapshot(native.serialize(), { shapes: [] });
+      const seq = s.putSnapshot(USER, D, page, checkpoint);
+      const e = editor(s, USER, D, page);
+      for (let i = 0; i < count; i++) e.edit();
+      const expected = s.stateAt(USER, D, page, s.latestOpSeq(USER, D, page));
+      expect(liveLines(expected.rm)).toBe(count + 1);
+      const points = s.historyPoints(USER, D, page, 100);
+      const { path } = db.query<{ path: string }, [number]>("SELECT path FROM page_snapshots WHERE seq=?").get(seq)!;
+      const bytes = readFileSync(path);
+      unlinkSync(path);
+      try {
+        expect((await call(page)).status).toBe(503);
+        expect((await call(page, empty)).status).toBe(503);
+        expect((await call(page, opaque)).status).toBe(503);
+        expect(s.historyPoints(USER, D, page, 100)).toEqual(points);
+      } finally {
+        writeFileSync(path, bytes);
+      }
+      const retry = await call(page);
+      expect(retry.status).toBe(200);
+      expect(new Uint8Array(await retry.arrayBuffer())).toEqual(checkpoint);
+      expect((await call(page, empty)).status).toBe(200);
+      expect(liveLines(s.stateAt(USER, D, page, s.latestOpSeq(USER, D, page)).rm)).toBe(count + 1);
+    }
+  } finally {
+    relay.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
