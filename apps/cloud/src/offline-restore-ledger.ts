@@ -1,7 +1,7 @@
 /** Offline prototype. Not a production migration or deletion endpoint. */
 import { Database } from "bun:sqlite";
-import { closeSync, cpSync, existsSync, fsyncSync, lstatSync, mkdtempSync, openSync, readdirSync, realpathSync, renameSync, rmSync } from "node:fs";
-import { dirname, isAbsolute, join, relative } from "node:path";
+import { closeSync, cpSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, renameSync, rmSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { drainAccountPurge, initAccountPurge, stageAccountPurge } from "./account-purge";
 
 export const RESTORE_LEDGER_KEY = "restore-deletion-ledger-id";
@@ -62,19 +62,34 @@ export function recordDeletion(path: string, deployment: string, user: string) {
 export function restoreWithLedger(options: {
   archive: string; finalDir: string; ledger: string; deployment: string; minimumGeneration: number;
 }) {
-  const { finalDir, deployment, minimumGeneration } = options;
-  if (!deployment || !Number.isSafeInteger(minimumGeneration) || minimumGeneration < 0 || existsSync(finalDir)) {
+  const { deployment, minimumGeneration } = options;
+  const destination = resolve(options.finalDir);
+  const parent = realpathSync(dirname(destination));
+  const finalDir = join(parent, basename(destination));
+  if (!deployment || !Number.isSafeInteger(minimumGeneration) || minimumGeneration < 0 ||
+      lstatSync(finalDir, { throwIfNoEntry: false })) {
     throw new Error("Restore requires identity, trusted generation and a fresh destination");
   }
+  if (!lstatSync(options.archive).isDirectory()) throw new Error("Expected a published backup directory");
   const archive = realpathSync(options.archive);
-  const parent = realpathSync(dirname(finalDir));
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-\d{6}$/.test(basename(archive))) {
+    throw new Error("Expected a published backup directory");
+  }
+  if (inside(finalDir, archive) || inside(archive, finalDir)) {
+    throw new Error("Restore destination cannot overlap the source archive");
+  }
   if (!lstatSync(options.ledger, { throwIfNoEntry: false })?.isFile()) throw new Error("An existing external ledger is required");
   const ledgerPath = realpathSync(options.ledger);
   if (inside(ledgerPath, archive) || inside(ledgerPath, finalDir)) throw new Error("Ledger must be outside the restore image");
-  const staging = mkdtempSync(join(parent, ".weft-restore-"));
+
+  // Cooperating restore commands cannot race to publish the same destination.
+  const claim = join(parent, ".weft-restore-lock-" + basename(finalDir));
+  mkdirSync(claim, { mode: 0o700 });
+  let staging: string | undefined;
   let ledger: Database | undefined;
-  const path = join(staging, "relay.db");
   try {
+    staging = mkdtempSync(join(parent, ".weft-restore-"));
+    const path = join(staging, "relay.db");
     // External ledger reads are one SQLite snapshot. No live primary should exist during restore.
     const external = new Database(ledgerPath, { readonly: true });
     ledger = external;
@@ -114,12 +129,13 @@ export function restoreWithLedger(options: {
       db.run("PRAGMA wal_checkpoint(TRUNCATE)");
     } finally { db.close(); }
     checkTree(staging, true);
-    if (existsSync(finalDir)) throw new Error("Restore destination appeared during validation");
+    if (lstatSync(finalDir, { throwIfNoEntry: false })) throw new Error("Restore destination appeared during validation");
     renameSync(staging, finalDir);
     syncPath(parent);
     return join(finalDir, "relay.db");
   } finally {
     ledger?.close();
-    rmSync(staging, { recursive: true, force: true });
+    if (staging) rmSync(staging, { recursive: true, force: true });
+    rmSync(claim, { recursive: true, force: true });
   }
 }

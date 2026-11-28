@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { CloudStore } from "../src/store";
@@ -74,7 +74,38 @@ test("offline restore fails closed without its current external deletion ledger"
     expect(existsSync(dest)).toBe(false);
     expect(readdirSync(root).some(name=>name.startsWith(".weft-restore-"))).toBe(false);
 
-    const restored = restoreWithLedger(guard);
+    const command = new URL("../src/restore-backup.ts", import.meta.url).pathname;
+    const input = ["--archive", archive, "--destination", dest, "--ledger", ledger,
+      "--deployment", deployment, "--minimum-generation", String(generation)];
+    const run = (...args: string[]) => Bun.spawnSync([process.execPath, command, ...args], {
+      env: {}, stdout: "pipe", stderr: "pipe",
+    });
+    const fail = (args: string[], reason: string) => {
+      const result = run(...args);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr.toString()).toContain(reason);
+      expect(existsSync(dest)).toBe(false);
+    };
+    fail([], "every restore input");
+    fail(input, "offline confirmation");
+    fail(["--offline", ...input, "--ledger", join(ext, "absent.sqlite")], "existing external ledger");
+    fail(["--offline", ...input, "--ledger", foreign], "Wrong ledger identity");
+    fail(["--offline", ...input, "--ledger", stale], "Ledger is stale");
+    fail(["--offline", ...input, "--archive", legacyArchive], "Wrong archive identity");
+    fail(["--offline", ...input, "--destination", join(archive, "nested")], "cannot overlap");
+    fail(["--offline", ...input, "--minimum-generation", "1.1"], "every restore input");
+
+    const originalDatabase = readFileSync(join(archive, "weft.db"));
+    const originalLive = readFileSync(join(root, "live.db"));
+    const output = run("--offline", ...input);
+    expect(output.exitCode).toBe(0);
+    const restored = output.stdout.toString().trim();
+    expect(restored).toEndWith("/promoted/relay.db");
+    expect(readFileSync(join(archive, "weft.db"))).toEqual(originalDatabase);
+    expect(readFileSync(join(root, "live.db"))).toEqual(originalLive);
+    const repeated = run("--offline", ...input);
+    expect(repeated.exitCode).toBe(1);
+    expect(repeated.stderr.toString()).toContain("fresh destination");
     const relay = startCloud({port:0,db:restored});
     try {
       const list = (token:string) => fetch("http://localhost:"+relay.port+"/api/documents",{headers:{"x-device-token":token}});
