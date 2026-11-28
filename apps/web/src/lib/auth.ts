@@ -11,6 +11,8 @@ const DEV_KEY = 'weft-dev-user'
 const LEGACY_SELFHOST_JWT_KEY = 'weft-selfhost-jwt'
 const selfHostSessionKey = (relay: string) => `weft-selfhost-jwt/${encodeURIComponent(relay)}`
 let pendingSelfHostLogin: AbortController | undefined
+const accountSelectionChanged = 'weft-account-selection-changed'
+const notifyAccountSelection = () => window.dispatchEvent(new Event(accountSelectionChanged))
 
 /**
  * The slice of Clerk the app touches. @clerk/clerk-js satisfies it
@@ -85,6 +87,7 @@ export async function selfHostLogin(password: string): Promise<void> {
         // The old key has no recorded issuer and cannot be safely migrated.
         localStorage.removeItem(LEGACY_SELFHOST_JWT_KEY)
         localStorage.removeItem(DEV_KEY)
+        notifyAccountSelection()
     } catch (error) {
         if (signal.aborted) throw new Error('The account or relay changed during sign-in')
         throw error
@@ -264,6 +267,7 @@ async function refreshClerkToken(): Promise<string | null> {
         if (selected !== account && (selected !== selectedBefore ||
             (selected !== null && selected !== priorAccount && !signInChangedSession))) return null
         localStorage.setItem(key, account)
+        if (selected !== account) notifyAccountSelection()
         if (signInChangedSession) forgetClerkSignIn(key)
         cachedToken = { value, publishableKey, relay }
         try {
@@ -331,6 +335,28 @@ export function guardedPageScope(): GuardedPageScope | null {
     if (provider && (!account || `clerk:${clerkSelectionSubject(account)}` !== owner)) return null
     const key = encodeURIComponent(JSON.stringify([relay, provider, owner, ...(account ? [account] : [])]))
     return { relay, owner, clerkAccount: account, key }
+}
+
+/** React even to provider callbacks and writes in this document (storage events
+ * only reach other documents). Subscription and abort lifetime belong to the view. */
+export function watchGuardedPageScope(onChange: () => void, signal: AbortSignal): void {
+    if (signal.aborted) return
+    watchRelayChange(onChange, signal)
+    window.addEventListener('storage', onChange, { signal })
+    window.addEventListener(accountSelectionChanged, onChange, { signal })
+    const provider = clerkPublishableKey()
+    const listen = (clerk: ClerkLike | null) => {
+        if (!clerk || signal.aborted || clerkPublishableKey() !== provider) return
+        const remove = clerk.addListener(() => { if (!signal.aborted) onChange() })
+        if (remove) signal.addEventListener('abort', remove, { once: true })
+        // SDK state may have changed while initialization was pending.
+        onChange()
+    }
+    if (provider) {
+        const clerk = activeClerk()
+        if (clerk) listen(clerk)
+        else void ensureClerk().then(listen).catch(() => {})
+    }
 }
 
 export async function guardedBearer(scope: GuardedPageScope): Promise<string | null> {
@@ -437,6 +463,7 @@ export async function signOut(): Promise<void> {
         const owner = activeClerk()?.user?.id
         if (selectedClerkToken() || (owner && clerkSelectionSubject(localStorage.getItem(key)) === owner)) {
             localStorage.setItem(key, '')
+            notifyAccountSelection()
         }
     }
     // Drop the previous account's cached doc list: it's plaintext localStorage
@@ -469,5 +496,6 @@ export async function signOut(): Promise<void> {
         localStorage.removeItem(DEV_KEY)
         localStorage.removeItem(selfHostSession)
         localStorage.removeItem(LEGACY_SELFHOST_JWT_KEY)
+        notifyAccountSelection()
     }
 }

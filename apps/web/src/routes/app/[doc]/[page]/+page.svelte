@@ -5,7 +5,7 @@
     import Editor from '$lib/Editor.svelte'
     import { cachedDocuments, resetTransport, transport } from '$lib/transport'
     import { readCachedDocumentList } from '$lib/library-cache'
-    import { getAuthToken, guardedPageScope, isKnownSignedOut, localPreferenceOwner } from '$lib/auth'
+    import { getAuthToken, guardedPageScope, isKnownSignedOut, localPreferenceOwner, watchGuardedPageScope } from '$lib/auth'
     import { connection, watchRelayChange } from '$lib/settings'
     import type { DocumentInfo } from '@weft/sync-engine'
 
@@ -21,7 +21,8 @@
     })
 
     const guarded = import.meta.env.PUBLIC_GUARDED_SAVES === '1'
-    let guardedOwner: string | null = null
+    let guardedOwner = $state<string | null>(null)
+    let guardedChecked = $state(false)
     let guardedReloadRequired = $state(false)
     let notebookRelay: string | null = null
     let notebookOwner: string | null = null
@@ -30,10 +31,11 @@
     let reconnectRequired = $state(false)
 
     function checkNotebookScope(): boolean {
-        if (guarded && guardedOwner && guardedPageScope()?.key !== guardedOwner) {
+        if (guarded && !guardedReloadRequired && guardedOwner && guardedPageScope()?.key !== guardedOwner) {
             // A mounted guarded editor never changes account in place. Preserve
             // its journal under the original scope and require a fresh open.
             guardedReloadRequired = true
+            resetTransport()
         }
         if (guardedReloadRequired) return true
         if (notebookOwner !== null) {
@@ -71,8 +73,11 @@
         notebookOwner = localPreferenceOwner()
         guardedOwner = guarded ? guardedPageScope()?.key ?? null : null
         const listener = new AbortController()
-        watchRelayChange(checkNotebookScope, listener.signal)
-        window.addEventListener('storage', checkNotebookScope, { signal: listener.signal })
+        if (guarded) watchGuardedPageScope(checkNotebookScope, listener.signal)
+        else {
+            watchRelayChange(checkNotebookScope, listener.signal)
+            window.addEventListener('storage', checkNotebookScope, { signal: listener.signal })
+        }
         // Also fence ordinary links that the browser may follow without a
         // SvelteKit navigation intent, such as a full same-origin load.
         window.addEventListener('click', (event) => {
@@ -84,8 +89,11 @@
         void getAuthToken().then(() => {
             if (listener.signal.aborted || notebookRelay !== connection().cloudUrl) return
             notebookOwner ??= localPreferenceOwner()
+            if (guarded) guardedOwner ??= guardedPageScope()?.key ?? null
             checkNotebookScope()
-        }).catch(() => {})
+        }).catch(() => {}).finally(() => {
+            if (!listener.signal.aborted) guardedChecked = true
+        })
         return () => listener.abort()
     })
 
@@ -121,7 +129,8 @@
 
 <!-- top-center: tldraw owns top-left (toolbar) and top-right (style panel) -->
 <div
-    inert={scopeChanged || guardedReloadRequired}
+    inert={scopeChanged || guardedReloadRequired || (guarded && !guardedOwner)}
+    class:invisible={guarded && (!guardedOwner || guardedReloadRequired)}
     class="fixed top-2 left-1/2 z-[250] flex max-w-[calc(100vw-16px)] -translate-x-1/2 flex-nowrap items-center gap-2 overflow-hidden border px-3 py-1.5 whitespace-nowrap sm:gap-3"
     style="border-color: var(--gray-3); border-radius: var(--radius); background: color-mix(in srgb, var(--gray-1) 96%, transparent)"
 >
@@ -158,10 +167,12 @@
      editor (its mount is the dominant open cost). Editor persists across
      navigations and swaps only the page content on docId/pageId change. -->
 <div inert={scopeChanged || reconnectRequired || guardedReloadRequired} class:invisible={scopeChanged || reconnectRequired || guardedReloadRequired}>
-    <Editor {docId} {pageId} />
+    {#if !guarded || guardedOwner}
+        <Editor {docId} {pageId} />
+    {/if}
 </div>
 
-{#if scopeChanged || reconnectRequired || guardedReloadRequired}
+{#if scopeChanged || reconnectRequired || guardedReloadRequired || (guarded && !guardedOwner)}
     <p role="status"
         class="fixed top-14 left-1/2 z-[250] w-max max-w-[calc(100vw-2rem)] -translate-x-1/2 border px-3 py-2 text-sm"
         style="border-color: var(--gray-3); background: var(--gray-1)"
@@ -173,6 +184,13 @@
             Notebook paused because the connection changed.
             <a class="underline" href="/settings" target="_blank" rel="noopener">Open Settings in a new tab</a>
             to select the original relay and account.
+        {:else if guarded && !guardedOwner}
+            {#if guardedChecked}
+                Sign in to open this notebook.
+                <a class="underline" href="/settings">Open Settings</a>
+            {:else}
+                Checking notebook account…
+            {/if}
         {:else}
             Original connection selected. Switch pages or return to Files to reopen this notebook.
         {/if}

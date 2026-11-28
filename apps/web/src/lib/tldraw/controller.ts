@@ -5,8 +5,7 @@
  */
 
 import { libraryCacheScope, readCachedDocumentList } from '../library-cache'
-import { guardedPageScope } from '../auth'
-import { watchRelayChange } from '../settings'
+import { guardedPageScope, watchGuardedPageScope } from '../auth'
 import {
     AssetRecordType,
     createShapeId,
@@ -364,8 +363,7 @@ export class StudioController {
                     for (const pending of this.loadingNativeImages.values()) pending.abort()
                 }
             }
-            watchRelayChange(fence, this.replicaUse.signal)
-            window.addEventListener('storage', fence, { signal: this.replicaUse.signal })
+            watchGuardedPageScope(fence, this.replicaUse.signal)
             fence()
         }
         // Device + document metadata (geometry convention, template, pdf index).
