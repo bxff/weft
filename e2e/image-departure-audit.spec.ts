@@ -8,19 +8,11 @@ const url='/api/documents/88888888-8888-4888-a888-888888888888/pages/99999999-99
 for(const depart of ['stay','depart','failed']) test('native image '+depart,async({page})=>{
  const base='/api/documents/'+doc+'/pages/'+crypto.randomUUID()
  const from=base.replace('/api/documents','/app').replace('/pages','')
- await page.goto(from)
- await expect(page.getByTestId('sync-status')).toHaveText('synced')
- await page.evaluate(async()=>{
-  const c=(window as any).__weftController
-  await c.createLayer('Drop origin')
-  await c.createLayer('Other layer')
-  c.setActiveLayer(c.listLayers().find((l:any)=>l.label==='Drop origin').ref)
- })
- const original=await page.evaluateHandle(()=> (window as any).__weftController)
  let commit!: (value:{status:number,url:string})=>void
  const uploaded=new Promise<{status:number,url:string}>(r=>commit=r)
  let release!:()=>void
  const wait=new Promise<void>(r=>release=r)
+ // Install interception before the editor starts its setup requests.
  await page.route('**'+base+'/assets/*',async route=>{
   if(route.request().method()!=='PUT') return route.continue()
   if(depart==='failed') {
@@ -33,6 +25,15 @@ for(const depart of ['stay','depart','failed']) test('native image '+depart,asyn
   await wait
   await route.fulfill({response}).catch(()=>{})
  })
+ await page.goto(from)
+ await expect(page.getByTestId('sync-status')).toHaveText('synced')
+ await page.evaluate(async()=>{
+  const c=(window as any).__weftController
+  await c.createLayer('Drop origin')
+  await c.createLayer('Other layer')
+  c.setActiveLayer(c.listLayers().find((l:any)=>l.label==='Drop origin').ref)
+ })
+ const original=await page.evaluateHandle(()=> (window as any).__weftController)
  const dataTransfer=await page.evaluateHandle(async u=>{
   const blob=await (await fetch(u)).blob()
   const dt=new DataTransfer()
