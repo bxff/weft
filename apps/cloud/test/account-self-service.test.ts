@@ -331,3 +331,45 @@ test("worker finishes explicit fenced deletion after a lost provider response wi
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a configured hosted relay does not expose export or deletion without the opt-in", async () => {
+  const env = {
+    HOST: "127.0.0.1",
+    CLERK_SECRET_KEY: fixtureSecret,
+    WEFT_ACCOUNT_AUTHORIZED_ORIGIN: "https://synthetic.example",
+    WEFT_ACCOUNT_PROVIDER_ISSUER: issuer,
+    WEFT_ACCOUNT_SELF_SERVICE: undefined,
+    WEFT_PASSWORD: undefined,
+  };
+  const previous = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
+  const apply = (values: Record<string, string | undefined>) => {
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+  apply(env);
+  let deletions = 0;
+  const relay = startCloud({
+    port: 0,
+    testClerk: { jwtKey, deleteUser: async () => { deletions++; } },
+  });
+  try {
+    relay.store.putDocuments(owner, '{"documents":[{"id":"synthetic"}]}');
+    const base = "http://127.0.0.1:" + relay.port;
+    const headers = { authorization: "Bearer " + jwt(owner, 0), "content-type": "application/json" };
+    const health = await fetch(base + "/api/health");
+    expect(await health.json()).toMatchObject({ authMode: "clerk", accountSelfService: false });
+    expect((await fetch(base + "/api/account/export", { method: "POST", headers })).status).toBe(404);
+    expect((await fetch(base + "/api/account", {
+      method: "DELETE", headers, body: '{"confirm":"DELETE"}',
+    })).status).toBe(404);
+    expect(await (await fetch(base + "/api/documents", { headers })).json())
+      .toEqual({ documents: [{ id: "synthetic" }] });
+    expect(relay.store.isAccountFenced(owner)).toBe(false);
+    expect(deletions).toBe(0);
+  } finally {
+    relay.stop();
+    apply(previous);
+  }
+});
