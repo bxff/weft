@@ -119,9 +119,10 @@ test('styled wrap changes at the measured edge and avoids splitting Unicode fall
         seen.push(ch)
         return (font.startsWith('700 ') ? 32 : 24) / INK_PER_PX
     }).paras
-    expect(seen).toEqual(['😀', '😀'])
+    expect(seen).toEqual(['😀', 'e\u0301', '😀'])
     expect(result!.lineStarts).toEqual([0, 2, 4])
     expectInk(result!.lineWidthsInk[0]!, 32)
+    expectInk(result!.lineWidthsInk[1]!, 24)
     expectInk(result!.lineWidthsInk[2]!, 24)
 })
 

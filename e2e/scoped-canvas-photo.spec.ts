@@ -193,3 +193,26 @@ test('an older response from another tab cannot overwrite newer durable bytes', 
     await expect.poll(() => cachedBytes(page)).toEqual([...bytes(newer)])
     await peer.close()
 })
+
+test('starts a cold canvas photo request after one scoped cache lookup', async ({ page }) => {
+    await page.addInitScript(() => {
+        const get = IDBObjectStore.prototype.get
+        const state = { lookups: 0 }
+        Object.assign(window, { photoCacheReadProbe: state })
+        IDBObjectStore.prototype.get = function (key) {
+            if (typeof key === 'string' && key.startsWith('assetmeta/')) state.lookups++
+            return get.call(this, key)
+        }
+    })
+    let lookupsAtRequest: number | undefined
+    await page.route(`**${photo}`, async (route) => {
+        if (lookupsAtRequest === undefined) {
+            lookupsAtRequest = await page.evaluate(() =>
+                (window as unknown as { photoCacheReadProbe: { lookups: number } }).photoCacheReadProbe.lookups,
+            )
+        }
+        await route.continue()
+    })
+    await start(page)
+    expect(lookupsAtRequest).toBe(1)
+})

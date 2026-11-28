@@ -28,6 +28,7 @@ import {
     DEVICE_TEXT_LEFT_MARGIN_INK,
     MARKER_BASELINE_DROP_INK,
     MARKER_RIGHT_GAP_INK,
+    graphemePaintSpans,
     layoutText,
     type LayoutParagraph,
     metricsFor,
@@ -36,7 +37,7 @@ import {
 import { richTextToLines, styleForNodeKind, type RichLine } from './device-text-richtext'
 
 interface SvgRun {
-    /** per-glyph x positions (ink, absolute within the column). */
+    /** One x per single-unit glyph, or one x for an entire shaped cluster. */
     xs: number[]
     text: string
     bold: boolean
@@ -131,6 +132,7 @@ export function buildSvgLines(richText: TLRichText, widthInk: number): SvgLine[]
         const xStart = m.indentInk > 0 ? m.indentInk : DEVICE_TEXT_LEFT_MARGIN_INK
         const full = line.text
         const marker = markerText(style, counters, m.marker?.glyph)
+        const paintSpans = graphemePaintSpans(spans)
         para.lineStarts.forEach((start, li) => {
             const end =
                 li + 1 < para.lineStarts.length ? para.lineStarts[li + 1]! : full.length
@@ -139,7 +141,7 @@ export function buildSvgLines(richText: TLRichText, widthInk: number): SvgLine[]
             const runs: SvgRun[] = []
             let pen = xStart
             let pos = 0
-            for (const seg of spans) {
+            for (const seg of paintSpans) {
                 const s0 = pos
                 const s1 = pos + seg.text.length
                 pos = s1
@@ -149,11 +151,23 @@ export function buildSvgLines(richText: TLRichText, widthInk: number): SvgLine[]
                 const text = seg.text.slice(a - s0, b - s0)
                 const span = { bold: seg.bold, italic: seg.italic }
                 const pp = penPositions(text, m, span, measure)
-                runs.push({
-                    xs: pp.xs.map((x) => pen + x),
-                    text,
-                    bold: seg.bold,
-                    italic: seg.italic,
+                let plain: SvgRun | undefined
+                pp.units.forEach((unit, j) => {
+                    const x = pen + pp.xs[j]!
+                    // An SVG position inside a cluster (including surrogate
+                    // pairs) can break shaping or position following glyphs
+                    // incorrectly. Give the cluster a separate text chunk.
+                    if (unit.length > 1) {
+                        runs.push({ ...span, text: unit, xs: [x] })
+                        plain = undefined
+                    } else {
+                        if (!plain) {
+                            plain = { ...span, text: '', xs: [] }
+                            runs.push(plain)
+                        }
+                        plain.text += unit
+                        plain.xs.push(x)
+                    }
                 })
                 pen += pp.end
             }
