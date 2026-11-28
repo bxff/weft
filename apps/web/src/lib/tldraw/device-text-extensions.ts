@@ -1,3 +1,4 @@
+import { parseDeviceIndent } from './device-text-richtext'
 import {
     commands,
     Extension,
@@ -25,6 +26,15 @@ const DeviceStyleAttr = Extension.create({
             {
                 types: ['paragraph', 'heading'],
                 attributes: {
+                    deviceIndent: {
+                        default: null,
+                        parseHTML: (el: HTMLElement) =>
+                            parseDeviceIndent(el.getAttribute('data-device-indent')) ?? null,
+                        renderHTML: (attrs: Record<string, unknown>) =>
+                            attrs.deviceIndent == null
+                                ? {}
+                                : { 'data-device-indent': String(attrs.deviceIndent) },
+                    },
                     deviceStyle: {
                         default: null,
                         parseHTML: (el: HTMLElement) => {

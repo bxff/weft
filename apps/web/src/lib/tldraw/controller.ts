@@ -71,6 +71,7 @@ import {
     paragraphsToRichText,
     richTextToLines,
     styleForNodeKind,
+    isNativeIndentedPlain,
     type RichLine,
 } from './device-text-richtext'
 import { arrowRecordProps, restoreArrowLinks, unpackArrowProps } from './arrow-persistence'
@@ -2066,9 +2067,14 @@ export class StudioController {
             for (let i = 0; i < Math.min(lines.length, paras.length); i++) {
                 const line = lines[i]!
                 const old = line.deviceStyle ?? paras[i]!.style
-                const write = styleForNodeKind(line.kind, old)
+                const prior = paras[i]!
+                const sameKind = nodeKindForParagraph(prior) === line.kind
+                const write = sameKind && line.kind === 'bullet2' &&
+                    isNativeIndentedPlain(prior.style, prior.indentLevel)
+                    ? { value: prior.style }
+                    : styleForNodeKind(line.kind, old)
                 const extra = write.extra ? [...write.extra] : undefined
-                if (nodeKindForParagraph(paras[i]!) !== line.kind) {
+                if (!sameKind) {
                     styles.push([anchors[i]!, write.value, extra])
                 }
                 // Reconcile this paragraph's shadow anchors. Fires independent of

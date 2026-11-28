@@ -34,7 +34,7 @@ import {
     metricsFor,
     penPositions,
 } from './text-metrics'
-import { richTextToLines, styleForNodeKind, type RichLine } from './device-text-richtext'
+import { isNativeIndentedPlain, richTextToLines, styleForNodeKind, type RichLine } from './device-text-richtext'
 
 interface SvgRun {
     /** One x per single-unit glyph, or one x for an entire shaped cluster. */
@@ -76,7 +76,10 @@ const STRIKE_WIDTH_INK = 1.59375
 
 /** Resolve the effective style code (paragraph kinds carry it in deviceStyle). */
 function effectiveStyle(line: RichLine): number {
-    if (line.kind === 'paragraph' && line.deviceStyle !== null) return line.deviceStyle
+    if (line.deviceStyle !== null && (line.kind === 'paragraph' ||
+        (line.kind === 'bullet2' && isNativeIndentedPlain(line.deviceStyle, line.indentLevel)))) {
+        return line.deviceStyle
+    }
     return styleForNodeKind(line.kind, line.deviceStyle).value
 }
 
