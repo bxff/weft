@@ -35,8 +35,10 @@
     <main>
         <div>
             <p class="my-4 first:mt-0 last:mb-0" style="color: var(--gray-e)">
-                weft syncs reMarkable notebooks with a browser editor. Handwriting, typed text
-                and PDF annotations sync both ways. You can restore an earlier version of a page.
+                weft syncs reMarkable notebooks with a browser editor using the tablet&rsquo;s
+                native notebook files. Handwriting, typed text, images and PDF annotations sync
+                both ways. If you add strokes on both sides, weft merges them. You can restore
+                an earlier version of a page.
             </p>
 
             <!-- Primary action: sign in (hosted). -->
