@@ -141,6 +141,31 @@ test('a missing retained snapshot does not route a tablet download to a stale le
     }
 })
 
+test('checkpoint disappearance between native and overlay reads aborts ordinary publication', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'weft-checkpoint-disappears-'))
+    const dbPath = join(dir, 'relay.sqlite')
+    const snapshots = join(dbPath + '-files', 'snapshots')
+    const store = new CloudStore(dbPath)
+    const inspector = new Database(dbPath)
+    try {
+        const original = encodeSnapshot(blank, overlay)
+        const seq = store.putSnapshot(...PAGE_KEY, original)
+        const path = join(snapshots, readdirSync(snapshots)[0]!)
+        const read = store.overlayAtHead.bind(store)
+        spyOn(store, 'overlayAtHead').mockImplementation((...args) => {
+            rmSync(path)
+            return read(...args)
+        })
+        expect(() => store.putSnapshotMerged(...PAGE_KEY, encodeSnapshot(tabletFile(), overlay)))
+            .toThrow('required checkpoint is unavailable')
+        expect(inspector.query("SELECT seq FROM page_snapshots").all()).toEqual([{ seq }])
+        expect(readdirSync(snapshots)).toEqual([])
+    } finally {
+        inspector.close()
+        rmSync(dir, { recursive: true, force: true })
+    }
+})
+
 const cases = [
     ['legacy RM', 'rm', 'PUT', 'page.changed'],
     ['first ops batch', 'ops', 'POST', 'ops.appended'],

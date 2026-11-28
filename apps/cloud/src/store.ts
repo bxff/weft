@@ -154,9 +154,9 @@ export interface SnapshotPublication {
   baseSeq: number;
 }
 
-export class SnapshotUnavailable extends Error {
-  constructor() { super("Current page checkpoint is unavailable"); }
-}
+// Keep the guarded endpoint's error response while letting all strict
+// checkpoint reads bypass ordinary snapshot publication's opaque fallback.
+export class SnapshotUnavailable extends CheckpointUnavailableError {}
 
 type SnapshotPublicationResult<T> =
   | { kind: "accepted"; seq: number; merged: boolean; duplicate: boolean }
