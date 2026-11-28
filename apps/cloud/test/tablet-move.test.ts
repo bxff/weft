@@ -27,7 +27,10 @@ beforeAll(() => {
     base = `http://localhost:${server.port}`
     t = new HttpTransport({ baseUrl: base, getAuthToken: () => 'dev:movetester' })
 })
-afterAll(() => server.stop())
+afterAll(() => {
+    t.close()
+    server.stop()
+})
 
 const auth = { authorization: 'Bearer dev:movetester' }
 

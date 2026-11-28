@@ -202,7 +202,7 @@
             <p class="my-2 text-[13px] text-gray-7">Checking whether you're signed in…</p>
         {:else if !token && !userLabel && clerkEnabled()}
             <div class="my-3 flex items-center gap-3">
-                <button type="button" class="wf-cta" onclick={() => void signIn()}>Sign in</button>
+                <button type="button" class="wf-cta" onclick={() => void signIn()}>Sign in or sign up</button>
                 <span class="text-[13px]" style="color: var(--gray-7)">
                     to fill in <code class="wf-icode">&lt;TOKEN&gt;</code> with your account token.
                 </span>
