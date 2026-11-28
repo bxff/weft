@@ -783,11 +783,11 @@ test.each(['checkpoint file', 'checkpoint directory'] as const)(
             },
             body: Buffer.from(bytes),
         })
-        const store = cloud.store as unknown as { syncRecoveryPath(path: string): void }
-        const sync = store.syncRecoveryPath.bind(store)
+        const store = cloud.store as unknown as { syncPath(path: string): void }
+        const sync = store.syncPath.bind(store)
         const before = readdirSync(files)
         let triggered = false
-        store.syncRecoveryPath = path => {
+        store.syncPath = path => {
             if ((fault === 'checkpoint directory' && path === files) ||
                 (fault === 'checkpoint file' && path.startsWith(files + '/'))) {
                 triggered = true

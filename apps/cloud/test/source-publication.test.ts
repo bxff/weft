@@ -12,7 +12,7 @@ const cold = new Uint8Array(512).fill(2);
 const next = new Uint8Array(1024).fill(9);
 const raw = (server: CloudServer) => server.store as unknown as {
   db: Database;
-  syncRecoveryPath(path: string): void;
+  syncPath(path: string): void;
 };
 
 async function withRelay(run: (relay: {
@@ -60,6 +60,14 @@ test.each(["ENOSPC", "EDQUOT", "insert", "evict"] as const)(
     expect(new Uint8Array(await original.arrayBuffer())).toEqual(old);
     const originalFiles = readdirSync(dir).sort();
 
+    const db = raw(server()).db;
+    const synchronous = () => db.query("PRAGMA synchronous").values();
+    db.run("PRAGMA synchronous = EXTRA");
+    const rejected = await put(server(), "hot", new Uint8Array(next.length + 1));
+    expect(rejected.status).toBe(507);
+    expect(await rejected.json()).toMatchObject({ reason: "quota", class: "sources" });
+    expect(synchronous()).toEqual([[3]]);
+
     const capacity = failure === "ENOSPC" || failure === "EDQUOT";
     if (!capacity) {
       // Fail the replacement after its bytes are staged, or the victim
@@ -70,14 +78,17 @@ test.each(["ENOSPC", "EDQUOT", "insert", "evict"] as const)(
         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;
       `);
     } else {
-      const sync = raw(server()).syncRecoveryPath.bind(server().store);
-      raw(server()).syncRecoveryPath = (path) => {
+      const sync = raw(server()).syncPath.bind(server().store);
+      raw(server()).syncPath = (path) => {
+        expect(db.inTransaction).toBe(true);
+        expect(synchronous()).toEqual([[2]]);
         if (path === dir) throw Object.assign(new Error("injected directory barrier failure"), { code: failure });
         sync(path);
       };
     }
     const failed = await put(server(), "hot", next);
     expect(failed.status).toBe(capacity ? 507 : 500);
+    expect(synchronous()).toEqual([[3]]);
     if (capacity) {
       expect(failed.headers.get("access-control-allow-origin")).toBe("*");
       expect(await failed.json()).toMatchObject({ reason: "capacity" });
@@ -200,8 +211,8 @@ test.each(["before-commit", "after-commit"] as const)(
         throw Error("test failed to kill paused relay");
       }
       if (${phase === "before-commit"}) {
-        const sync = relay.store.syncRecoveryPath.bind(relay.store);
-        relay.store.syncRecoveryPath = (path) => {
+        const sync = relay.store.syncPath.bind(relay.store);
+        relay.store.syncPath = (path) => {
           sync(path);
           if (path === ${JSON.stringify(dir)}) pause();
         };

@@ -11,15 +11,19 @@
 //! startup reconcile finishes; later checks are hours apart.
 
 use std::path::Path;
+#[cfg(feature = "legacy-relay-updates")]
 use std::time::Duration;
 
 use crate::cloud::CloudConfig;
 
+#[cfg(feature = "legacy-relay-updates")]
 const FIRST_CHECK: Duration = Duration::from_secs(2 * 60);
+#[cfg(feature = "legacy-relay-updates")]
 /// Matches the reconcile rhythm (~10 min): deploys reach every tablet within
 /// minutes; steady-state cost is one 304 header per check.
 const CHECK_EVERY: Duration = Duration::from_secs(10 * 60);
 
+#[cfg(feature = "legacy-relay-updates")]
 pub fn spawn(config: CloudConfig) {
     tokio::spawn(async move {
         let client = reqwest::Client::new();

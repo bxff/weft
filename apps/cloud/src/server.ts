@@ -7,6 +7,7 @@
 
 import {
   BelowFloorError,
+  CheckpointUnavailableError,
   CloudStore,
   SnapshotUnavailable,
   type SnapshotPublication,
@@ -474,6 +475,15 @@ export function startCloud(
   /** Watermark check for a storage-growing write; null = allowed. Runs before
    *  the per-user quota so a capacity refusal reports reason:"capacity", never
    *  misread as the user's own quota. */
+  const newAccountWatermark = (total?: number): boolean =>
+    CAPACITY_BYTES > 0 && (total ?? store.totalUsageBytes()) >= CAPACITY_BYTES * 0.8;
+  const newAccountPause = (): Response => {
+    counters.capacity++;
+    return json({
+      error: "the beta is at capacity for new accounts — please try again later",
+      reason: "capacity",
+    }, 503);
+  };
   const atCapacity = (uid: string): Response | null => {
     if (CAPACITY_BYTES <= 0) return null;
     const total = store.totalUsageBytes();
@@ -488,17 +498,7 @@ export function startCloud(
         507,
       );
     }
-    if (total >= CAPACITY_BYTES * 0.8 && store.usageTotal(uid) === 0) {
-      counters.capacity++;
-      return json(
-        {
-          error:
-            "the beta is at capacity for new accounts — please try again later",
-          reason: "capacity",
-        },
-        503,
-      );
-    }
+    if (newAccountWatermark(total) && store.usageTotal(uid) === 0) return newAccountPause();
     return null;
   };
   /** Guards for every storage-growing write, in order: selective-sync
@@ -674,6 +674,7 @@ export function startCloud(
         const email = typeof body.email === "string" ? body.email.trim() : "";
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
           return json({ error: "enter a valid email address" }, 400);
+        if (newAccountWatermark()) return newAccountPause();
         // Existing account? Point them at sign-in instead of minting a new
         // invitation — Clerk happily invites already-registered emails, and
         // the stray invitation then sits "pending" in the dashboard forever
@@ -690,6 +691,8 @@ export function startCloud(
             409,
           );
         }
+        // Usage may have crossed the watermark while the user lookup ran.
+        if (newAccountWatermark()) return newAccountPause();
         const r = await fetch("https://api.clerk.com/v1/invitations", {
           method: "POST",
           headers: {
@@ -887,6 +890,12 @@ export function startCloud(
           return json({ error: "pairing requires sign-in" }, 403);
         }
         const body = (await req.json().catch(() => ({}))) as { label?: string };
+        // Existing device enrollment can predate the account's first
+        // counted content, or outlive an empty/rotated notebook library.
+        if (CAPACITY_BYTES > 0 && store.usageTotal(user) === 0 && !store.hasPairedDevice(user)) {
+          const gate = atCapacity(user);
+          if (gate) return gate;
+        }
         const token = store.mintDeviceToken(user, body.label ?? "tablet");
         return json({ token });
       }
@@ -1161,7 +1170,12 @@ export function startCloud(
           // seed the empty first page (a valid .rm v6) so the daemon's page
           // pull writes a real first page, not a 404
           const bytes = RmDocument.empty(crypto.randomUUID()).serialize();
+          const gate = storageGuard(user, bytes.length);
+          if (gate) return gate;
           store.putPage(user, docId, pageId, "", bytes, "web-new");
+        } else {
+          const gate = atCapacity(user);
+          if (gate) return gate;
         }
         store.mergeDocuments(user, JSON.stringify({ documents: [doc] }), null);
         emit(user, { type: "doc.list.changed" });
@@ -2043,7 +2057,7 @@ export function startCloud(
                 400,
               );
             }
-            const bytes = store.getSnapshotBytes(user, doc, page, snapSeq);
+            const bytes = store.getSnapshotBytes(user, doc, page, snapSeq, true);
             if (!bytes) {
               return json(
                 { error: "snapshot not found (it may have been pruned)" },
@@ -2267,6 +2281,10 @@ export function startCloud(
     error(err) {
       if (err instanceof SnapshotUnavailable) {
         return json({ error: "Current page checkpoint is unavailable" }, 503);
+      }
+      if (err instanceof CheckpointUnavailableError) {
+        console.error("weft-cloud: checkpoint unavailable", err.cause);
+        return json({ error: "required checkpoint is unavailable; try again after it is restored" }, 503);
       }
       if (err instanceof RootTextAuthorConflict) {
         // A legacy tablet treats 409 as permission to fetch a different page.
