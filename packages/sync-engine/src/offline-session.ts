@@ -968,12 +968,17 @@ export class OfflineSession {
             // A replacement paints the final checkpoint and tail together. Keep
             // follow-up repairs separate, after the source shapes are installed.
             const publishReplacement = snap ? this.opts.onPatchBatch : undefined
+            // A guarded receipt tail may contain a native erase followed by a
+            // newer projection of the same semantic shape. Apply both before
+            // deciding to repair, detach, or remove that shape.
+            const hasInk = batch.some(op => op.op === 'add' || op.op === 'tombstone')
+            const auditFolded = !!snap || !!receiptFold && hasInk
             const repairs: ViewPatch[] = []
-            const collectReplacement = snap ? (patch: ViewPatch) => {
+            const collectReplacement = auditFolded ? (patch: ViewPatch) => {
                 if (patch.type === 'shape-edited') repairs.push(patch)
                 else if (!publishReplacement) notifyPatch(patch)
             } : undefined
-            const previous = snap && !snap.revert && this.bootstrapped ? this.baseDoc : null
+            const previous = auditFolded && !snap?.revert && this.bootstrapped ? this.baseDoc : null
             if (snap && replacement && replacementDoc) {
                 const { rm, overlay } = replacement
                 this.baseDoc = replacementDoc
@@ -988,14 +993,14 @@ export class OfflineSession {
             const snapshotBase = snap ? this.baseDoc : null
             // A single-patch subscriber also observes the individual changes since
             // this checkpoint. Compare ink after the tail has established ownership.
-            const priorInk = snap && !publishReplacement && batch.some(op => op.op === 'add' || op.op === 'tombstone')
+            const priorInk = auditFolded && !publishReplacement && hasInk
                 ? snapshotKnownState(this.baseDoc) : null
             if (records.length) {
                 this.applyOpBatch(batch, collectReplacement, notifyPatch, notifyBatch)
                 this.opCursor = records[records.length - 1]!.seq
             }
             const replayedInk = snapshotBase && snapshotBase !== this.baseDoc
-            repaired = snap ? this.runAudit(collectReplacement, {
+            repaired = auditFolded ? this.runAudit(collectReplacement, {
                 previous: replayedInk ? snapshotBase : previous,
                 beforeSnapshot: replayedInk ? previous : null,
             }) : false
@@ -1008,8 +1013,10 @@ export class OfflineSession {
                 const patch = { type: 'document-replaced' } as const
                 if (publishReplacement) notifyBatch?.([patch])
                 else notifyPatch(patch)
-                for (const repair of repairs) notifyPatch(repair)
             }
+            // Apply semantic edits only after the guarded view has observed
+            // every other patch from the same authoritative state.
+            for (const repair of repairs) notifyPatch(repair)
         } catch (error) {
             if (prior) {
                 this.baseDoc = prior.baseDoc
@@ -1021,6 +1028,7 @@ export class OfflineSession {
             throw error
         }
         receiptFold?.complete()
+        let repaintNeeded = false
         const observeConfirmed = (callback: () => void) => {
             try {
                 callback()
@@ -1029,6 +1037,7 @@ export class OfflineSession {
                 // stop its exact checkpoint and journal retirement. Exceptions
                 // from view code can embed note text; don't report their detail.
                 this.reportFailure('codec', 'ViewPatch', 'Guarded view observer failed')
+                repaintNeeded = true
             }
         }
         for (const callback of notifications) observeConfirmed(callback)
@@ -1041,6 +1050,14 @@ export class OfflineSession {
             this.bootstrapped = true
             if (receiptFold) observeConfirmed(() => this.opts.onPageAvailable?.())
             else this.opts.onPageAvailable?.()
+        }
+        if (repaintNeeded && active()) {
+            // One bounded full reconciliation of the visible page. Never retry
+            // a partial semantic repair or use repaint as an ack requirement.
+            const patch = { type: 'document-replaced' } as const
+            observeConfirmed(() => this.opts.onPatchBatch
+                ? this.opts.onPatchBatch([patch])
+                : this.opts.onPatch(patch))
         }
         return skipTail
     }

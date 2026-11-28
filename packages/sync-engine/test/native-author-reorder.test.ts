@@ -5,6 +5,10 @@ import { FakeDaemon } from '../src/fake-daemon'
 import { MemoryStorage } from '../src/storage'
 import { decodePublicationBytes, type BrowserPublication, type BrowserReceipt } from '../src/browser-publication'
 import { decodeSnapshot, decodeSnapshotBatch, encodeSnapshot } from '../src/snapshot'
+import { applyOps, type LocalOp } from '../src/apply-ops'
+import { encodeOp } from '../src/ops'
+import type { OverlayDocument, ViewPatch } from '../src/types'
+import { polylineToPoints } from '@weft/rm-ink/pure'
 
 const A = 'aaaaaaaa-0000-4000-a000-000000000001'
 const B = 'bbbbbbbb-0000-4000-a000-000000000002'
@@ -61,15 +65,22 @@ class GuardedDaemon extends FakeDaemon {
         this.requests.push(req)
         const previous = this.receipts.get(req.id)
         if (previous) return previous
-        if (req.kind !== 'snapshot') throw new Error('expected a native text snapshot')
         await this.beforeSave?.()
         const head = await this.getSnapshot(doc, page)
         if (head?.seq !== req.baseSeq) return { kind: 'stale' }
-        const receipt = { kind: 'snapshot' as const, ...await this.putSnapshot(doc, page, decodeSnapshotBatch(decodePublicationBytes(req.payload)).snapshot) }
+        const receipt = req.kind === 'snapshot'
+            ? { kind: 'snapshot' as const, ...await this.putSnapshot(doc, page, decodeSnapshotBatch(decodePublicationBytes(req.payload)).snapshot) }
+            : await this.acceptOps(doc, page, req.payload)
         this.receipts.set(req.id, receipt)
         this.accepted.push(req)
         await this.afterSave?.()
         return receipt
+    }
+
+    private async acceptOps(doc: string, page: string, payload: string) {
+        const { batch } = JSON.parse(payload) as { batch: { ops: string[]; author: string } }
+        const { lastSeq } = await this.appendOps(doc, page, batch.ops.map(decodePublicationBytes), batch.author)
+        return { kind: 'ops' as const, lastSeq }
     }
 }
 
@@ -362,10 +373,18 @@ test('a view observer exception cannot prevent atomic local retirement of an acc
     daemon.subscribe = () => () => {}
     await seed(daemon, native(A, 'A'))
     let crashes = 0
+    let visible = ''
     const reports: string[] = []
     let session = await OfflineSession.open(storage, daemon, 'd', 'p', {
         authorUuid: C, clientId: 'editor', guardedSaves: true,
-        onPatch: () => { if (daemon.accepted.length) { crashes++; throw new Error('Synthetic view failure with note text: AB') } },
+        onPatch: patch => {
+            if (!daemon.accepted.length || patch.type !== 'document-replaced') return
+            if (!crashes) {
+                crashes++
+                throw new Error('Synthetic view failure with note text: AB')
+            }
+            visible = text(session.document)
+        },
         onFailure: report => reports.push(report.message),
     })
     try {
@@ -373,6 +392,7 @@ test('a view observer exception cannot prevent atomic local retirement of an acc
         await session.apply([{ type: 'edit-root-text', inserts: [{ afterKey: firstKey(session.document), text: 'B' }] }])
         await session.reconcile()
         expect(crashes).toBe(1)
+        expect(visible).toBe('AB')
         expect(reports).toEqual(['Guarded view observer failed'])
         expect(daemon.requests).toHaveLength(1)
         expect(session.pendingCount).toBe(0)
@@ -384,3 +404,65 @@ test('a view observer exception cannot prevent atomic local retirement of an acc
         session.dispose()
     }
 })
+
+for (const replacedInSameTail of [false, true]) {
+    test(`guarded receipt resolves glyph repair against the final folded overlay (replaced=${replacedInSameTail})`, async () => {
+        const daemon = new GuardedDaemon()
+        daemon.subscribe = () => () => {}
+        const id = 'shape:glyphs'
+        const base = RmDocument.empty(A)
+        const initial: LocalOp = {
+            type: 'upsert-shape',
+            shape: { shapeId: id, kind: 'text', props: { text: 'ABCD' }, x: 0, y: 0, rotation: 0, renderRevision: 'old', version: { actor: A, ts: 1 } },
+            parts: [...'ABCD'].map((_, glyph) => ({
+                partKey: `glyph:${glyph}`,
+                strokes: [{
+                    points: polylineToPoints([{ x: 10 + glyph * 10, y: 20 }, { x: 10 + glyph * 10, y: 30 }], { width: 40 }),
+                    color: 'black',
+                }],
+            })),
+        }
+        const overlay: OverlayDocument = { shapes: [] }
+        applyOps(base, overlay, [initial], { authorUuid: A })
+        const shape = overlay.shapes[0]!
+        const deleted = shape.rendered[3]!.items[0]!
+        await daemon.putSnapshot('d', 'p', encodeSnapshot(base.serialize(), overlay))
+        const outgoing = { ...initial, shape: { ...initial.shape, shapeId: 'shape:unrelated', kind: 'geo' }, parts: [] }
+        const observations: Array<{ patch: ViewPatch; text: unknown }> = []
+        const session = await OfflineSession.open(new MemoryStorage(), daemon, 'd', 'p', {
+            authorUuid: C, clientId: 'editor', guardedSaves: true,
+            onPatch: patch => {
+                if (patch.type !== 'shape-edited') return
+                const visible = session.currentOverlay.shapes.find(shape => shape.shapeId === id)
+                observations.push({ patch, text: visible?.props })
+            },
+        })
+        try {
+            await session.reconcile()
+            daemon.afterSave = async () => {
+                const blobs = [encodeOp({ op: 'tombstone', id: { author: deleted.authorUuid, clock: deleted.clock } })]
+                if (replacedInSameTail) blobs.push(encodeOp({
+                    op: 'upsert-object', id, objType: 'text', props: { text: 'XBC' },
+                    transform: { x: 0, y: 0, rotation: 0 }, rendered: shape.rendered.slice(0, 3),
+                    version: { actor: B, ts: 2 }, renderRevision: 'new',
+                }))
+                await daemon.appendOps('d', 'p', blobs, B)
+            }
+            await session.apply([outgoing])
+            await session.reconcile()
+            expect(session.pendingCount).toBe(0)
+            expect(daemon.accepted[0]?.kind).toBe('ops')
+            if (replacedInSameTail) {
+                expect(observations).toEqual([])
+                expect(session.currentOverlay.shapes.find(shape => shape.shapeId === id)?.props).toEqual({ text: 'XBC' })
+            } else {
+                expect(observations).toEqual([{
+                    patch: { type: 'shape-edited', shapeId: id, edit: { kind: 'text-truncate-glyphs', removedGlyphIndices: [3] } },
+                    text: { text: 'ABCD' },
+                }])
+            }
+        } finally {
+            session.dispose()
+        }
+    })
+}

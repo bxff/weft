@@ -133,3 +133,30 @@ test('guarded startup does not read or clear an unattributed legacy browser queu
     await expect(nativeText(page)).toHaveText('New owner edit')
     expect(await openLegacy(false)).toBe(legacyBytes)
 })
+
+test('a temporary paint failure recovers the visible page after a guarded save', async ({ page }) => {
+    const here = `/app/${doc}/${crypto.randomUUID()}`
+    await page.goto(here)
+    await expect(page.getByTestId('sync-status')).toHaveText('synced')
+    const expected = 'Repainted without re-saving'
+    await page.evaluate(async value => {
+        const w = window as any
+        const controller = w.__weftController
+        const onPatches = controller.onPatches.bind(controller)
+        controller.onPatches = (patches: Array<{ type: string }>) => {
+            if (patches.some(patch => patch.type === 'document-replaced') && !w.failedReceiptPaint) {
+                w.failedReceiptPaint = true
+                controller.remote(() => controller.editor.deleteShape('shape:device-text'))
+                throw new Error('Synthetic paint stopped midway')
+            }
+            return onPatches(patches)
+        }
+        await controller.editRootText({ create: {}, inserts: [{ afterKey: null, text: value }] })
+        await controller.saveBeforeNavigation()
+    }, expected)
+    await expect.poll(() => page.evaluate(() => (window as any).failedReceiptPaint)).toBe(true)
+    await expect(nativeText(page)).toHaveText(expected)
+    await expect(page.getByTestId('sync-status')).toHaveText('synced')
+    await page.reload()
+    await expect(nativeText(page)).toHaveText(expected)
+})
