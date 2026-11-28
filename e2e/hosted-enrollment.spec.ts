@@ -15,8 +15,9 @@ test('hosted install to real pair, isolated device, capacity and revocation', as
     const contexts = new Set<BrowserContext>()
     const child = spawn(
         join(homedir(), '.bun', 'bin', 'bun'),
-        [fileURLToPath(new URL('../scripts/hosted-enrollment-e2e.ts', import.meta.url)), scratch],
-        { env: {}, stdio: 'ignore' },
+        // An empty environment is not enough: Bun normally loads cwd's dotenv files.
+        ['--no-env-file', fileURLToPath(new URL('../scripts/hosted-enrollment-e2e.ts', import.meta.url)), scratch],
+        { cwd: fileURLToPath(new URL('../', import.meta.url)), env: {}, stdio: 'ignore' },
     )
     const exit = new Promise<true>((resolve) => {
         child.once('close', () => resolve(true))
