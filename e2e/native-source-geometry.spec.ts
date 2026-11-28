@@ -140,25 +140,56 @@ test('packing the accepted photo into a checkpoint leaves its browser move undoa
     const { doc, sheet } = await openNativeImage(page)
     const endpoint = `/api/documents/${doc}/pages/${sheet}`
     const shape = () => page.evaluate(() => {
-        const editor = (window as unknown as { __weftEditor: Editor }).__weftEditor
-        return editor?.getCurrentPageShapes().find(item => item.type === 'image')
+        const editor = (window as unknown as { __weftEditor?: Editor }).__weftEditor
+        const image = editor?.getCurrentPageShapes().find(item => item.type === 'image')
+        if (!editor || image?.type !== 'image') return
+        const transform = editor.getShapePageTransform(image)
+        return {
+            id: image.id, x: image.x, generation: image.meta.weftNativeGeometry,
+            quad: [[0, 0], [image.props.w, 0], [image.props.w, image.props.h], [0, image.props.h]].map(([x, y]) => {
+                const point = transform.applyToPoint({ x: x!, y: y! })
+                return [point.x, point.y]
+            }),
+        }
     })
-    const photo = () => page.request.get(endpoint + '/rm').then(async response =>
-        [...RmDocument.parse(new Uint8Array(await response.body())).tree().walk()].find(([, item]) => item.kind === 'image')?.[1])
-    await expect.poll(shape).toBeTruthy()
-    const original = (await shape())!
+    const authoredQuad = [[0, 200], [100, 200], [100, 300], [0, 300]]
+        .map(([x, y]) => [x! * RM_SCALE, y! * RM_SCALE])
     const movedX = 317.125
-    await page.evaluate(({ id, x }) => {
+    const rotation = 0.31
+    // Independent page-space oracle from the authored native rectangle and commanded pose.
+    const movedQuad = authoredQuad.map(([x, y]) => {
+        const dy = y! - 200 * RM_SCALE
+        return [movedX + x! * Math.cos(rotation) - dy * Math.sin(rotation),
+            200 * RM_SCALE + x! * Math.sin(rotation) + dy * Math.cos(rotation)]
+    })
+    const nativeQuad = async () => {
+        const response = await page.request.get(endpoint + '/rm')
+        const rm = RmDocument.parse(new Uint8Array(await response.body()))
+        const item = [...rm.tree().walk()].find(([, item]) => item.kind === 'image')?.[1]
+        if (item?.kind !== 'image') return
+        return [0, 4, 8, 12].map(i => [item.vertices[i]! * RM_SCALE, item.vertices[i + 1]! * RM_SCALE])
+    }
+    const expectQuad = (read: () => Promise<number[][] | undefined>, expected: number[][], angle: number) =>
+        expect(async () => {
+            const corners = (await read()) ?? []
+            expect(corners).toHaveLength(4)
+            for (const [i, [x, y]] of corners.entries()) {
+                expect(x, `corner ${i} x`).toBeCloseTo(expected[i]![0]!, 3)
+                expect(y, `corner ${i} y`).toBeCloseTo(expected[i]![1]!, 3)
+            }
+            const [a, b] = corners
+            expect(Math.atan2(b![1]! - a![1]!, b![0]! - a![0]!), 'top edge angle').toBeCloseTo(angle, 5)
+        }).toPass({ timeout: 5000 })
+    const browserQuad = async () => (await shape())?.quad
+    await expectQuad(browserQuad, authoredQuad, 0)
+    const original = (await shape())!
+    await page.evaluate(({ id, x, rotation }) => {
         const editor = (window as unknown as { __weftEditor: Editor }).__weftEditor
         editor.focus()
         editor.markHistoryStoppingPoint('move native photo')
-        editor.updateShape({ id, type: 'image', x, rotation: 0.31 })
-    }, { id: original.id, x: movedX })
-    const nativeX = async () => {
-        const item = await photo()
-        return item?.kind === 'image' ? item.vertices[0]! * RM_SCALE : NaN
-    }
-    await expect.poll(nativeX).toBeCloseTo(movedX, 3)
+        editor.updateShape({ id, type: 'image', x, rotation })
+    }, { id: original.id, x: movedX, rotation })
+    await expectQuad(nativeQuad, movedQuad, rotation)
     await expect(page.getByTestId('sync-status')).toHaveText('synced')
     expect((await shape())?.x).toBe(movedX)
     const native = new Uint8Array(await (await page.request.get(endpoint + '/rm')).body())
@@ -166,9 +197,11 @@ test('packing the accepted photo into a checkpoint leaves its browser move undoa
     expect((await page.request.put(endpoint + '/snapshot', { data: Buffer.from(checkpoint) })).ok()).toBe(true)
     // Wait for the browser to apply the float32 round-trip difference.
     await expect.poll(async () => (await shape())?.x).not.toBe(movedX)
-    expect((await shape())?.meta.weftNativeGeometry).toBe(original.meta.weftNativeGeometry)
+    await expectQuad(browserQuad, movedQuad, rotation)
+    expect((await shape())?.generation).toBe(original.generation)
     await page.keyboard.press('ControlOrMeta+z')
-    await expect.poll(nativeX).toBeCloseTo(original.x, 3)
+    await expectQuad(nativeQuad, authoredQuad, 0)
+    await expectQuad(browserQuad, authoredQuad, 0)
 })
 
 test('flushing a different photo keeps Undo behind a deferred tablet change', async ({ page }) => {
