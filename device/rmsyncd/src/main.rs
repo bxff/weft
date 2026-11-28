@@ -8,8 +8,7 @@ mod dbus;
 mod recovery;
 mod server;
 mod store;
-// Keep the atomic-install regression tests, but ship no unsigned update path.
-#[cfg(test)]
+#[cfg(any(test, feature = "legacy-relay-updates"))]
 mod update;
 mod watch;
 
@@ -108,7 +107,12 @@ async fn main() {
     );
     if let Some(config) = cloud::load_config(&cloud_config_path) {
         let state_path = cloud_config_path.with_file_name("cloud-state.json");
+        #[cfg(feature = "legacy-relay-updates")]
+        let update_config = config.clone();
         cloud::spawn(state.clone(), config, state_path);
+        // Keep the legacy relay updater for source/relay builds only.
+        #[cfg(feature = "legacy-relay-updates")]
+        update::spawn(update_config);
     }
 
     // A/B firmware-update survival (opt-in, off until device-verified on a real

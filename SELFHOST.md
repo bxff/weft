@@ -28,20 +28,8 @@ Three screens answer "is everything working":
 3. **Usage counters** — `GET /api/admin/stats` (admin users only): request /
    429 / 507 counters, per-user storage, doc counts.
 
-The desktop installer verifies official tablet binaries with GitHub's
-provenance service. Install [GitHub CLI](https://cli.github.com/) from a
-trusted source and run `gh auth login --hostname github.com` first.
-`weft setup` selects the highest stable tablet release; pass
-`--release tablet-vMAJOR.MINOR.PATCH` to request a specific verified release.
-If no such release is published or verification fails, setup stops before
-installing anything. For a source build you trust, pass `--local-daemon PATH`
-explicitly; the relay is not an installer download source.
-
-Update newer tablets by rerunning the desktop installer. They do not
-auto-install binaries from the relay: a checksum sent by the same server is
-not release authorization. Older installed builds are unchanged; migrate them
-by reinstalling from a trusted release or local build. The legacy relay
-release settings are not needed for newer builds.
+To offer tablet updates from your own relay, set `WEFT_DAEMON_RELEASE` and,
+if needed, `WEFT_DAEMON_RELEASE_ARMV7` to the corresponding binaries.
 
 ## HTTPS: use your tunnel or Caddy
 
@@ -257,3 +245,19 @@ Disabling capture, changing the link, or deleting data from the relay does
 not delete local backups. To remove them, stop the daemon and delete the
 recovery directory deliberately; ordinary notebook and sync state are
 separate. Recovery is supplementary, not a replacement for a separate backup.
+
+### Explicit GitHub release install
+
+Once a stable tablet release is published, opt in from a computer with a
+trusted, signed-in GitHub CLI:
+
+```sh
+bunx @bxff/weft setup --release tablet-vMAJOR.MINOR.PATCH --no-auto-reinstall
+```
+
+This checks the exact binary's GitHub provenance, architecture, release tag
+and source commit before uploading it. Verified installs use the manual
+rollback path and reject older verified releases or a moved tag previously
+installed at the same version. The first verified install establishes the
+version floor; legacy deployments have no verified version receipt. Plain
+`setup` still uses the existing source/relay install path.

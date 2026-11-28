@@ -1,9 +1,9 @@
 import { expect, test } from 'bun:test'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-test.each(['success', 'mask', 'stop', 'restart', 'health', 'upgrade'])('manual setup restores stock state when activation fails (%s)', failure => {
+test.each(['success', 'mask', 'stop', 'restart', 'health', 'upgrade', 'release', 'release-health', 'release-downgrade', 'release-retag', 'release-untrusted', 'release-old-source', 'release-wrong-arch', 'release-draft', 'release-copy-corrupt'])('manual setup restores stock state when activation fails (%s)', failure => {
     const dir = mkdtempSync(join(tmpdir(), 'weft-manual-rollback-'))
     const path = (name: string) => join(dir, name)
     try {
@@ -15,32 +15,68 @@ test.each(['success', 'mask', 'stop', 'restart', 'health', 'upgrade'])('manual s
         const cli = path('apps/cli/src/cli.ts')
         copyFileSync(join(import.meta.dir, '../src/cli.ts'), cli)
         copyFileSync(join(import.meta.dir, '../src/tablet-release.ts'), path('apps/cli/src/tablet-release.ts'))
-        const local = path('device/target/aarch64-unknown-linux-musl/release/rmsyncd')
-        const elf = Buffer.alloc(64)
-        elf.writeUInt32BE(0x7f454c46, 0)
-        elf[4] = 2
-        elf[5] = elf[6] = 1
-        elf.writeUInt16LE(183, 18)
-        writeFileSync(local, elf)
+        writeFileSync(path('device/target/aarch64-unknown-linux-musl/release/rmsyncd'), '')
         writeFileSync(path('usr/bin/rm-sync'), 'signal name="documentFinished"\n type="(ay)"\n type="a(ay)"\n type="a(ay)"')
         writeFileSync(path('home/root/weft/cloud.json'), 'original config')
         writeFileSync(path('home/root/weft/rmsyncd'), 'original daemon')
         writeFileSync(path('usr/lib/systemd/system/weft.service'), 'original unit')
         writeFileSync(path('usr/lib/systemd/system/xochitl.service.d/weft.conf'), 'original drop-in')
         symlinkSync('/previous/weft.service', path('usr/lib/systemd/system/multi-user.target.wants/weft.service'))
+        const verified = failure.startsWith('release')
+        const commit = 'a'.repeat(40)
+        const installedReceipt = failure === 'release-downgrade' ? `tablet-v3.0.0 ${commit}\n`
+            : failure === 'release-retag' ? `tablet-v2.10.0 ${'b'.repeat(40)}\n` : `tablet-v2.9.9 ${commit}\n`
+        if (verified) {
+            writeFileSync(path('home/root/weft/verified-release'), installedReceipt)
+            const binary = Buffer.alloc(64)
+            binary.writeUInt32BE(0x7f454c46, 0)
+            binary[4] = failure === 'release-wrong-arch' ? 1 : 2
+            binary[5] = binary[6] = 1
+            binary.writeUInt16LE(183, 18)
+            writeFileSync(path('signed-daemon'), binary)
+        }
         const upgrade = failure === 'upgrade'
         writeFileSync(path(upgrade ? 'stock-mask' : 'stock-active'), '')
         const mock = (name: string, script: string) =>
             writeFileSync(path(name), `#!/bin/sh\n${script}\n`, { mode: 0o755 })
+        if (process.platform === 'darwin') mock('sha256sum', 'shasum -a 256 "$@"')
         mock('journalctl', 'exit 0')
         mock('sleep', 'exit 0')
         mock('mount', 'exit 0')
         mock('strings', 'cat "$1"')
-        mock('wget', 'test "$FAILURE" != health')
+        mock('wget', 'test "$FAILURE" != health && test "$FAILURE" != release-health')
+        mock('gh', `
+printf '%s\\n' "$*" >> "$TABLET/gh.log"
+case "$1 $2" in
+    "release view")
+        if [ "$FAILURE" = release-draft ]; then draft=true; else draft=false; fi
+        printf '{"tagName":"tablet-v2.10.0","isDraft":%s,"isPrerelease":false}' "$draft" ;;
+    "api --hostname")
+        case "$4" in
+            *git/ref/tags/tablet-v2.10.0) echo '{"object":{"type":"tag","sha":"${'b'.repeat(40)}"}}' ;;
+            *git/tags/${'b'.repeat(40)}) echo '{"object":{"type":"commit","sha":"${commit}"}}' ;;
+            *compare/7aa37e65361bb219f579ea4926f73e7fa364fc59...${commit})
+                if [ "$FAILURE" = release-old-source ]; then status=behind; else status=ahead; fi
+                printf '{"status":"%s","merge_base_commit":{"sha":"7aa37e65361bb219f579ea4926f73e7fa364fc59"}}' "$status" ;;
+            *) exit 1 ;;
+        esac ;;
+    "release download") for arg do target=$arg; done; cp "$TABLET/signed-daemon" "$target" ;;
+    "attestation verify")
+        [ "$FAILURE" != release-untrusted ] &&
+        [ "$4 $5 $6 $7 $8 $9 ${'\$'}{10} ${'\$'}{11} ${'\$'}{12} ${'\$'}{13} ${'\$'}{14}" = "--hostname github.com --repo bxff/weft --signer-workflow bxff/weft/.github/workflows/release-tablet.yml --source-ref refs/tags/tablet-v2.10.0 --source-digest ${commit} --deny-self-hosted-runners" ] &&
+        cmp "$3" "$TABLET/signed-daemon" ;;
+    *) exit 1 ;;
+esac
+`)
         mock('scp', `
-for arg do target=$arg; done
+for arg do src=$target; target=$arg; done
 target=$(printf '%s' "$target" | cut -d: -f2-)
-printf 'new daemon' > "$TABLET$target"
+printf '%s\\n' "$target" >> "$TABLET/scp.log"
+case "$FAILURE" in
+    release-copy-corrupt) printf incorrect > "$TABLET$target" ;;
+    release*) cp "$src" "$TABLET$target" ;;
+    *) printf 'new daemon' > "$TABLET$target" ;;
+esac
 `)
         mock('ssh', `
 case "$1" in -fNM|-O) exit 0 ;; esac
@@ -79,20 +115,26 @@ case "$*" in
 esac
 `)
         const run = Bun.spawnSync([
-            process.execPath, cli, 'setup', '--no-auto-reinstall', '--local-daemon', local, '--cloud', 'https://relay.example', '--token', 'sample',
+            process.execPath, cli, 'setup', '--no-auto-reinstall', '--cloud', 'https://relay.example', '--token', 'sample',
+            ...(verified ? ['--release', 'tablet-v2.10.0'] : []),
         ], {
             env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, TABLET: dir, FAILURE: failure, RM_SSH_PASS: '' },
         })
-        const calls = readFileSync(path('systemctl.log'), 'utf8')
-        if (failure === 'success') {
+        const calls = existsSync(path('systemctl.log')) ? readFileSync(path('systemctl.log'), 'utf8') : ''
+        if (failure === 'success' || failure === 'release') {
             expect(run.exitCode).toBe(0)
             expect(existsSync(path('stock-mask'))).toBe(true)
             expect(existsSync(path('stock-active'))).toBe(false)
             expect(calls).toContain('restart xochitl')
-            expect(readFileSync(path('home/root/weft/rmsyncd'), 'utf8')).toBe('new daemon')
+            if (verified) {
+                expect(readFileSync(path('home/root/weft/rmsyncd'))).toEqual(readFileSync(path('signed-daemon')))
+                expect(readFileSync(path('home/root/weft/verified-release'), 'utf8')).toBe(`tablet-v2.10.0 ${commit}\n`)
+            } else expect(readFileSync(path('home/root/weft/rmsyncd'), 'utf8')).toBe('new daemon')
             expect(JSON.parse(readFileSync(path('home/root/weft/cloud.json'), 'utf8')).token).toBe('sample')
         } else {
             expect(run.exitCode).toBe(1)
+            if (verified) expect(readFileSync(path('home/root/weft/verified-release'), 'utf8')).toBe(installedReceipt)
+            if (['release-untrusted', 'release-old-source', 'release-wrong-arch', 'release-draft'].includes(failure)) expect(existsSync(path('scp.log'))).toBe(false)
             expect(existsSync(path('stock-mask'))).toBe(upgrade)
             expect(existsSync(path('stock-active'))).toBe(!upgrade)
             if (upgrade) {
@@ -106,6 +148,8 @@ esac
             expect(readFileSync(path('usr/lib/systemd/system/xochitl.service.d/weft.conf'), 'utf8')).toBe('original drop-in')
             expect(readlinkSync(path('usr/lib/systemd/system/multi-user.target.wants/weft.service'))).toBe('/previous/weft.service')
         }
+        expect(existsSync(path('gh.log'))).toBe(verified)
+        expect(readdirSync(path('home/root/weft')).filter(name => name.startsWith('verified-stage-') || name === 'verified-install.lock')).toEqual([])
     } finally {
         rmSync(dir, { recursive: true, force: true })
     }

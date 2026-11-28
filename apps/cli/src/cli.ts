@@ -14,6 +14,8 @@
  */
 
 import { spawnSync } from 'node:child_process'
+import { existsSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
@@ -30,7 +32,6 @@ const flags = (() => {
                 cloud: { type: 'string' },
                 token: { type: 'string' },
                 release: { type: 'string' },
-                'local-daemon': { type: 'string' },
                 notebook: { type: 'string' },
                 'recovery-dir': { type: 'string' },
                 'native-dir': { type: 'string' },
@@ -54,6 +55,46 @@ const DRY = flags['dry-run']
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '../../..')
 const DAEMON_BIN = join(REPO_ROOT, 'device/target/aarch64-unknown-linux-musl/release/rmsyncd')
+
+/** Daemon binary for `arch`: a local source-tree build if present, otherwise
+ *  downloaded from the cloud's release endpoint (the file tablets self-update
+ *  from). */
+async function daemonBinary(arch: 'aarch64' | 'armv7'): Promise<string> {
+    const target = arch === 'armv7' ? 'armv7-unknown-linux-musleabihf' : 'aarch64-unknown-linux-musl'
+    const local = join(REPO_ROOT, `device/target/${target}/release/rmsyncd`)
+    if (existsSync(local)) return local
+    if (!CLOUD || !TOKEN) {
+        console.error(
+            'no daemon binary: not in a source tree and no --cloud/--token to download from.\n' +
+                'Use the setup page (it fills both in), or build from source:\n' +
+                `  cd device && cargo zigbuild --release --target ${target}`,
+        )
+        process.exit(1)
+    }
+    process.stdout.write(`  downloading daemon (${arch}) from ${CLOUD} ... `)
+    const r = await fetch(`${CLOUD}/api/daemon/release?arch=${arch}`, {
+        headers: { 'x-device-token': TOKEN },
+    }).catch((e: unknown) => {
+        console.error(`\ncouldn't reach ${CLOUD}: ${e instanceof Error ? e.message : e}`)
+        return process.exit(1)
+    })
+    if (!r.ok) {
+        console.error(
+            `\ndaemon download failed (${r.status})${r.status === 401 ? ' — bad or expired token' : ''}` +
+                `${r.status === 404 && arch === 'armv7' ? ' — the server has no armv7 release yet' : ''}`,
+        )
+        process.exit(1)
+    }
+    const bytes = new Uint8Array(await r.arrayBuffer())
+    if (bytes.length < 1024 * 1024 || bytes[0] !== 0x7f || bytes[1] !== 0x45) {
+        console.error('\ndownloaded file does not look like the daemon binary')
+        process.exit(1)
+    }
+    const path = join(tmpdir(), `weft-rmsyncd-${process.pid}`)
+    writeFileSync(path, bytes)
+    console.log(`ok (${(bytes.length / 1024 / 1024).toFixed(1)} MB)`)
+    return path
+}
 
 const INSTALL_DIR = '/home/root/weft'
 
@@ -220,8 +261,39 @@ WantedBy=multi-user.target
 `
 
 /** Install manually in one remote operation so a failed takeover restores stock sync. */
-function activateManualSetup(configured: boolean): void {
+type VerifiedStage = { tag: string; commit: string; sha256: string; dir: string }
+
+function activateManualSetup(configured: boolean, release?: VerifiedStage): void {
+    const staged = release?.dir ?? INSTALL_DIR
+    const receipt = `${INSTALL_DIR}/verified-release`
+    const lock = `${INSTALL_DIR}/verified-install.lock`
+    const guard = release ? `
+mkdir ${lock} || { echo 'Another verified install is in progress.' >&2; exit 1; }
+trap 'rmdir ${lock}' 0
+printf '%s  %s\n' '${release.sha256}' '${staged}/rmsyncd.new' | sha256sum -c - >/dev/null
+if [ -e ${receipt} ] || [ -L ${receipt} ]; then
+    if ! awk -v incoming='${release.tag}' -v commit='${release.commit}' '
+        NR == 1 && NF == 2 && $1 ~ /^tablet-v[0-9]+[.][0-9]+[.][0-9]+$/ &&
+            $2 ~ /^[0-9a-f]+$/ && length($2) == 40 {
+            split(substr($1, 9), old, ".")
+            split(substr(incoming, 9), next_version, ".")
+            valid = 1
+            for (i = 1; i <= 3; i++) {
+                if (length(old[i]) > 9 || old[i] ~ /^0[0-9]/) valid = 0
+                if (!cmp && (old[i]+0) != (next_version[i]+0))
+                    cmp = (old[i]+0) > (next_version[i]+0) ? 1 : -1
+            }
+            permitted = cmp < 0 || (cmp == 0 && ("sha:" $2) == ("sha:" commit))
+        }
+        END { exit !(NR == 1 && valid && permitted) }
+    ' ${receipt}; then
+        echo 'Verified release is older, retagged, or the installed release receipt is invalid.' >&2
+        exit 1
+    fi
+fi
+` : ''
     const activate = `set -e
+${guard}
 stock_mask=$(systemctl is-enabled rm-sync.service 2>/dev/null) || :
 stock_active=$(systemctl is-active rm-sync.service 2>/dev/null) || :
 weft_active=$(systemctl is-active weft.service 2>/dev/null) || :
@@ -239,7 +311,8 @@ esac
 
 mount -o remount,rw / 2>/dev/null || true
 backup=$(mktemp -d "${INSTALL_DIR}/setup-rollback.XXXXXX")
-paths="${INSTALL_DIR}/rmsyncd${configured ? `
+paths="${INSTALL_DIR}/rmsyncd${release ? `
+${receipt}` : ''}${configured ? `
 ${INSTALL_DIR}/cloud.json` : ''}
 /usr/lib/systemd/system/weft.service
 /usr/lib/systemd/system/multi-user.target.wants/weft.service
@@ -255,7 +328,11 @@ rollback() {
     result=$?
     trap - 0
     trap '' HUP INT TERM
-    if [ "$result" -eq 0 ]; then rm -rf "$backup"; return; fi
+    if [ "$result" -eq 0 ]; then
+        rm -rf "$backup"
+        ${release ? `rmdir ${lock} || :` : ''}
+        return
+    fi
     set +e
     failed=0
     if [ "$weft_attempted" -eq 1 ]; then systemctl stop weft.service || failed=1; fi
@@ -280,6 +357,7 @@ rollback() {
     else
         echo "Setup rollback was incomplete. Backups remain at $backup" >&2
     fi
+    ${release ? `rmdir ${lock} || :` : ''}
     exit "$result"
 }
 trap rollback 0
@@ -301,10 +379,10 @@ fi
 
 files_changed=1
 rm -f ${INSTALL_DIR}/rmsyncd
-mv ${INSTALL_DIR}/rmsyncd.new ${INSTALL_DIR}/rmsyncd
+mv ${staged}/rmsyncd.new ${INSTALL_DIR}/rmsyncd
 chmod +x ${INSTALL_DIR}/rmsyncd
 ${configured ? `rm -f ${INSTALL_DIR}/cloud.json
-mv ${INSTALL_DIR}/cloud.json.new ${INSTALL_DIR}/cloud.json
+mv ${staged}/cloud.json.new ${INSTALL_DIR}/cloud.json
 ` : ''}mkdir -p /usr/lib/systemd/system/multi-user.target.wants /usr/lib/systemd/system/xochitl.service.d
 rm -f /usr/lib/systemd/system/weft.service /usr/lib/systemd/system/xochitl.service.d/weft.conf
 cat > /usr/lib/systemd/system/weft.service <<'WEFT_UNIT'
@@ -325,13 +403,26 @@ sleep 3
 systemctl is-active --quiet weft.service
 wget -q -O- http://127.0.0.1:9000/api/health
 systemctl restart xochitl
+${release ? `printf '%s %s\n' '${release.tag}' '${release.commit}' > ${staged}/receipt.new
+mv ${staged}/receipt.new ${receipt}
+` : ''}
 `
-    step('activate manual setup', run([...sshBase(), 'sh -s'], activate))
+    const result = run([...sshBase(), 'sh -s'], activate)
+    if (release) requireVerifiedStep('activate manual setup', result)
+    else step('activate manual setup', result)
+}
+
+function requireVerifiedStep(label: string, result: { ok: boolean; out: string }): void {
+    if (!result.ok) throw Error(`${label} failed: ${result.out.trim()}`)
+    console.log(`✓ ${label}`)
 }
 
 // ----- commands -----
 
 async function setup(): Promise<void> {
+    if (flags.release !== undefined && AUTO_REINSTALL) {
+        throw Error('Verified GitHub releases require --no-auto-reinstall for rollback-safe installation.')
+    }
     console.log(`Installing weft on ${HOST}${DRY ? ' (dry run)' : ''}\n`)
 
     // Probe BEFORE fetching a binary or touching the device: the arch decides
@@ -360,25 +451,29 @@ async function setup(): Promise<void> {
         process.exit(1)
     }
     step('check firmware compatibility', ssh(firmwarePreflight))
-    if (DRY) {
-        step('create install dir', ssh(`mkdir -p ${INSTALL_DIR}`))
-        step('deploy daemon', scp(DAEMON_BIN, `${INSTALL_DIR}/rmsyncd.new`))
-    } else {
-        const daemon = stageTabletDaemon(isArm32 ? 'armv7' : 'aarch64', {
-            tag: flags.release,
-            local: flags['local-daemon'],
-        })
-        if (daemon.tag) console.log(`  verified GitHub release ${daemon.tag}`)
-        else console.log('  using the explicitly supplied trusted local build')
-        process.once('exit', daemon.remove)
-        try {
-            step('create install dir', ssh(`mkdir -p ${INSTALL_DIR}`))
-            step('deploy daemon', scp(daemon.path, `${INSTALL_DIR}/rmsyncd.new`))
-        } finally {
-            process.removeListener('exit', daemon.remove)
+    if (flags.release !== undefined && !DRY) {
+        const daemon = stageTabletDaemon(isArm32 ? 'armv7' : 'aarch64', flags.release)
+        const dir = `${INSTALL_DIR}/verified-stage-${crypto.randomUUID()}`
+        const cleanup = () => {
             daemon.remove()
+            ssh(`rm -rf ${dir}`)
         }
+        try {
+            console.log(`  verified GitHub release ${daemon.tag}`)
+            requireVerifiedStep('create install staging', ssh(`mkdir -p ${INSTALL_DIR} && mkdir -m 700 ${dir}`))
+            requireVerifiedStep('stage verified daemon', scp(daemon.path, `${dir}/rmsyncd.new`))
+            if (CLOUD && TOKEN) {
+                requireVerifiedStep('stage cloud config', run([...sshBase(), `umask 077; cat > ${dir}/cloud.json.new`], JSON.stringify({ url: CLOUD, token: TOKEN })))
+            }
+            activateManualSetup(Boolean(CLOUD && TOKEN), { tag: daemon.tag, commit: daemon.commit, sha256: daemon.sha256, dir })
+        } finally {
+            cleanup()
+        }
+        return
     }
+    const daemonBin = DRY ? DAEMON_BIN : await daemonBinary(isArm32 ? 'armv7' : 'aarch64')
+    step('create install dir', ssh(`mkdir -p ${INSTALL_DIR}`))
+    step('deploy daemon', scp(daemonBin, `${INSTALL_DIR}/rmsyncd.new`))
     // file contents travel via stdin, never heredocs inside joined commands
     console.log(
         `  config: store-timeout=${STORE_TIMEOUT}ms, auto-reinstall=${AUTO_REINSTALL ? 'on' : 'off'}, ` +
@@ -549,7 +644,7 @@ async function restoreNotebook(): Promise<void> {
 switch (command) {
     case 'setup':
         try { await setup() }
-        catch (e) { console.error(e instanceof Error ? e.message : 'Setup failed'); process.exitCode = 1 }
+        catch (error) { console.error(error instanceof Error ? error.message : 'Setup failed'); process.exitCode = 1 }
         break
     case 'doctor':
         doctor()
@@ -565,6 +660,6 @@ switch (command) {
         catch (e) { console.error(e instanceof Error ? e.message : 'Restore failed'); process.exitCode = 1 }
         break
     default:
-        console.log('usage: weft <setup [--release tablet-vMAJOR.MINOR.PATCH | --local-daemon PATH] [--store-timeout ms] [--no-auto-reinstall] [--experimental-rm2] [--cloud URL --token chd_...]|doctor|uninstall|link|restore-notebook> --host root@10.11.99.1 [--password X] [--dry-run]')
+        console.log('usage: weft <setup [--release tablet-vMAJOR.MINOR.PATCH --no-auto-reinstall] [--store-timeout ms] [--no-auto-reinstall] [--experimental-rm2] [--cloud URL --token chd_...]|doctor|uninstall|link|restore-notebook> --host root@10.11.99.1 [--password X] [--dry-run]')
         process.exit(command && command !== '--help' && command !== '-h' ? 1 : 0)
 }
