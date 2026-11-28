@@ -99,7 +99,11 @@ jobs:
           PUBLIC_CLERK_PUBLISHABLE_KEY: ""
           PUBLIC_DOCS_URL: ""
           PUBLIC_TLDRAW_LICENSE_KEY: ""
-      - run: node node_modules/@playwright/test/cli.js test
+          PUBLIC_GUARDED_SAVES: "0"
+      - id: default-e2e
+        run: node node_modules/@playwright/test/cli.js test
+        env:
+          PUBLIC_GUARDED_SAVES: "0"
       # Both filename variants have lost their page context in CI. Retain the
       # failing synthetic fixture's full trace without rerunning its Undo.
       - name: Retain photo history navigation diagnostics
@@ -123,6 +127,8 @@ jobs:
       # Keep the shipping build above flag-off. Use a fresh synthetic relay for
       # the guarded browser save contract; never reuse this build for deploys.
       - name: Build guarded browser saves for E2E
+        id: guarded-build
+        if: ${{ !cancelled() && (steps.default-e2e.outcome == 'success' || steps.default-e2e.outcome == 'failure') }}
         run: bun run build
         working-directory: apps/web
         env:
@@ -132,6 +138,7 @@ jobs:
           PUBLIC_TLDRAW_LICENSE_KEY: ""
           PUBLIC_GUARDED_SAVES: "1"
       - name: Exercise guarded browser saves
+        if: ${{ !cancelled() && steps.guarded-build.outcome == 'success' }}
         env:
           PUBLIC_GUARDED_SAVES: "1"
         run: |
