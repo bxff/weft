@@ -46,10 +46,10 @@ jobs:
           targets=(aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf)
           rustup toolchain install "$rust" --profile minimal --target "${targets[0]}" --target "${targets[1]}"
           cargo "+$rust" install --locked cargo-zigbuild --version 0.20.1
-          cargo "+$rust" test --locked
+          cargo "+$rust" test --locked --no-default-features
           mkdir -p release
           for target in "${targets[@]}"; do
-            cargo "+$rust" zigbuild --locked --release --target "$target"
+            cargo "+$rust" zigbuild --locked --no-default-features --release --target "$target"
             binary="release/rmsyncd-${target%%-*}"
             cp "target/$target/release/rmsyncd" "$binary"
             header="$(readelf -h "$binary")"

@@ -8,6 +8,7 @@ mod dbus;
 mod recovery;
 mod server;
 mod store;
+#[cfg(any(test, feature = "legacy-relay-updates"))]
 mod update;
 mod watch;
 
@@ -106,11 +107,12 @@ async fn main() {
     );
     if let Some(config) = cloud::load_config(&cloud_config_path) {
         let state_path = cloud_config_path.with_file_name("cloud-state.json");
-        cloud::spawn(state.clone(), config.clone(), state_path);
-        // self-update: polls the cloud's release binary; a swap exits(0) and
-        // systemd relaunches the new binary. Inert until the server sets
-        // WEFT_DAEMON_RELEASE (404 = nothing to do).
-        update::spawn(config);
+        #[cfg(feature = "legacy-relay-updates")]
+        let update_config = config.clone();
+        cloud::spawn(state.clone(), config, state_path);
+        // Keep the legacy relay updater for source/relay builds only.
+        #[cfg(feature = "legacy-relay-updates")]
+        update::spawn(update_config);
     }
 
     // A/B firmware-update survival (opt-in, off until device-verified on a real
