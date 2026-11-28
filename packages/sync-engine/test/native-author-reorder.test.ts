@@ -405,8 +405,8 @@ test('a view observer exception cannot prevent atomic local retirement of an acc
     }
 })
 
-for (const replacedInSameTail of [false, true]) {
-    test(`guarded receipt resolves glyph repair against the final folded overlay (replaced=${replacedInSameTail})`, async () => {
+for (const replacement of ['none', 'relay', 'optimistic'] as const) {
+    test(`guarded receipt resolves glyph repair against the final folded overlay (replacement=${replacement})`, async () => {
         const daemon = new GuardedDaemon()
         daemon.subscribe = () => () => {}
         const id = 'shape:glyphs'
@@ -429,6 +429,7 @@ for (const replacedInSameTail of [false, true]) {
         await daemon.putSnapshot('d', 'p', encodeSnapshot(base.serialize(), overlay))
         const outgoing = { ...initial, shape: { ...initial.shape, shapeId: 'shape:unrelated', kind: 'geo' }, parts: [] }
         const observations: Array<{ patch: ViewPatch; text: unknown }> = []
+        let observedParked = false
         const session = await OfflineSession.open(new MemoryStorage(), daemon, 'd', 'p', {
             authorUuid: C, clientId: 'editor', guardedSaves: true,
             onPatch: patch => {
@@ -441,20 +442,35 @@ for (const replacedInSameTail of [false, true]) {
             await session.reconcile()
             daemon.afterSave = async () => {
                 const blobs = [encodeOp({ op: 'tombstone', id: { author: deleted.authorUuid, clock: deleted.clock } })]
-                if (replacedInSameTail) blobs.push(encodeOp({
+                daemon.afterSave = undefined
+                if (replacement === 'relay') blobs.push(encodeOp({
                     op: 'upsert-object', id, objType: 'text', props: { text: 'XBC' },
                     transform: { x: 0, y: 0, rotation: 0 }, rendered: shape.rendered.slice(0, 3),
                     version: { actor: B, ts: 2 }, renderRevision: 'new',
                 }))
                 await daemon.appendOps('d', 'p', blobs, B)
+                if (replacement === 'optimistic') {
+                    daemon.beforeSave = async () => {
+                        const state = session as unknown as { parkedRepairs: Set<string> }
+                        observedParked = state.parkedRepairs.has(id)
+                    }
+                    await session.apply([{
+                        ...initial,
+                        shape: { ...initial.shape, props: { text: 'XYZW' }, renderRevision: 'new-local', version: { actor: C, ts: 2 } },
+                    }])
+                }
             }
             await session.apply([outgoing])
-            await session.reconcile()
+            for (let i = 0; i < 3; i++) await session.reconcile()
             expect(session.pendingCount).toBe(0)
             expect(daemon.accepted[0]?.kind).toBe('ops')
-            if (replacedInSameTail) {
+            expect(observedParked).toBe(replacement === 'optimistic')
+            expect((session as unknown as { parkedRepairs: Set<string> }).parkedRepairs.size).toBe(0)
+            if (replacement !== 'none') {
                 expect(observations).toEqual([])
-                expect(session.currentOverlay.shapes.find(shape => shape.shapeId === id)?.props).toEqual({ text: 'XBC' })
+                expect(session.currentOverlay.shapes.find(shape => shape.shapeId === id)?.props).toEqual({
+                    text: replacement === 'optimistic' ? 'XYZW' : 'XBC',
+                })
             } else {
                 expect(observations).toEqual([{
                     patch: { type: 'shape-edited', shapeId: id, edit: { kind: 'text-truncate-glyphs', removedGlyphIndices: [3] } },

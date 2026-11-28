@@ -10,6 +10,7 @@ import { NativeTextReferenceConflict, acceptedTextEdit, applyOps, captureTextRef
 import { diffPage, snapshotKnownState } from './differ'
 import {
     applyInkDeltas,
+    compareVersion,
     decodeOp,
     encodeOp,
     mergeOverlayOp,
@@ -124,6 +125,7 @@ export class OfflineSession {
     private pendingOps: LocalOp[] = []
     private publication: BrowserPublication | undefined
     private confirmedPrefix = 0
+    private readonly parkedRepairs = new Set<string>()
     private deferredOrphan = false
     private checkpointDirty = false
     private diskCheckpoint: StoragePair = [null, null]
@@ -170,7 +172,10 @@ export class OfflineSession {
         await session.adoptOrphanPending()
         // the page may have changed while NO session was watching (tablet
         // moves/erases of our rendered shapes): audit before the view binds
-        if (session.runAudit()) await session.persist()
+        if (session.runAudit(patch => {
+            if (opts.guardedSaves && patch.type === 'shape-edited') session.emitGuardedRepair(patch)
+            else opts.onPatch(patch)
+        })) await session.persist()
         if (session.bootstrapped || session.pendingOps.length) opts.onPageAvailable?.()
         session.unsubscribe = transport.subscribe((event) => void session.onRemote(event), () => void session.reconcile())
         session.retryTimer = setInterval(
@@ -905,6 +910,21 @@ export class OfflineSession {
         }
     }
 
+    /** A semantic inverse is only valid against the shape that produced its
+     * glyph indices. Park a blocked repair until the next authoritative audit;
+     * never replay stale indices over a newer optimistic local projection. */
+    private emitGuardedRepair(patch: Extract<ViewPatch, { type: 'shape-edited' }>): void {
+        const basis = this.overlay.shapes.find(shape => shape.shapeId === patch.shapeId)
+        const visible = this.currentOverlay.shapes.find(shape => shape.shapeId === patch.shapeId)
+        if (!basis || !visible || compareVersion(basis.version, visible.version) !== 0 ||
+            basis.renderRevision !== visible.renderRevision || basis.state !== visible.state) {
+            this.parkedRepairs.add(patch.shapeId)
+            return
+        }
+        this.opts.onPatch(patch)
+        this.parkedRepairs.delete(patch.shapeId)
+    }
+
     /** Stage the snapshot and its operation tail before replacing the current page. */
     private async pullOps(
         gen: number,
@@ -963,20 +983,18 @@ export class OfflineSession {
             : undefined
         let nativeBytes: Uint8Array | undefined
         let repaired: boolean
+        const repairs: Array<Extract<ViewPatch, { type: 'shape-edited' }>> = []
+        const canonicalReceipt = !!receiptFold && (!!snap || records.length > 0 || this.parkedRepairs.size > 0)
         if (prior) this.overlay = structuredClone(prior.overlay)
         try {
-            // A replacement paints the final checkpoint and tail together. Keep
-            // follow-up repairs separate, after the source shapes are installed.
-            const publishReplacement = snap ? this.opts.onPatchBatch : undefined
-            // A guarded receipt tail may contain a native erase followed by a
-            // newer projection of the same semantic shape. Apply both before
-            // deciding to repair, detach, or remove that shape.
-            const hasInk = batch.some(op => op.op === 'add' || op.op === 'tombstone')
-            const auditFolded = !!snap || !!receiptFold && hasInk
-            const repairs: ViewPatch[] = []
+            // Follow one canonical guarded projection. Queued upsert objects
+            // can be mutated by native move audit; replaying their mirror move
+            // after a post-audit upsert would translate the same shape twice.
+            const publishReplacement = snap && !canonicalReceipt ? this.opts.onPatchBatch : undefined
+            const auditFolded = !!snap || canonicalReceipt
             const collectReplacement = auditFolded ? (patch: ViewPatch) => {
                 if (patch.type === 'shape-edited') repairs.push(patch)
-                else if (!publishReplacement) notifyPatch(patch)
+                else if (!publishReplacement && !canonicalReceipt) notifyPatch(patch)
             } : undefined
             const previous = auditFolded && !snap?.revert && this.bootstrapped ? this.baseDoc : null
             if (snap && replacement && replacementDoc) {
@@ -993,7 +1011,8 @@ export class OfflineSession {
             const snapshotBase = snap ? this.baseDoc : null
             // A single-patch subscriber also observes the individual changes since
             // this checkpoint. Compare ink after the tail has established ownership.
-            const priorInk = auditFolded && !publishReplacement && hasInk
+            const priorInk = snap && !publishReplacement && !canonicalReceipt &&
+                batch.some(op => op.op === 'add' || op.op === 'tombstone')
                 ? snapshotKnownState(this.baseDoc) : null
             if (records.length) {
                 this.applyOpBatch(batch, collectReplacement, notifyPatch, notifyBatch)
@@ -1009,14 +1028,12 @@ export class OfflineSession {
                 if (diff.foreignAdds.length) notifyPatch({ type: 'ink-added', items: diff.foreignAdds })
                 if (diff.foreignDeletes.length) notifyPatch({ type: 'ink-removed', items: diff.foreignDeletes })
             }
-            if (snap) {
+            if (snap || canonicalReceipt) {
                 const patch = { type: 'document-replaced' } as const
-                if (publishReplacement) notifyBatch?.([patch])
+                if (notifyBatch) notifyBatch([patch])
                 else notifyPatch(patch)
             }
-            // Apply semantic edits only after the guarded view has observed
-            // every other patch from the same authoritative state.
-            for (const repair of repairs) notifyPatch(repair)
+            if (!receiptFold) for (const repair of repairs) notifyPatch(repair)
         } catch (error) {
             if (prior) {
                 this.baseDoc = prior.baseDoc
@@ -1041,6 +1058,13 @@ export class OfflineSession {
             }
         }
         for (const callback of notifications) observeConfirmed(callback)
+        if (canonicalReceipt) {
+            // A superseding projection or native edit can eliminate the old
+            // repair. The final audit, not this in-memory set, is authoritative.
+            const repairIds = new Set(repairs.map(repair => repair.shapeId))
+            for (const id of this.parkedRepairs) if (!repairIds.has(id)) this.parkedRepairs.delete(id)
+            for (const repair of repairs) observeConfirmed(() => this.emitGuardedRepair(repair))
+        }
         const first = !this.bootstrapped
         if (persistCheckpoint && (first || snap || records.length || this.checkpointDirty)) {
             await this.persist(gen, records.length || repaired ? undefined : nativeBytes)

@@ -160,3 +160,83 @@ test('a temporary paint failure recovers the visible page after a guarded save',
     await page.reload()
     await expect(nativeText(page)).toHaveText(expected)
 })
+
+test('one guarded ops receipt paints a peer move and winning overlay update exactly once', async ({ page }) => {
+    const { RmDocument, crdtId } = await import('../packages/rm-format/src/index')
+    const { encodeOp, lineBlockToAddOp } = await import('../packages/sync-engine/src/ops')
+    const { RM_SCALE } = await import('../packages/rm-ink/src/pen')
+    const sheet = crypto.randomUUID()
+    const api = `/api/documents/${doc}/pages/${sheet}`
+    await page.goto(`/app/${doc}/${sheet}`)
+    const synced = page.getByTestId('sync-status')
+    await expect(synced).toHaveText('synced')
+    await page.keyboard.press('t')
+    const box = (await page.locator('.tl-canvas').boundingBox())!
+    await page.mouse.click(box.x + box.width / 2 - 60, box.y + 240)
+    await page.keyboard.type('Peer move')
+    await page.keyboard.press('Escape')
+    let shape: import('../packages/sync-engine/src/types').OverlayShape | undefined
+    await expect.poll(async () => {
+        const response = await page.request.get(api + '/overlay')
+        if (!response.ok()) return false
+        const overlay = await response.json() as import('../packages/sync-engine/src/types').OverlayDocument
+        shape = overlay.shapes.find(entry => entry.kind === 'text')
+        return Boolean(shape?.rendered.length)
+    }).toBe(true)
+    await expect(synced).toHaveText('synced')
+    const original = shape!
+    const rmResponse = await page.request.get(api + '/rm')
+    expect(rmResponse.ok()).toBe(true)
+    const rm = RmDocument.parse(new Uint8Array(await rmResponse.body()))
+    const dx = 113
+    const author = 'cdcd0001-0000-4000-a000-0000000000cd'
+    const operations: Uint8Array[] = []
+    for (const ref of original.rendered.flatMap(part => part.items)) {
+        const id = crdtId(rm.resolveAuthor(ref.authorUuid), ref.clock)
+        const source = rm.findLineItem(id)!
+        const moved = rm.appendLine({
+            ...source.line!, moveId: id,
+            points: source.line!.points.map(point => ({ ...point, x: point.x + dx })),
+        }, { authorUuid: author, parentId: source.parentId })
+        operations.push(encodeOp({ op: 'tombstone', id: { author: ref.authorUuid, clock: ref.clock } }))
+        operations.push(encodeOp(lineBlockToAddOp(rm, moved)))
+    }
+    operations.push(encodeOp({
+        op: 'upsert-object', id: original.shapeId, objType: original.kind, props: original.props,
+        transform: { x: original.x, y: original.y, rotation: original.rotation },
+        rendered: original.rendered, version: { actor: author, ts: original.version.ts + 1 },
+        renderRevision: 'peer-overlay',
+    }))
+    let interleaved = false
+    await page.route(`**${api}/ops-batch`, async route => {
+        if (interleaved) return route.continue()
+        const accepted = await route.fetch()
+        expect(accepted.ok()).toBe(true)
+        const peer = await page.request.post(api + '/ops', {
+            data: { ops: operations.map(bytes => Buffer.from(bytes).toString('base64')), author },
+        })
+        expect(peer.ok()).toBe(true)
+        interleaved = true
+        await route.fulfill({ response: accepted })
+    })
+    await page.evaluate(async () => {
+        const w = window as any
+        const controller = w.__weftController
+        const original = controller.onPatches.bind(controller)
+        w.receiptPaints = []
+        controller.onPatches = (patches: Array<{ type: string }>) => {
+            w.receiptPaints.push(...patches.map(patch => patch.type))
+            original(patches)
+        }
+        w.__weftEditor.createShape({ id: 'shape:guarded-move-trigger', type: 'geo', x: 100, y: 240 })
+        await controller.saveBeforeNavigation()
+    })
+    await expect.poll(() => interleaved).toBe(true)
+    await expect(synced).toHaveText('synced')
+    const view = await page.evaluate(id => {
+        const w = window as any
+        return { x: w.__weftEditor.getShape(id)?.x, paints: w.receiptPaints }
+    }, original.shapeId)
+    expect(view.x).toBeCloseTo(original.x + dx * RM_SCALE, 4)
+    expect(view.paints).toEqual(['document-replaced'])
+})
