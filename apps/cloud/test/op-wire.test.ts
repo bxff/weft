@@ -21,7 +21,10 @@ beforeAll(() => {
     server = startCloud({ port: 0 })
     t = new HttpTransport({ baseUrl: `http://localhost:${server.port}`, getAuthToken: () => 'dev:wireuser' })
 })
-afterAll(() => server.stop())
+afterAll(() => {
+    t.close()
+    server.stop()
+})
 
 test('append + stream ops over HTTP, with a resumable head cursor', async () => {
     const r1 = await t.appendOps!(DOC, PAGE, [op('a'), op('b')], 'authorA')
@@ -143,7 +146,11 @@ test('ops are per-user isolated (a different bearer sees nothing)', async () => 
         baseUrl: `http://localhost:${server.port}`,
         getAuthToken: () => 'dev:otheruser',
     })
-    expect(await other.opsSince!(DOC, PAGE, 0)).toEqual([])
+    try {
+        expect(await other.opsSince!(DOC, PAGE, 0)).toEqual([])
+    } finally {
+        other.close()
+    }
 })
 
 test('a snapshot PUT lands in the change feed (the daemon pulls text edits)', async () => {
