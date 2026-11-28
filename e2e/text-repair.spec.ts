@@ -104,61 +104,90 @@ async function tabletErase(page: Page, pageId: string, items: ItemRef[]): Promis
 const glyphItems = (shape: OverlayShapeJson, index: number): ItemRef[] =>
     shape.rendered.find((p) => p.partKey === `glyph:${index}`)!.items
 
-test('adopting repeated tablet move snapshots repositions text without drawing its ink twice', async ({ page }) => {
-    const { encodeSnapshot } = await import('../packages/sync-engine/src/snapshot')
-    const { RM_SCALE } = await import('../packages/rm-ink/src/pen')
-    const pageId = crypto.randomUUID()
-    await seedText(page, `/app/${DOC}/${pageId}`, 'ab')
-    const shape = await textOverlay(page, pageId, 2)
-    const readView = () => page.evaluate((shapeId) => {
-        const { __weftEditor: editor } = window as unknown as { __weftEditor: Editor }
-        const shapes = editor.getCurrentPageShapes()
-        return {
-            x: shapes.find((candidate) => candidate.id === shapeId)?.x,
-            looseInkCount: shapes.filter((candidate) => candidate.type === 'draw').length,
-        }
-    }, shape.shapeId)
-    const before = await readView()
-    expect(before.x).toBeDefined()
-    expect(before.looseInkCount).toBe(0)
-
-    const { bytes } = await getRm(page, pageId)
-    const { RmDocument, crdtId } = await import('../packages/rm-format/src/index')
-    const rm = RmDocument.parse(bytes)
-    const overlayResponse = await page.request.get(`/api/documents/${DOC}/pages/${pageId}/overlay`)
-    expect(overlayResponse.ok()).toBe(true)
-    const overlay = await overlayResponse.json() as OverlayDocument
-    let strokes = shape.rendered.flatMap((part) => part.items)
-        .map((ref) => crdtId(rm.resolveAuthor(ref.authorUuid), ref.clock))
-    let totalDx = 0
-    for (const dx of [226, 113]) {
-        strokes = strokes.map((id) => {
-            const source = rm.findLineItem(id)!
-            const replacement = rm.appendLine({
-                ...source.line!,
-                moveId: source.line!.moveId ?? id,
-                points: source.line!.points.map((point) => ({ ...point, x: point.x + dx })),
-            }, { authorUuid: 'cdcd0001-0000-4000-a000-0000000000cd', parentId: source.parentId })
-            expect(rm.tombstone(id)).toBe(true)
-            return replacement.itemId
-        })
-        const put = await page.request.put(`/api/documents/${DOC}/pages/${pageId}/snapshot`, {
-            data: Buffer.from(encodeSnapshot(rm.serialize(), overlay)),
-            headers: { 'content-type': 'application/octet-stream' },
-        })
-        expect(put.ok()).toBe(true)
-        totalDx += dx
-        // Native points round to Float32 on serialization. Keep a subpixel
-        // tolerance on the inferred move, but require exact ink ownership.
-        await expect.poll(async () => {
-            const { x, looseInkCount } = await readView()
+for (const grouped of [false, true]) {
+    test(`adopting repeated tablet move snapshots repositions text exactly once (grouped=${grouped})`, async ({ page }) => {
+        const { encodeSnapshot } = await import('../packages/sync-engine/src/snapshot')
+        const { RM_SCALE } = await import('../packages/rm-ink/src/pen')
+        const pageId = crypto.randomUUID()
+        await seedText(page, `/app/${DOC}/${pageId}`, 'ab')
+        const shape = await textOverlay(page, pageId, 2)
+        await synced(page)
+        if (grouped) await page.evaluate(shapeId => {
+            const w = window as any
+            const editor = w.__weftEditor as Editor
+            const frame = 'shape:native-move-frame' as const
+            w.__weftController.remote(() => {
+                editor.createShape({ id: frame, type: 'frame', x: -200, y: -180, rotation: 0.3 })
+                editor.reparentShapes([shapeId as never], frame)
+            })
+        }, shape.shapeId)
+        const readView = () => page.evaluate((shapeId) => {
+            const { __weftEditor: editor } = window as unknown as { __weftEditor: Editor }
+            const shapes = editor.getCurrentPageShapes()
+            const shape = shapes.find(candidate => candidate.id === shapeId)
+            const frame = shapes.find(candidate => candidate.id === 'shape:native-move-frame')
+            const pose = shape && editor.getShapePageTransform(shape)
             return {
-                atExpectedX: x !== undefined && Math.abs(x - (before.x! + totalDx * RM_SCALE)) < 0.001,
-                looseInkCount,
+                x: pose?.e,
+                y: pose?.f,
+                rotation: pose && Math.atan2(pose.b, pose.a),
+                parentId: shape?.parentId,
+                props: shape?.props,
+                frame: frame && { x: frame.x, y: frame.y, rotation: frame.rotation, props: frame.props },
+                looseInkCount: shapes.filter((candidate) => candidate.type === 'draw').length,
             }
-        }).toEqual({ atExpectedX: true, looseInkCount: 0 })
-    }
-})
+        }, shape.shapeId)
+        const before = await readView()
+        expect(before.x).toBeDefined()
+        expect(before.rotation).toBeDefined()
+        expect(before.looseInkCount).toBe(0)
+
+        const { bytes } = await getRm(page, pageId)
+        const { RmDocument, crdtId } = await import('../packages/rm-format/src/index')
+        const rm = RmDocument.parse(bytes)
+        const overlayResponse = await page.request.get(`/api/documents/${DOC}/pages/${pageId}/overlay`)
+        expect(overlayResponse.ok()).toBe(true)
+        const overlay = await overlayResponse.json() as OverlayDocument
+        let strokes = shape.rendered.flatMap((part) => part.items)
+            .map((ref) => crdtId(rm.resolveAuthor(ref.authorUuid), ref.clock))
+        let totalDx = 0
+        for (const dx of [226, 113]) {
+            strokes = strokes.map((id) => {
+                const source = rm.findLineItem(id)!
+                const replacement = rm.appendLine({
+                    ...source.line!,
+                    moveId: source.line!.moveId ?? id,
+                    points: source.line!.points.map((point) => ({ ...point, x: point.x + dx })),
+                }, { authorUuid: 'cdcd0001-0000-4000-a000-0000000000cd', parentId: source.parentId })
+                expect(rm.tombstone(id)).toBe(true)
+                return replacement.itemId
+            })
+            const put = await page.request.put(`/api/documents/${DOC}/pages/${pageId}/snapshot`, {
+                data: Buffer.from(encodeSnapshot(rm.serialize(), overlay)),
+                headers: { 'content-type': 'application/octet-stream' },
+            })
+            expect(put.ok()).toBe(true)
+            totalDx += dx
+            // Native points round to Float32 on serialization. Keep a subpixel
+            // tolerance on the inferred move, but require exact ink ownership.
+            await expect.poll(async () => {
+                const { x, y, rotation, parentId, props, frame, looseInkCount } = await readView()
+                return {
+                    atExpectedX: x !== undefined && Math.abs(x - (before.x! + totalDx * RM_SCALE)) < 0.001,
+                    atExpectedY: y !== undefined && Math.abs(y - before.y!) < 0.001,
+                    atExpectedRotation: rotation !== undefined && Math.abs(rotation - before.rotation!) < 1e-9,
+                    parentId,
+                    props,
+                    frame,
+                    looseInkCount,
+                }
+            }).toEqual({
+                atExpectedX: true, atExpectedY: true, atExpectedRotation: true, parentId: before.parentId,
+                props: before.props, frame: before.frame, looseInkCount: 0,
+            })
+        }
+    })
+}
 
 test('TRAILING erase: "abcd" − "d" repairs to "abc" and stays editable text', async ({ page }) => {
     await seedText(page, `/app/${DOC}/${TRAILING_PAGE}`, 'abcd')

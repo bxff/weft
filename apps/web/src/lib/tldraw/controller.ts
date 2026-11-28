@@ -978,16 +978,24 @@ export class StudioController {
         // Skip no-op updates: every device echo re-renders the scene, and
         // updateShapes with identical values still mints new records (fresh
         // props identity), churning the store + React on every round-trip.
-        // renderRevision is the hash of exactly what defs carry (props +
-        // page transform), so equality means the live shape already matches.
+        // renderRevision describes the projection that authored these props,
+        // while native reconciliation may move its authoritative pose.
         const revByShape = new Map(overlay.shapes.map((s) => [s.shapeId, s.renderRevision]))
-        const toUpdate = defs.filter((d) => {
+        const toUpdate = defs.flatMap((d) => {
             const live = this.editor.getShape(d.id)
-            if (!live) return false
-            if (live.opacity !== d.opacity || (d.index !== undefined && live.index !== d.index)) return true
-            if ((live.meta as { weft?: boolean; detached?: boolean })?.weft !== true) return true
-            if ((live.meta as { detached?: boolean })?.detached !== d.meta.detached) return true
-            return hashOf(live, this.editor) !== revByShape.get(d.id)
+            if (!live) return []
+            // A tablet move rewrites the authoritative page pose without
+            // replacing the browser projection revision. Compare both.
+            const desired = Mat.Translate(d.x, d.y).rotate(d.rotation)
+            if (live.opacity === d.opacity && (d.index === undefined || live.index === d.index) &&
+                live.meta.weft === true && live.meta.detached === d.meta.detached &&
+                samePageTransform(this.editor.getShapePageTransform(live), desired) &&
+                hashOf(live, this.editor) === revByShape.get(d.id)) return []
+            if (isPageId(live.parentId)) return [d]
+            // Overlay positions are page-space; tldraw updates of existing
+            // frame/group children take parent-local coordinates.
+            const local = Mat.Compose(Mat.Inverse(this.editor.getShapeParentTransform(live)), desired)
+            return [{ ...d, x: local.e, y: local.f, rotation: Math.atan2(local.b, local.a) }]
         })
         if (toCreate.length) this.editor.createShapes(toCreate as never[])
         if (toUpdate.length) this.editor.updateShapes(toUpdate as never[])
