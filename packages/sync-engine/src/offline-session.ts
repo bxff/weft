@@ -307,6 +307,7 @@ export class OfflineSession {
         this.unsubscribe?.()
         if (this.retryTimer) clearInterval(this.retryTimer)
         if (this.quickRetryTimer) clearTimeout(this.quickRetryTimer)
+        if (this.localPublishTimer) clearTimeout(this.localPublishTimer)
     }
 
     /** Stop reconciliation while allowing already-started local writes to commit. */
@@ -415,15 +416,27 @@ export class OfflineSession {
         if (this.pendingOps.length > 0) void this.reconcile()
     }
 
-    /** Apply local edits: instant and durable, tablet not required. */
-    async apply(ops: LocalOp[]): Promise<void> {
+    private localPublishTimer: ReturnType<typeof setTimeout> | undefined
+
+    /** Apply local edits: durability never waits for the optional relay coalescing window. */
+    async apply(ops: LocalOp[], publishDelayMs = 0): Promise<void> {
         await this.writePending(async () => {
             this.pendingOps.push(...ops)
             this.pendingVersion++
             await this.persistPending()
         })
+        if (this.disposed) return
         this.status({ state: 'pending', ops: this.pendingOps.length })
-        void this.reconcile()
+        if (this.localPublishTimer) clearTimeout(this.localPublishTimer)
+        if (publishDelayMs > 0) {
+            this.localPublishTimer = setTimeout(() => {
+                this.localPublishTimer = undefined
+                void this.reconcile()
+            }, publishDelayMs)
+        } else {
+            this.localPublishTimer = undefined
+            void this.reconcile()
+        }
     }
 
     private status(s: SyncStatus): void {

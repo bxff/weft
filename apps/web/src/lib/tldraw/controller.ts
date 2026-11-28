@@ -21,6 +21,7 @@ import {
     type Editor,
     type ShapeUtil,
     type TLDrawShape,
+    type TLEventInfo,
     type TLShape,
     type TLShapeId,
 } from 'tldraw'
@@ -132,7 +133,9 @@ export interface ControllerOptions {
     clientId: string
     authorUuid: string
     fontUrl?: string
-    onStatus?: (status: SyncStatus) => void
+    onStatus?: (status: SyncStatus |
+        { state: 'saving-locally'; ops: number } |
+        { state: 'local-save-failed'; detail: string }) => void
     onPageAvailable?: () => void
 }
 
@@ -176,6 +179,8 @@ function sameNativeLine(a: Line, b: Line): boolean {
         })
 }
 
+const PUBLICATION_COALESCE_MS = 180
+
 const closingReplicas = new Map<string, Promise<void>>()
 
 export class StudioController {
@@ -195,6 +200,10 @@ export class StudioController {
     }
     /** tablet ink: itemRefKey -> tldraw shape id */
     private inkShapes = new Map<string, TLShapeId>()
+    private completedDrawUnsub: (() => void) | undefined
+    private drawStagePending = false
+    private drawSaveFailed = false
+    private lastSessionStatus: SyncStatus = { state: 'synced' }
     private debounce: ReturnType<typeof setTimeout> | null = null
     /** Font-not-ready flush retry (see flush). Cancelled on dispose so it
      *  never fires on a disposed controller. */
@@ -403,7 +412,10 @@ export class StudioController {
                 adoptOrphanAuthor,
                 onPatch: (patch) => this.onPatches([patch]),
                 onPatchBatch: (patches) => this.onPatches(patches),
-                onStatus: (status) => { if (!this.disposed) this.opts.onStatus?.(status) },
+                onStatus: (status) => {
+                    this.lastSessionStatus = status
+                    if (!this.disposed && !this.drawStagePending && !this.drawSaveFailed) this.opts.onStatus?.(status)
+                },
                 onPageAvailable: () => {
                     if (this.disposed) return
                     this.opts.onPageAvailable?.()
@@ -485,6 +497,31 @@ export class StudioController {
             },
             { scope: 'document', source: 'user' },
         )
+        const completeDraw = (info: TLEventInfo) => {
+            if (this.disposed || info.type !== 'pointer' || info.name !== 'pointer_up' || info.button !== 0 ||
+                this.editor.getCurrentToolId() !== 'draw') return
+            // The post-event hook sees the settled draw. Process the SDK's
+            // deferred store listeners now rather than a frame after release.
+            this.editor.store._flushHistory()
+            if (!this.hasOnlyFreshCompletedDraws()) return
+            if (this.debounce) clearTimeout(this.debounce)
+            this.drawStagePending = true
+            this.opts.onStatus?.({ state: 'saving-locally', ops: this.session.pendingCount })
+            void this.flush(true).catch(() => {})
+        }
+        this.editor.on('event', completeDraw)
+        this.completedDrawUnsub = () => this.editor.off('event', completeDraw)
+    }
+
+    private hasOnlyFreshCompletedDraws(): boolean {
+        if (!this.pendingShapeIds.size || this.pendingDeletes.size ||
+            this.pendingImageMoves.size || this.pendingInkTransforms.size ||
+            [...this.pendingOpacityWrites.keys()].some(id => !this.pendingShapeIds.has(id))) return false
+        return [...this.pendingShapeIds].every(id => {
+            const shape = this.editor.getShape(id as TLShapeId)
+            return shape?.type === 'draw' && (shape as TLDrawShape).props.isComplete &&
+                !shape.meta.rmBrush && !this.projectedShapeIds.has(id)
+        })
     }
 
     /** Run engine-driven editor mutations as remote-sourced store changes.
@@ -599,6 +636,8 @@ export class StudioController {
         this.anchorHistoryUnsub = null
         this.storeUnsub?.()
         this.storeUnsub = null
+        this.completedDrawUnsub?.()
+        this.completedDrawUnsub = undefined
         this.assetUnsub?.()
         for (const loading of this.loadingNativeImages.values()) loading.abort()
         this.docListUnsub?.()
@@ -1587,7 +1626,7 @@ export class StudioController {
         // Coalesces a burst of edits into one /ops POST. Kept short so the
         // web->tablet handoff is snappy; the daemon no longer adds a fixed
         // coalesce lead on top (it pulls the first edit immediately).
-        this.debounce = setTimeout(() => void this.flush().catch(() => {}), 180)
+        this.debounce = setTimeout(() => void this.flush().catch(() => {}), PUBLICATION_COALESCE_MS)
     }
 
     private hasUnprojectedShape(shapeId: string): boolean {
@@ -1611,21 +1650,46 @@ export class StudioController {
         return work
     }
 
-    private async applyLocal(ops: LocalOp[], render?: () => void): Promise<void> {
+    private async applyLocal(ops: LocalOp[], render?: () => void, publishDelayMs = 0): Promise<void> {
         if (this.disposed) return
+        const failedDraw = this.drawSaveFailed ? this.saveFailure : null
         try {
-            await this.session.apply(ops)
+            await this.session.apply(ops, publishDelayMs)
         } catch (error) {
             if (!this.disposed) {
                 this.saveFailure = Symbol()
                 if (render) this.renderAfterRetry.add(render)
-                this.opts.onStatus?.({ state: 'error', detail: String(error) })
+                if (this.drawStagePending) {
+                    this.drawSaveFailed = true
+                    this.opts.onStatus?.({ state: 'local-save-failed', detail: String(error) })
+                } else {
+                    this.opts.onStatus?.({ state: 'error', detail: String(error) })
+                }
             }
             // OfflineSession has already queued the ops. Retrying persistence
             // must write that queue, never apply the same command twice.
             throw error
         }
-        if (!this.disposed) render?.()
+        if (!this.disposed) {
+            // A committed apply persists the entire current pending queue, so
+            // it also covers the exact failed stroke still in that queue.
+            if (failedDraw && failedDraw === this.saveFailure) {
+                this.clearSaveFailure(failedDraw)
+                for (const retryRender of this.renderAfterRetry) {
+                    if (this.renderAfterRetry.delete(retryRender)) retryRender()
+                }
+            }
+            render?.()
+        }
+    }
+
+    private clearSaveFailure(failure: symbol | null): void {
+        if (this.saveFailure !== failure) return
+        this.saveFailure = null
+        if (this.drawSaveFailed) {
+            this.drawSaveFailed = false
+            if (!this.drawStagePending) this.opts.onStatus?.(this.lastSessionStatus)
+        }
     }
 
     completeNavigationGesture(): void {
@@ -1670,11 +1734,12 @@ export class StudioController {
                 const renders = [...this.renderAfterRetry]
                 await this.session.savePending()
                 if (this.disposed) return
-                if (this.saveFailure === failure) this.saveFailure = null
+                this.clearSaveFailure(failure)
                 for (const render of renders) {
                     if (this.renderAfterRetry.delete(render)) render()
                 }
                 this.rebuildSceneWhenIdle()
+                this.finishDrawStageIfDrained()
                 // Input can arrive while the IndexedDB transaction commits.
             } while (!this.disposed && this.hasUnsavedEdits)
         } catch (e) {
@@ -1683,19 +1748,40 @@ export class StudioController {
         }
     }
 
-    private flush(): Promise<void> {
-        if (this.flushing) return this.flushing.then(() => this.flush())
-        const work = this.flushBatch()
+    private flush(stageDraw = false): Promise<void> {
+        if (this.flushing) return this.flushing.then(
+            () => this.flush(stageDraw),
+            (error) => {
+                if (stageDraw && !this.disposed && this.hasQueuedShapeEdits) this.schedule()
+                throw error
+            },
+        )
+        if (stageDraw && !this.hasOnlyFreshCompletedDraws()) {
+            if (this.hasQueuedShapeEdits) this.schedule()
+            return Promise.resolve()
+        }
+        const work = this.flushBatch(stageDraw)
         this.flushing = work
         const clear = () => { if (this.flushing === work) this.flushing = null }
         void work.then(() => {
             clear()
             this.rebuildSceneWhenIdle()
+            this.finishDrawStageIfDrained()
         }, clear).catch(() => {})
         return work
     }
 
-    private async flushBatch(): Promise<void> {
+    private finishDrawStageIfDrained(): void {
+        // The pen fast path can hand the edits back to the normal debounce
+        // if mixed work joins while a prior write commits. A resolved fast
+        // path is not a durability signal. Only a successful drain is.
+        if (this.disposed || !this.drawStagePending || this.drawSaveFailed ||
+            this.flushing || this.hasQueuedShapeEdits) return
+        this.drawStagePending = false
+        this.opts.onStatus?.(this.lastSessionStatus)
+    }
+
+    private async flushBatch(stageDraw: boolean): Promise<void> {
         if (this.disposed) return
         if (!this.font && [...this.pendingShapeIds].some((id) =>
             needsProjectionFont(this.editor.getShape(id as TLShapeId)),
@@ -1835,7 +1921,7 @@ export class StudioController {
                 }
                 if (imageRemaps.size) this.remapImageIdentities(imageRemaps)
                 if (inkTransformKeys.length > 0) this.rebindTransformedInk(inkTransformKeys)
-            })
+            }, stageDraw ? PUBLICATION_COALESCE_MS : 0)
         }
         if (!this.disposed && this.deferredOpacityRepaints.size) this.applyDeferredOpacity(batch)
         if (!this.disposed && this.pendingAnchorReflow) {
