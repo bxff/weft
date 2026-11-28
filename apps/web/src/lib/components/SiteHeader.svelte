@@ -1,7 +1,7 @@
 <script lang="ts">
     import { onMount } from 'svelte'
     import { docsUrl } from '$lib/settings'
-    import { currentUserLabel, clerkEnabled, joinWaitlist } from '$lib/auth'
+    import { currentUserLabel, clerkEnabled, signIn } from '$lib/auth'
 
     let userLabel = $state<string | null>(null)
     let ready = $state(false)
@@ -28,8 +28,7 @@
         {#if userLabel}
             <a href="/library" class="wf-link">Open notes</a>
         {:else if showSignIn}
-            <!-- routes to the waitlist page, which links to sign-in for approved users -->
-            <button type="button" class="wf-nav" style="cursor: pointer" onclick={() => void joinWaitlist()}>Sign in</button>
+            <button type="button" class="wf-nav" style="cursor: pointer" onclick={() => void signIn()}>Sign in</button>
         {:else if ready}
             <a href="/library" class="wf-link">Open notes</a>
         {/if}

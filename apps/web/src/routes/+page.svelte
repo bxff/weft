@@ -1,7 +1,7 @@
 <script lang="ts">
     import { onMount } from 'svelte'
     import { docsUrl } from '$lib/settings'
-    import { currentUserLabel, clerkEnabled, joinWaitlist } from '$lib/auth'
+    import { currentUserLabel, clerkEnabled, signIn } from '$lib/auth'
     import SiteHeader from '$lib/components/SiteHeader.svelte'
     import SiteFooter from '$lib/components/SiteFooter.svelte'
     import heroManifest from '$lib/home-hero.json'
@@ -49,13 +49,8 @@
                     <a href="/library" class="wf-cta">Open your notes</a>
                     <a href={docsUrl()} class="wf-link" style="margin-left: 1rem; display: inline-block; white-space: nowrap">Read the docs &rarr;</a>
                 {:else if showSignIn}
-                    <!-- One door: the hosted waitlist page. New visitors leave
-                         their email; it links to sign-in for approved users. -->
-                    <button type="button" class="wf-cta" onclick={() => void joinWaitlist()}>Sign in or join the waitlist</button>
+                    <button type="button" class="wf-cta" onclick={() => void signIn()}>Sign in or sign up</button>
                     <a href={docsUrl()} class="wf-link" style="margin-left: 1rem; display: inline-block; white-space: nowrap">Read the docs &rarr;</a>
-                    <span class="mt-2 block text-[12px]" style="color: var(--gray-6)">
-                        Waitlist invites arrive by email. The domain is new, so check spam.
-                    </span>
                 {:else}
                     {#if ready}<a href="/library" class="wf-cta">Open your notes</a>{/if}
                     <a href={docsUrl()} class="wf-link" style:margin-left={ready ? '1rem' : undefined} style="display: inline-block; white-space: nowrap">Read the docs &rarr;</a>
@@ -99,7 +94,7 @@
                 The hosted beta is free, and none of it needs a reMarkable Connect
                 subscription: browser editing, backup, version history, PDFs, and images in
                 your notes all work on a plain account (the official apps reserve image
-                support for Connect subscribers). The hosted beta is invite-only. The
+                support for Connect subscribers). The
                 <a href="https://github.com/bxff/weft" class="wf-link">source is public</a>,
                 and you can <a href={docsUrl()} class="wf-link">run it yourself</a>.
             </p>
