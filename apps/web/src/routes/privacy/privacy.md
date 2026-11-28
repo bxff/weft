@@ -3,17 +3,17 @@ title: Privacy Notice
 description: How hosted Weft handles sign-in, synced notebooks, and privacy requests.
 ---
 
-Last revised 27 November 2026.
+Last revised 28 November 2026.
 
 ## Who runs Weft and what this notice covers
 
-I’m Musaab Khan. I operate hosted Weft at weft.page. This notice covers the website, beta waitlist and sign-in, browser editor, and hosted sync relay. It does not cover independently self-hosted Weft installations or reMarkable’s own cloud service.
+I’m Musaab Khan. I operate hosted Weft at weft.page. This notice covers the website, accounts and sign-in, browser editor, and hosted sync relay. It does not cover independently self-hosted Weft installations or reMarkable’s own cloud service.
 
 For privacy questions or requests, email me at [musaab.khan@protonmail.com](mailto:musaab.khan@protonmail.com). You do not need a Weft account.
 
 ## Information we use
 
-- **Beta waitlist.** If you join the waitlist, Clerk collects your email address. I use it to manage beta invitations and let you know about your request. You can browse the site without joining. To withdraw a pending request, email me.
+- **Former beta waitlist.** If you joined the former waitlist, Clerk collected the email address you provided so I could manage invitations and contact you about your request. If you want to ask about that information or have it removed, email me.
 
 - **Account and sign-in information.** Clerk handles sign-in, including Google sign-in. The relay uses your Clerk account ID to associate your synced notebooks with your account. When you’re signed in, Weft displays your primary email address, or your username or account ID if no primary email address is available.
 
@@ -39,7 +39,7 @@ A notebook you sync can contain information about someone else. Weft receives th
 
 - **Cloudflare** delivers the website and proxies traffic to and from the relay. It terminates HTTPS at its network edge and can process connection information, request headers, and the contents of traffic it forwards, including synced notebook data.
 
-- **Clerk** handles the waitlist and account authentication. If you sign in with Google, **Google** handles that part of sign-in.
+- **Clerk** handles account authentication. If you sign in with Google, **Google** handles that part of sign-in.
 
 - **tldraw** provides the editor SDK. Its license check sends the editor URL and license and SDK information to tldraw. The URL can include notebook and page identifiers. The license request does not contain notebook text, handwriting, or files.
 
