@@ -27,8 +27,6 @@ export interface ClerkLike {
     /** Hosted-portal sign-in (redirects to Clerk's Account Portal, has Google
      *  SSO, then back). Works without bundled UI components. */
     redirectToSignIn?(opts?: { signInForceRedirectUrl?: string }): Promise<unknown> | void
-    /** Hosted-portal waitlist page: email in, approval from the dashboard. */
-    redirectToWaitlist?(): Promise<unknown> | void
     signOut(): Promise<void>
     addListener(listener: () => void): void | (() => void)
 }
@@ -376,23 +374,6 @@ export async function signIn(): Promise<void> {
         await clerk.redirectToSignIn({ signInForceRedirectUrl: window.location.href })
     } else {
         clerk.openSignIn()
-    }
-}
-
-/** Waitlist-first front door for the invite-only beta: new visitors land on
- *  the hosted waitlist page. Falls back to plain sign-in where unavailable. */
-export async function joinWaitlist(): Promise<void> {
-    if (!clerkEnabled()) {
-        window.location.href = '/login'
-        return
-    }
-    const clerk = await ensureClerk()
-    if (!clerk) return
-    if (clerk.redirectToWaitlist) {
-        rememberClerkSignIn(clerk)
-        await clerk.redirectToWaitlist()
-    } else {
-        await signIn()
     }
 }
 
