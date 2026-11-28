@@ -7,6 +7,7 @@
 
 import {
   BelowFloorError,
+  HistoryCheckpointError,
   CloudStore,
   type StorageClass,
   type StoredFailureReport,
@@ -1967,7 +1968,7 @@ export function startCloud(
                 400,
               );
             }
-            const bytes = store.getSnapshotBytes(user, doc, page, snapSeq);
+            const bytes = store.getSnapshotBytes(user, doc, page, snapSeq, true);
             if (!bytes) {
               return json(
                 { error: "snapshot not found (it may have been pruned)" },
@@ -2189,6 +2190,10 @@ export function startCloud(
     // request lands here — report to GlitchTip (telemetry.ts) and answer a
     // clean 500 instead of Bun's default HTML error page.
     error(err) {
+      if (err instanceof HistoryCheckpointError) {
+        console.error("weft-cloud: history checkpoint unavailable", err.cause);
+        return json({ error: "required history checkpoint is unavailable; try again after it is restored" }, 503);
+      }
       if (err instanceof RootTextAuthorConflict) {
         // A legacy tablet treats 409 as permission to fetch a different page.
         return json({ error: "unresolved-text-author" }, 422);
