@@ -15,6 +15,7 @@ import {
     rootTextCharPositions,
     crdtId,
     crdtIdKey,
+    lww,
     ParagraphStyle,
     encodeStyleExtra,
 } from '../src/index'
@@ -183,7 +184,7 @@ describe('inline format codes (bold/italic)', () => {
         expect(spansOf(back)).toEqual([[{ text: 'abc', bold: false, italic: false }]])
     })
 
-    test('bold+italic overlap and paragraph boundaries', () => {
+    test('separate bold and italic spans across paragraph boundaries', () => {
         const doc = RmDocument.empty(WEB)
         createRootText(doc)
         insertText(doc, null, 'ab\ncd', { authorUuid: WEB })
@@ -204,7 +205,7 @@ describe('inline format codes (bold/italic)', () => {
         ])
     })
 
-    test('bold+italic on the SAME char sanitizes to italic (device cannot overlap)', () => {
+    test('default writer normalizes a requested bold+italic overlap to italic', () => {
         const doc = RmDocument.empty(WEB)
         createRootText(doc)
         insertText(doc, null, 'mixed both mixed', { authorUuid: WEB })
@@ -221,6 +222,54 @@ describe('inline format codes (bold/italic)', () => {
         const again = planFormatEdits(back.tree().rootText!, T('mixed both mixed', '......xxxx......'))!
         expect(again.deleteIds).toHaveLength(0)
         expect(again.inserts).toHaveLength(0)
+    })
+
+    test('serialized native overlap retains its marks, paragraph styles, and ink anchor', () => {
+        const doc = RmDocument.empty(TABLET)
+        createRootText(doc)
+        const start = insertText(doc, null, 'Title\nABCD\nNext', { authorUuid: TABLET })
+        const id = (offset: number) => crdtId(start.part1, start.part2 + offset)
+        const author = { authorUuid: TABLET }
+        setParagraphStyle(doc, crdtId(0, 0), ParagraphStyle.HEADING, author)
+        setParagraphStyle(doc, id(5), ParagraphStyle.BULLET, { ...author, extra: encodeStyleExtra({ indent: 1 }) })
+        setParagraphStyle(doc, id(10), 10, author) // native numbered list
+
+        // Construct the native wire codes directly, not through planFormatEdits:
+        // the current compatibility writer does not author overlapping marks.
+        insertFormatCode(doc, id(5), 1, author)
+        insertFormatCode(doc, id(6), 3, author)
+        insertFormatCode(doc, id(7), 2, author)
+        insertFormatCode(doc, id(8), 4, author)
+
+        const layer = doc.blocks.find((b) => b.type === 'treeNode' && crdtIdKey(b.nodeId) === crdtIdKey(doc.defaultLayerId()!))
+        if (!layer || layer.type !== 'treeNode') throw new Error('missing ink layer')
+        const stamp = crdtId(start.part1, doc.maxClock() + 1)
+        layer.anchorId = lww(stamp, id(7))
+        layer.anchorType = lww(stamp, 2)
+        layer.anchorThreshold = lww(stamp, 0)
+        layer.anchorOriginX = lww(stamp, -464)
+
+        const bytes = doc.serialize()
+        const back = RmDocument.parse(bytes)
+        expect(back.serialize()).toEqual(bytes)
+        const text = back.tree().rootText!
+        const paragraphs = linearizeRootText(text)
+        expect(paragraphs.map(p => [crdtIdKey(p.startId), p.style, p.indentLevel])).toEqual([
+            ['0:0', ParagraphStyle.HEADING, undefined],
+            [crdtIdKey(id(5)), ParagraphStyle.BULLET, 1],
+            [crdtIdKey(id(10)), 10, undefined],
+        ])
+        expect(paragraphs[1]!.spans).toEqual([
+            { text: 'A', bold: true, italic: false },
+            { text: 'B', bold: true, italic: true },
+            { text: 'C', bold: false, italic: true },
+            { text: 'D', bold: false, italic: false },
+        ])
+        expect(paragraphs[2]!.spans).toEqual([{ text: 'Next', bold: false, italic: false }])
+        expect(back.anchoredGroups().map(group => crdtIdKey(group.anchorId))).toEqual([crdtIdKey(id(7))])
+        expect(rootTextCharPositions(text).find(c => crdtIdKey(c.id) === crdtIdKey(id(7)))).toMatchObject({
+            paragraphIndex: 1, offset: 1,
+        })
     })
 
     test('length mismatch returns null (text diff not settled)', () => {

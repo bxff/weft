@@ -6,6 +6,9 @@
 import { Database } from "bun:sqlite";
 import { publishBackup } from "./backup";
 import {
+  closeSync,
+  fsyncSync,
+  openSync,
   mkdirSync,
   mkdtempSync,
   writeFileSync,
@@ -17,6 +20,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve, win32 } from "node:path";
 import { tmpdir } from "node:os";
+import type { RecoveryImport } from "./recovery-import";
 import { RmDocument, RootTextAuthorConflict } from "@weft/rm-format";
 import {
   reconstructRm,
@@ -36,6 +40,18 @@ import {
   type Op,
   type OverlayDocument,
 } from "@weft/sync-engine";
+
+/** Keep FULL enabled through the caller's synchronous, top-level commit. */
+function withFullDurability<T>(db: Database, publish: () => T): T {
+  if (db.inTransaction) throw new Error("Durable publication requires its own transaction");
+  const previous = db.query<{ synchronous: number }, []>("PRAGMA synchronous").get()!.synchronous;
+  db.run("PRAGMA synchronous = FULL");
+  try {
+    return publish();
+  } finally {
+    db.run(`PRAGMA synchronous = ${previous}`);
+  }
+}
 
 /** Author naming author-table index 1 when seeding an empty reconstructed doc
  *  for the device bridge; real ink ops carry their own authors. */
@@ -200,8 +216,14 @@ export class CloudStore {
             );
             CREATE TABLE IF NOT EXISTS assets (
                 user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
-                file TEXT NOT NULL, bytes BLOB NOT NULL,
+                file TEXT NOT NULL, bytes BLOB NOT NULL, etag TEXT,
                 PRIMARY KEY (user_id, doc, page, file)
+            );
+            CREATE TABLE IF NOT EXISTS recovery_epochs (
+                user_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recovery_imports (
+                user_id TEXT PRIMARY KEY, digest TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS thumbnails (
                 user_id TEXT NOT NULL, doc TEXT NOT NULL, page TEXT NOT NULL,
@@ -288,7 +310,8 @@ export class CloudStore {
                 -- at/after its op_seq (newest-snapshot rule), so stateAt(head)==live
                 -- after a revert; targets before op_seq exclude it and raw-replay.
                 -- Also exempts revert markers from SNAPSHOT_KEEP pruning.
-                revert INTEGER NOT NULL DEFAULT 0
+                revert INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT
             );
             CREATE INDEX IF NOT EXISTS page_snapshots_page ON page_snapshots(user_id, doc, page, seq);
             -- Truncation floor: the highest op seq retention deleted for a page
@@ -355,7 +378,30 @@ export class CloudStore {
     this.db.run(
       "CREATE INDEX IF NOT EXISTS device_tokens_user ON device_tokens(user_id)",
     );
+    if (!(this.db.query<{ name: string }, []>("PRAGMA table_info(assets)").all())
+      .some((column) => column.name === "etag")) {
+      this.db.run("ALTER TABLE assets ADD COLUMN etag TEXT");
+    }
+    if (!this.db.query("SELECT 1 FROM pragma_table_info('page_snapshots') WHERE name='sha256'").get()) {
+      this.db.run("ALTER TABLE page_snapshots ADD COLUMN sha256 TEXT");
+    }
+
+    // Existing change sequence covers normal page writes. Track independent
+    // changes transactionally (including DELETE and same-name replacement), so
+    // an unchanged recovery sweep does not have to scan a user's library.
+    for (const table of ["assets", "overlays", "page_snapshots"]) {
+      for (const [event, row] of [["INSERT", "NEW"], ["UPDATE", "NEW"], ["DELETE", "OLD"]]) {
+        this.db.run(`
+          CREATE TRIGGER IF NOT EXISTS recovery_epoch_${table}_${event}
+          AFTER ${event} ON ${table} BEGIN
+            INSERT INTO recovery_epochs (user_id, epoch) VALUES (${row}.user_id, 1)
+            ON CONFLICT(user_id) DO UPDATE SET epoch=epoch+1;
+          END;
+        `);
+      }
+    }
     this.initUsageTracking();
+    this.reclaimOrphanSources();
   }
 
   // ----- per-user storage usage (two classes) -----
@@ -791,16 +837,6 @@ export class CloudStore {
       .all(user);
   }
 
-  /** On-disk path for a document's source file. The raw ids are hashed, so
-   *  the name is escape-proof (no path separators survive) and collision-free
-   *  (distinct tenants can never map onto the same file). */
-  private filePath(user: string, doc: string): string {
-    return join(
-      this.filesDir,
-      sha256hex(new TextEncoder().encode(`${user}\u0000${doc}`)),
-    );
-  }
-
   /** Saved paths include the writer's absolute directory, which can change
    * on restore. Retain only the generated digest within the current tree. */
   private storedBlobPath(stored: string, folder: "" | "snapshots" = ""): string | null {
@@ -914,6 +950,96 @@ export class CloudStore {
       this.latestOpSeq(user, doc, page),
       this.latestSnapshotSeq(user, doc, page),
     );
+  }
+
+  /** Publish a validated restore to an empty account under one writer lock.
+   * New checkpoint files are retired on rollback by the normal publisher. */
+  restoreRecoveryNotebook(
+    user: string, data: RecoveryImport, digest: string,
+    storageCheck: (stage: "before" | "after") => void,
+  ): "created" | "replay" | "not-empty" | "unverified" {
+    const { notebook, pages } = data;
+    const restore = () => this.publishPage(user, notebook.id, pages[0]!.id, () => {
+      const receipt = this.db.query<{ digest: string }, [string]>(
+        "SELECT digest FROM recovery_imports WHERE user_id=?",
+      ).get(user);
+      const list = JSON.parse(this.getDocuments(user)) as { documents?: { id?: unknown; deleted?: unknown; pages?: { id?: unknown }[] }[] };
+      if (!Array.isArray(list.documents)) return "not-empty";
+      const current = list.documents.find(d => d.id === notebook.id && d.deleted !== true);
+      if (receipt?.digest === digest && current) {
+        if (!Array.isArray(current.pages) ||
+            !current.pages.every(p => p && typeof p.id === "string")) return "unverified";
+        const retained = new Set(current.pages.map(p => p.id));
+        return pages.every(p => !retained.has(p.id) || this.verifyRecoveredPage(user, notebook.id, p.id))
+          ? "replay" : "unverified";
+      }
+      const hasRows = USAGE_TABLES.some(([table]) =>
+        !!this.db.query(`SELECT 1 FROM ${table} WHERE user_id=? LIMIT 1`).get(user));
+      if (receipt || list.documents.length || hasRows ||
+          this.db.query("SELECT 1 FROM device_tokens WHERE user_id=? LIMIT 1").get(user)) {
+        return "not-empty";
+      }
+      storageCheck("before");
+      // Mark the account before generating checkpoint files so every snapshot
+      // written by this restore (and future edits) records an integrity hash.
+      this.db.run("INSERT INTO recovery_imports (user_id, digest) VALUES (?,?)", [user, digest]);
+      const timestamp = Date.now();
+      this.putDocuments(user, JSON.stringify({
+        documents: [{ ...notebook, type: "notebook", parent: "", createdTime: timestamp, lastModified: timestamp }],
+      }));
+      for (const page of pages) {
+        for (const { name, bytes } of page.assets) {
+          this.putAsset(user, notebook.id, page.id, name, bytes);
+        }
+        this.putSnapshot(user, notebook.id, page.id, encodeSnapshot(page.native, page.overlay), false, 0);
+        if (page.currentNative) {
+          const base = this.deviceRevision(user, notebook.id, page.id);
+          const { changed } = this.applyDevicePut(user, notebook.id, page.id, page.currentNative, base, "recovery");
+          if (changed) continue; // the existing merge already recorded the head
+        }
+        this.recordOpChange(user, notebook.id, page.id, "recovery");
+      }
+      storageCheck("after");
+      for (const path of this.stagedPageFiles!) this.syncPath(path);
+      const snapshotsDir = join(this.filesDir, "snapshots");
+      // A fresh relay may have just created snapshots/ and its parent.
+      this.syncPath(snapshotsDir);
+      this.syncPath(this.filesDir);
+      this.syncPath(dirname(this.filesDir));
+      return "created";
+    });
+    return withFullDurability(this.db, restore);
+  }
+
+  private syncPath(path: string): void {
+    const fd = openSync(path, "r");
+    try { fsyncSync(fd); }
+    finally { closeSync(fd); }
+  }
+
+  private verifyRecoveredPage(user: string, doc: string, page: string): boolean {
+    try {
+      const snapshot = this.latestSnapshotRow(user, doc, page);
+      if (!snapshot?.sha256 || snapshot.op_seq < this.truncationFloor(user, doc, page)) return false;
+      const path = this.existingSnapshotPath(snapshot.path);
+      if (!path) return false;
+      const bytes = readFileSync(path);
+      if (sha256hex(bytes) !== snapshot.sha256) return false;
+      const base = decodeSnapshot(bytes);
+      const ops = this.opsInRange(user, doc, page, snapshot.op_seq, this.latestOpSeq(user, doc, page));
+      const current = reconstructRm(base.rm, ops, DEVICE_BRIDGE_AUTHOR);
+      for (const [, item] of RmDocument.parse(current).tree().walk()) {
+        if (item.kind !== "image") continue;
+        if (!item.filename) return false;
+        const stored = this.db.query<{ bytes: Uint8Array; etag: string | null }, [string, string, string, string]>(
+          "SELECT bytes, etag FROM assets WHERE user_id=? AND doc=? AND page=? AND file=?",
+        ).get(user, doc, page, item.filename);
+        if (!stored?.etag || sha256hex(stored.bytes) !== stored.etag) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Run a synchronous page write under SQLite's write lock. New snapshot
@@ -1429,9 +1555,121 @@ export class CloudStore {
     bytes: Uint8Array,
   ): void {
     this.db.run(
-      "INSERT OR REPLACE INTO assets (user_id, doc, page, file, bytes) VALUES (?, ?, ?, ?, ?)",
-      [user, doc, page, file, bytes],
+      "INSERT OR REPLACE INTO assets (user_id, doc, page, file, bytes, etag) VALUES (?, ?, ?, ?, ?, ?)",
+      [user, doc, page, file, bytes, sha256hex(bytes)],
     );
+  }
+
+  /** Existing rows may lack a hash after upgrade. Their marker changes on
+   * the first subsequent PUT, and remains stable until the bytes are replaced. */
+  private recoveryAssetMarker(
+    rows: { file: string; etag: string | null }[], legacyOverlay: string | null = null,
+  ): string {
+    if (!rows.length && legacyOverlay === null) return "";
+    return sha256hex(Buffer.from(JSON.stringify([rows.map(({ file, etag }) => [file, etag]), legacyOverlay])));
+  }
+
+  /** A separate marker per page lets an asset-only overwrite wake the tablet
+   * even if the native revision and the retained change feed did not change.
+   * Legacy blob overlays can change independently of the native revision too. */
+  recoveryAssetRevisions(user: string): Record<string, string> {
+    const rows = this.db.query<
+      { doc: string; page: string; file: string; etag: string | null }, [string]
+    >("SELECT doc, page, file, etag FROM assets WHERE user_id=? ORDER BY doc, page, file").all(user);
+    const groups = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const key = `${row.doc}/${row.page}`;
+      const group = groups.get(key);
+      if (group) group.push(row);
+      else groups.set(key, [row]);
+    }
+    const legacy = this.db.query<{ doc: string; page: string; json: string }, [string]>(`
+      SELECT o.doc, o.page, o.json FROM overlays o
+      WHERE o.user_id=?1
+        AND NOT EXISTS (SELECT 1 FROM page_ops p WHERE p.user_id=?1 AND p.doc=o.doc AND p.page=o.page)
+        AND NOT EXISTS (SELECT 1 FROM page_snapshots s WHERE s.user_id=?1 AND s.doc=o.doc AND s.page=o.page)
+    `).all(user);
+    const legacyByPage = new Map(legacy.map(({ doc, page, json }) => [`${doc}/${page}`, json]));
+    const keys = new Set([...groups.keys(), ...legacyByPage.keys()]);
+    return Object.fromEntries([...keys].map((key) => [
+      key, this.recoveryAssetMarker(groups.get(key) ?? [], legacyByPage.get(key) ?? null),
+    ]));
+  }
+
+  readRecoveryRevisions(user: string, ifNoneMatch: string | null) {
+    return this.db.transaction(() => {
+      const epoch = this.db.query<{ epoch: number }, [string]>(
+        "SELECT epoch FROM recovery_epochs WHERE user_id=?",
+      ).get(user)?.epoch ?? 0;
+      const etag = `"recovery-v1-${this.latestChangeSeq(user)}-${epoch}"`;
+      return ifNoneMatch === etag
+        ? { etag, body: null }
+        : { etag, body: { pages: this.pageRevisions(user), assets: this.recoveryAssetRevisions(user) } };
+    })();
+  }
+
+  /** Read all members of the recovery revision in the same SQLite snapshot.
+   * Missing checkpoint files fail closed instead of replaying against empty ink. */
+  readRecoveryPage(
+    user: string, doc: string, page: string,
+    knownNative: string | null, ifNoneMatch: string | null,
+  ) {
+    return this.db.transaction(() => {
+      const snapshot = this.latestSnapshotRow(user, doc, page);
+      const snapshotSeq = snapshot?.seq ?? 0;
+      const opSeq = this.latestOpSeq(user, doc, page);
+      const blob = snapshotSeq || opSeq ? null : this.getPage(user, doc, page);
+      if (!snapshotSeq && !opSeq && !blob) return null;
+      const revision = blob?.revision ?? opMarker(opSeq, snapshotSeq);
+      const legacyOverlay = blob ? this.getOverlay(user, doc, page) : null;
+      const rows = this.db.query<{ file: string; etag: string | null }, [string,string,string]>(
+        "SELECT file, etag FROM assets WHERE user_id=? AND doc=? AND page=? ORDER BY file",
+      ).all(user, doc, page);
+      const assetRevision = this.recoveryAssetMarker(rows, legacyOverlay);
+      const etagFor = (native: string) =>
+        `"${sha256hex(Buffer.from(JSON.stringify([revision, native, assetRevision, legacyOverlay])))}"`;
+      // The client must still hold the exact native bytes for a 304. Including
+      // their digest in the validator makes the common conditional check cheap.
+      if (knownNative && /^[a-f0-9]{64}$/.test(knownNative) && ifNoneMatch === etagFor(knownNative)) {
+        return { etag: ifNoneMatch, body: null };
+      }
+
+      if (this.truncationFloor(user, doc, page) > (snapshot?.op_seq ?? 0)) {
+        throw new Error("Recovery checkpoint is below the retained operation floor");
+      }
+      const checkpointPath = snapshot ? this.storedBlobPath(snapshot.path, "snapshots") : null;
+      if (snapshot && !checkpointPath) throw new Error("Invalid recovery checkpoint path");
+      const checkpoint = checkpointPath
+        ? decodeSnapshot(new Uint8Array(readFileSync(checkpointPath))) : null;
+      const ops = this.opsInRange(user, doc, page, snapshot?.op_seq ?? 0, opSeq);
+      const native = blob?.bytes ?? reconstructRm(checkpoint?.rm ?? null, ops, DEVICE_BRIDGE_AUTHOR);
+      const overlay: OverlayDocument = checkpoint?.overlay ?? (legacyOverlay ? JSON.parse(legacyOverlay) : { shapes: [] });
+      foldOverlayOps(overlay, ops);
+      const nativeSha256 = sha256hex(native);
+      const required = new Set<string>();
+      const missingAssets = new Set<string>();
+      for (const [, item] of RmDocument.parse(native).tree().walk()) {
+        if (item.kind !== "image") continue;
+        if (item.filename) required.add(item.filename);
+        else missingAssets.add("<unresolved image>");
+      }
+      const assets = [];
+      for (const { file, etag } of rows) {
+        if (!required.delete(file)) continue;
+        const bytes = etag ? null : this.getAsset(user, doc, page, file);
+        if (!etag && !bytes) throw new Error("Recovery asset disappeared");
+        assets.push({ name: file, sha256: etag ?? sha256hex(bytes!) });
+      }
+      for (const file of required) missingAssets.add(file);
+      return {
+        etag: etagFor(nativeSha256),
+        body: {
+          revision, snapshotSeq, opSeq, nativeSha256, assetRevision,
+          nativeBase64: nativeSha256 === knownNative ? null : Buffer.from(native).toString("base64"),
+          overlay, assets, missingAssets: [...missingAssets],
+        },
+      };
+    })();
   }
 
   listAssets(user: string, doc: string, page: string): string[] {
@@ -1508,13 +1746,88 @@ export class CloudStore {
     doc: string,
     bytes: Uint8Array,
     mime = "application/pdf",
-  ): void {
-    const path = this.filePath(user, doc);
-    writeFileSync(path, bytes);
-    this.db.run(
-      "INSERT OR REPLACE INTO files (user_id, doc, path, size, mime, etag) VALUES (?, ?, ?, ?, ?, ?)",
-      [user, doc, path, bytes.length, mime, sha256hex(bytes)],
-    );
+    limit = 0,
+  ): boolean {
+    const etag = sha256hex(bytes);
+    let staged: string | undefined;
+    const retired: string[] = [];
+    try {
+      const published = this.commitSources(() => {
+        const old = this.sourceRow(user, doc);
+        const needed = this.usageBytes(user, "sources") - (old?.size ?? 0) + bytes.length - limit;
+        const victims = limit > 0 && needed > 0 ? this.colderSources(user, doc, needed) : [];
+        if (!victims) return false;
+
+        // Do not truncate the live source (including a pre-upgrade file).
+        // Put the replacement on durable storage before publishing its row.
+        const path = join(this.filesDir, sha256hex(new TextEncoder().encode(crypto.randomUUID())));
+        const fd = openSync(path, "wx", 0o600);
+        staged = path;
+        try {
+          writeFileSync(fd, bytes);
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+        this.syncPath(this.filesDir);
+        this.syncPath(dirname(this.filesDir));
+        this.db.run(
+          "INSERT OR REPLACE INTO files (user_id, doc, path, size, mime, etag) VALUES (?, ?, ?, ?, ?, ?)",
+          [user, doc, path, bytes.length, mime, etag],
+        );
+        if (old) retired.push(old.path);
+        for (const victim of victims) {
+          this.db.run("DELETE FROM files WHERE user_id=? AND doc=?", [user, victim.doc]);
+          retired.push(victim.path);
+        }
+        return true;
+      });
+      // A stale reader may still hold the old inode; unlink is safe for it.
+      for (const path of retired) this.unlinkSource(path);
+      return published;
+    } catch (error) {
+      // Never remove a possibly committed blob if checking the DB also fails.
+      // Startup reconciles either side of an interrupted publication.
+      if (staged) {
+        try {
+          if (this.sourceRow(user, doc)?.path !== staged) this.unlinkSource(staged);
+        } catch {}
+      }
+      throw error;
+    }
+  }
+
+  private sourceRow(user: string, doc: string) {
+    return this.db.query<{ path: string; size: number; mime: string; etag: string }, [string, string]>(
+      "SELECT path, size, mime, etag FROM files WHERE user_id=? AND doc=?",
+    ).get(user, doc);
+  }
+
+  private commitSources<T>(write: () => T): T {
+    // No autocommit ROW can be lost to a WAL reset after deleting its old
+    // files. BEGIN IMMEDIATE also serializes quota planning with other writers.
+    return withFullDurability(this.db, () => this.db.transaction(write).immediate());
+  }
+
+  private unlinkSource(stored: string): void {
+    const path = this.storedBlobPath(stored);
+    if (!path) return;
+    try { rmSync(path, { force: true }); }
+    catch (error) { console.error("weft-cloud: source cleanup deferred:", (error as NodeJS.ErrnoException).code); }
+  }
+
+  private reclaimOrphanSources(): void {
+    // Covers a crash before COMMIT (staged candidate) or after it (retired
+    // blobs). The writer lock prevents sweeping another process's candidate.
+    this.db.transaction(() => {
+      const live = new Set(this.db.query<{ path: string }, []>("SELECT path FROM files").all()
+        .map(({ path }) => this.storedBlobPath(path)));
+      for (const entry of readdirSync(this.filesDir, { withFileTypes: true })) {
+        if (entry.isFile() && /^[0-9a-f]{64}$/.test(entry.name) && !live.has(join(this.filesDir, entry.name))) {
+          this.unlinkSource(entry.name);
+        }
+      }
+    }).immediate();
   }
 
   /** Disk reference for a document's source file (for streaming + Range), or
@@ -1523,22 +1836,12 @@ export class CloudStore {
     user: string,
     doc: string,
   ): { path: string; size: number; mime: string; etag: string } | null {
-    const row = this.db
-      .query<
-        { path: string; size: number; mime: string; etag: string },
-        [string, string]
-      >("SELECT path, size, mime, etag FROM files WHERE user_id = ? AND doc = ?")
-      .get(user, doc);
+    const row = this.sourceRow(user, doc);
     if (!row) return null;
     const path = this.storedBlobPath(row.path);
-    if (!path || !existsSync(path)) return null;
-    // trust the on-disk size in case it was replaced out of band
-    return {
-      path,
-      size: statSync(path).size,
-      mime: row.mime,
-      etag: row.etag,
-    };
+    if (!path) return null;
+    const stat = statSync(path, { throwIfNoEntry: false });
+    return stat ? { path, size: stat.size, mime: row.mime, etag: row.etag } : null;
   }
 
   /** Full bytes of a document's source file (used by tests/back-compat). */
@@ -1563,17 +1866,16 @@ export class CloudStore {
    *  bytes. The source is NOT lost — it still lives on the tablet and re-pushes
    *  when it's hot enough to be resident again. */
   deleteFile(user: string, doc: string): number {
-    const ref = this.getFileRef(user, doc);
-    this.db.run("DELETE FROM files WHERE user_id=? AND doc=?", [user, doc]);
-    if (ref) {
-      try {
-        rmSync(ref.path, { force: true });
-      } catch {
-        // best-effort; the row is gone so usage no longer counts it
-      }
-      return ref.size;
-    }
-    return 0;
+    const ref = this.commitSources(() => {
+      const row = this.sourceRow(user, doc);
+      if (row) this.db.run("DELETE FROM files WHERE user_id=? AND doc=?", [user, doc]);
+      return row;
+    });
+    if (!ref) return 0;
+    const path = this.storedBlobPath(ref.path);
+    const size = path ? statSync(path, { throwIfNoEntry: false })?.size ?? 0 : 0;
+    this.unlinkSource(ref.path);
+    return size;
   }
 
   /** A doc's lastOpened (epoch ms) from the stored doc list, or 0 (never opened
@@ -1592,38 +1894,20 @@ export class CloudStore {
     }
   }
 
-  /** LRU eviction to make room for an incoming source (#81): free source bytes
-   *  by deleting the COLDEST resident sources (oldest lastOpened) that are
-   *  STRICTLY colder than `incomingDoc` — a source can only displace ones the
-   *  user opened less recently than the one being pushed. Never evicts the
-   *  incoming doc itself. Returns the total bytes freed (caller re-checks the
-   *  quota; if the incoming is the coldest of all, nothing is freed and it
-   *  stays tablet-only — correct). Evicted bytes remain on the tablet and
-   *  re-push when hot again. */
-  evictColderSources(user: string, needBytes: number, incomingDoc: string): number {
-    if (needBytes <= 0) return 0;
+  /** Plan enough strictly colder removals, or return null without taking any. */
+  private colderSources(user: string, incomingDoc: string, needed: number) {
     const incomingLastOpened = this.docLastOpened(user, incomingDoc);
-    // colder resident sources (recency + size), coldest first
-    const colder = this.residentSources(user)
-      .filter((doc) => doc !== incomingDoc)
-      .map((doc) => ({
-        doc,
-        lastOpened: this.docLastOpened(user, doc),
-        size: this.getFileRef(user, doc)?.size ?? 0,
-      }))
-      .filter((r) => r.lastOpened < incomingLastOpened)
+    const colder = this.db.query<{ doc: string; path: string; size: number }, [string, string]>(
+      "SELECT doc, path, size FROM files WHERE user_id=? AND doc!=? ORDER BY doc",
+    ).all(user, incomingDoc)
+      .map(row => ({ ...row, lastOpened: this.docLastOpened(user, row.doc) }))
+      .filter(row => row.lastOpened < incomingLastOpened)
       .sort((a, b) => a.lastOpened - b.lastOpened);
-    // ATOMIC: if the colder sources can't free `needBytes`, the incoming won't
-    // fit anyway — evict NOTHING rather than delete innocents for a PUT the
-    // server is about to 507 (which then churns those evicted sources back).
-    const evictable = colder.reduce((n, r) => n + r.size, 0);
-    if (evictable < needBytes) return 0;
-    let freed = 0;
-    for (const r of colder) {
-      if (freed >= needBytes) break;
-      freed += this.deleteFile(user, r.doc);
+    for (let i = 0; i < colder.length; i++) {
+      needed -= colder[i]!.size;
+      if (needed <= 0) return colder.slice(0, i + 1);
     }
-    return freed;
+    return null;
   }
 
   // Page templates (reMarkable's line/grid backgrounds), per user so one
@@ -2291,9 +2575,10 @@ export class CloudStore {
     );
     try {
       writeFileSync(path, bytes);
+      const recovery = this.db.query("SELECT 1 FROM recovery_imports WHERE user_id=?").get(user);
       const seq = this.db
         .query(
-          "INSERT INTO page_snapshots (user_id, doc, page, path, size, ts, op_seq, revert) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO page_snapshots (user_id, doc, page, path, size, ts, op_seq, revert, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .run(
           user,
@@ -2304,6 +2589,7 @@ export class CloudStore {
           Date.now(),
           opSeq,
           revert ? 1 : 0,
+          recovery ? sha256hex(bytes) : null,
         ).lastInsertRowid as number;
       this.stagedPageFiles?.push(path);
       return seq;
@@ -2356,10 +2642,10 @@ export class CloudStore {
   private latestSnapshotRow(user: string, doc: string, page: string) {
     return this.db
       .query<
-        { seq: number; op_seq: number; revert: number; path: string; complete: number },
+        { seq: number; op_seq: number; revert: number; path: string; complete: number; sha256: string | null },
         [string, string, string]
       >(
-        `SELECT s.seq, s.op_seq, s.revert, s.path,
+        `SELECT s.seq, s.op_seq, s.revert, s.path, s.sha256,
            (s.op_seq >= COALESCE((SELECT floor_seq FROM page_floors
              WHERE user_id=?1 AND doc=?2 AND page=?3), 0)
             AND NOT EXISTS (SELECT 1 FROM page_ops
@@ -2916,6 +3202,11 @@ export class CloudStore {
       "UPDATE device_tokens SET last_used_at=? WHERE token=? AND (last_used_at IS NULL OR last_used_at < ?)",
       [now, token, now - 60_000],
     );
+  }
+
+  /** Existing relay enrollment, without reading raw device credentials. */
+  hasPairedDevice(userId: string): boolean {
+    return !!this.db.query("SELECT 1 FROM device_tokens WHERE user_id=? LIMIT 1").get(userId);
   }
 
   /** A user's paired devices. Returns the full token (owner-only session) so

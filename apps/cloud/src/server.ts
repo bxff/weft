@@ -18,10 +18,11 @@ import {
   signSelfHostToken,
 } from "./auth";
 import { encodeSnapshot } from "@weft/sync-engine";
+import { parseRecoveryImport, type RecoveryImport } from "./recovery-import";
 import { builtinTemplate, builtinTemplateList } from "./builtin-templates";
 import { installProcessHooks, reportError } from "./telemetry";
 import { RmDocument, RootTextAuthorConflict } from "@weft/rm-format";
-import { readFileSync } from "node:fs";
+import { createReadStream, openSync, readFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { createBrotliCompress, createGzip, constants as zlib } from "node:zlib";
 import Negotiator from "negotiator";
@@ -153,7 +154,7 @@ function acceptedEncodings(req: Request, available?: string[], preferred?: strin
 // shells. Keep request classification in sync with the Vercel routing rules.
 const clientPage = /^\/(?:install|join|library|login|settings(?:\/keys)?)\/?$/;
 const notebookPage = /^\/app\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+\/?$/;
-const docsPage = /^\/docs(?:\/[a-zA-Z0-9_-]+)*\/?$/;
+const prerenderedPage = /^\/(?:docs(?:\/[a-zA-Z0-9_-]+)*|privacy|terms)\/?$/;
 const acceptsHtml = /^(?:[^,]*,)*\s*text\/html\s*(?=[;,]|$)(?![^,]*;\s*q\s*=\s*0(?:\.0*)?\s*(?:[;,]|$))[^,]*(?:,.*)?$/i;
 
 async function serveStatic(dir: string, pathname: string, req: Request): Promise<Response> {
@@ -179,7 +180,7 @@ async function serveStatic(dir: string, pathname: string, req: Request): Promise
       path = await Bun.file(shell).exists() ? shell : dir + "/index.html";
     } else if (clientPage.test(rel)) {
       path = dir + "/index.html";
-    } else if (docsPage.test(rel)) {
+    } else if (prerenderedPage.test(rel)) {
       path = dir + rel.replace(/\/$/, "") + ".html";
     } else {
       return new Response(null, { status: 404, headers });
@@ -332,7 +333,7 @@ export function startCloud(
   const CORS = {
     "access-control-allow-origin": "*",
     "access-control-allow-headers":
-      "authorization, content-type, x-base-revision, x-client-id, x-device-token, x-api-key, range, if-none-match, x-if-snapshot-seq-gt",
+      "authorization, content-type, x-base-revision, x-client-id, x-device-token, x-api-key, range, if-none-match, x-if-snapshot-seq-gt, x-weft-recovery, x-weft-native-sha256",
     "access-control-allow-methods": "GET, PUT, POST, PATCH, DELETE, OPTIONS",
     // headers pdf.js + client caches read cross-origin (Range, revalidation etags)
     "access-control-expose-headers":
@@ -343,6 +344,7 @@ export function startCloud(
   // on Content-Length, then re-checked on the materialized body (the header is
   // advisory: absent or lying on chunked uploads).
   const MAX_RM = 32 * 1024 * 1024;
+  const MAX_RECOVERY_JSON = 16 * 1024 * 1024;
   const MAX_JSON = 16 * 1024 * 1024;
 
   // Per-user storage quotas, one per data class. Enforced as
@@ -470,6 +472,15 @@ export function startCloud(
   /** Watermark check for a storage-growing write; null = allowed. Runs before
    *  the per-user quota so a capacity refusal reports reason:"capacity", never
    *  misread as the user's own quota. */
+  const newAccountWatermark = (total?: number): boolean =>
+    CAPACITY_BYTES > 0 && (total ?? store.totalUsageBytes()) >= CAPACITY_BYTES * 0.8;
+  const newAccountPause = (): Response => {
+    counters.capacity++;
+    return json({
+      error: "the beta is at capacity for new accounts — please try again later",
+      reason: "capacity",
+    }, 503);
+  };
   const atCapacity = (uid: string): Response | null => {
     if (CAPACITY_BYTES <= 0) return null;
     const total = store.totalUsageBytes();
@@ -484,17 +495,7 @@ export function startCloud(
         507,
       );
     }
-    if (total >= CAPACITY_BYTES * 0.8 && store.usageTotal(uid) === 0) {
-      counters.capacity++;
-      return json(
-        {
-          error:
-            "the beta is at capacity for new accounts — please try again later",
-          reason: "capacity",
-        },
-        503,
-      );
-    }
+    if (newAccountWatermark(total) && store.usageTotal(uid) === 0) return newAccountPause();
     return null;
   };
   /** Guards for every storage-growing write, in order: selective-sync
@@ -670,6 +671,7 @@ export function startCloud(
         const email = typeof body.email === "string" ? body.email.trim() : "";
         if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
           return json({ error: "enter a valid email address" }, 400);
+        if (newAccountWatermark()) return newAccountPause();
         // Existing account? Point them at sign-in instead of minting a new
         // invitation — Clerk happily invites already-registered emails, and
         // the stray invitation then sits "pending" in the dashboard forever
@@ -686,6 +688,8 @@ export function startCloud(
             409,
           );
         }
+        // Usage may have crossed the watermark while the user lookup ran.
+        if (newAccountWatermark()) return newAccountPause();
         const r = await fetch("https://api.clerk.com/v1/invitations", {
           method: "POST",
           headers: {
@@ -883,6 +887,12 @@ export function startCloud(
           return json({ error: "pairing requires sign-in" }, 403);
         }
         const body = (await req.json().catch(() => ({}))) as { label?: string };
+        // Existing device enrollment can predate the account's first
+        // counted content, or outlive an empty/rotated notebook library.
+        if (CAPACITY_BYTES > 0 && store.usageTotal(user) === 0 && !store.hasPairedDevice(user)) {
+          const gate = atCapacity(user);
+          if (gate) return gate;
+        }
         const token = store.mintDeviceToken(user, body.label ?? "tablet");
         return json({ token });
       }
@@ -1073,6 +1083,48 @@ export function startCloud(
         return json({ ok: true });
       }
 
+      if (path === "/api/recovery/notebook" && req.method === "POST") {
+        if (auth.via === "device") return json({ error: "restore requires an account credential" }, 403);
+        const body = await readJson(req, MAX_JSON);
+        if ("error" in body) return body.error;
+        let data: RecoveryImport;
+        try {
+          data = parseRecoveryImport(JSON.parse(body.text));
+        } catch (e) {
+          return json({ error: e instanceof Error ? e.message : "invalid recovery bundle" }, 400);
+        }
+        const digest = new Bun.CryptoHasher("sha256").update(body.text).digest("hex");
+        let result: ReturnType<typeof store.restoreRecoveryNotebook>;
+        try {
+          result = store.restoreRecoveryNotebook(user, data, digest, (stage) => {
+            if (stage === "before") {
+              const guard = uploadGuard(user, data.notebook.id);
+              if (guard) throw guard;
+              return;
+            }
+            // Check the actual amount committed, including any additional
+            // snapshot generated by reconciliation, before releasing the lock.
+            const limit = quotaFor(user, "created");
+            if (limit > 0 && store.usageBytes(user, "created") > limit) {
+              throw quotaError(user, "created");
+            }
+            const capacity = atCapacity(user);
+            if (capacity) throw capacity;
+          });
+        } catch (error) {
+          if (error instanceof Response) return error;
+          throw error;
+        }
+        if (result === "unverified") {
+          return json({ error: "existing recovery cannot be verified; no data was changed" }, 503);
+        }
+        if (result === "not-empty") {
+          return json({ error: "restore requires an empty account without paired devices" }, 409);
+        }
+        if (result === "created") emit(user, { type: "doc.list.changed" });
+        return json({ ok: true, notebookId: data.notebook.id }, result === "created" ? 201 : 200);
+      }
+
       // #54: create a brand-new empty notebook or folder from the web. Adds a
       // doc-list entry stamped `create: true`; the daemon materializes the
       // valid xochitl files (create_notebook/create_folder) on the tablet. For
@@ -1115,7 +1167,12 @@ export function startCloud(
           // seed the empty first page (a valid .rm v6) so the daemon's page
           // pull writes a real first page, not a 404
           const bytes = RmDocument.empty(crypto.randomUUID()).serialize();
+          const gate = storageGuard(user, bytes.length);
+          if (gate) return gate;
           store.putPage(user, docId, pageId, "", bytes, "web-new");
+        } else {
+          const gate = atCapacity(user);
+          if (gate) return gate;
         }
         store.mergeDocuments(user, JSON.stringify({ documents: [doc] }), null);
         emit(user, { type: "doc.list.changed" });
@@ -1225,13 +1282,27 @@ export function startCloud(
       // ZERO body — the tablet never re-downloads markers it already acted
       // on (owner requirement: the sweep must not weigh on the device).
       if (path === "/api/revisions" && req.method === "GET") {
-        const etag = `"${store.latestChangeSeq(user)}"`;
-        if (req.headers.get("if-none-match") === etag) {
-          return new Response(null, {
-            status: 304,
-            headers: { etag, ...CORS },
+        const ifNoneMatch = req.headers.get("if-none-match");
+        if (auth.via === "device" && req.headers.get("x-weft-recovery") === "1") {
+          const recovery = store.readRecoveryRevisions(user, ifNoneMatch);
+          const headers = {
+            etag: recovery.etag, "cache-control": "private, no-store", vary: "X-Weft-Recovery",
+          };
+          if (!recovery.body) return new Response(null, {
+            status: 304, headers: { ...CORS, ...headers },
+          });
+          const body = JSON.stringify(recovery.body);
+          if (Buffer.byteLength(body) > MAX_RECOVERY_JSON) {
+            return json({ error: "Recovery inventory exceeds size limit" }, 413, headers);
+          }
+          return new Response(body, {
+            headers: { ...CORS, ...headers, "content-type": "application/json" },
           });
         }
+        const etag = quoteEtag(String(store.latestChangeSeq(user)));
+        if (ifNoneMatch === etag) return new Response(null, {
+          status: 304, headers: { etag, ...CORS },
+        });
         return json({ pages: store.pageRevisions(user) }, 200, { etag });
       }
 
@@ -1506,93 +1577,60 @@ export function startCloud(
             const cap = atCapacity(user);
             if (cap) return cap;
           }
-          // Per-user PDF space WITH LRU eviction (#81): if this source would
-          // exceed the user's sources quota, evict their COLDEST resident
-          // sources (opened less recently than THIS doc) to make room, so the
-          // most-recently-opened PDFs stay resident. Only 507 (tablet-only) if
-          // it still doesn't fit — i.e. this doc is the coldest of all. Evicted
-          // bytes stay on the tablet and re-push when hot again (the daemon
-          // learns of eviction via GET /api/sources).
-          {
-            const limit = quotaFor(user, "sources");
-            const incoming = body.bytes.length;
-            // Projected usage AFTER this write. Subtract the doc's OWN existing
-            // source bytes: putFile is INSERT-OR-REPLACE, so re-importing a
-            // resident PDF nets (new - old), NOT (usage + new). Without this a
-            // near-quota re-import over-computes the need, evicts a colder source
-            // for nothing, then 507s the legit re-import -> stale bytes kept.
-            const existing = store.getFileRef(user, doc)?.size ?? 0;
-            const projected = store.usageBytes(user, "sources") - existing + incoming;
-            if (limit > 0 && projected > limit) {
-              store.evictColderSources(user, projected - limit, doc);
-              const after = store.usageBytes(user, "sources") - existing + incoming;
-              if (after > limit) {
-                return quotaError(user, "sources");
-              }
-            }
+          // Per-user source replacement and any colder evictions publish together.
+          if (!store.putFile(user, doc, body.bytes, mime, quotaFor(user, "sources"))) {
+            return quotaError(user, "sources");
           }
-          store.putFile(user, doc, body.bytes, mime);
           return json({ ok: true });
         }
         if (req.method === "GET") {
           const privateHeaders = { ...CORS, "cache-control": "private, no-store", vary: "Authorization" };
-          const ref = store.getFileRef(user, doc);
-          // 204, not 404: "source not resident" is a NORMAL state (the doc is
-          // tablet-only, STORAGE-PLAN §2) — the client shows the cold-doc
-          // banner, and the browser doesn't log a console error per open.
-          if (!ref) return new Response(null, { status: 204, headers: privateHeaders });
-          // The etag IS the file's revision (sha256; a re-import is a new
-          // one): the browser's Cache API layer revalidates with
-          // If-None-Match instead of re-downloading tens of MB per open.
-          const fileEtag = quoteEtag(ref.etag);
-          if (req.headers.get("if-none-match") === fileEtag) {
-            return new Response(null, {
-              status: 304,
+          const noSource = () => new Response(null, { status: 204, headers: privateHeaders });
+          for (let attempt = 0; attempt < 2; attempt++) {
+            const ref = store.getFileRef(user, doc);
+            if (!ref) {
+              if (attempt === 0) continue;
+              return noSource();
+            }
+            const fileEtag = quoteEtag(ref.etag);
+            const headers = { "accept-ranges": "bytes", etag: fileEtag, ...privateHeaders };
+            if (req.headers.get("if-none-match") === fileEtag) {
+              return new Response(null, { status: 304, headers });
+            }
+            const rangeHeader = req.headers.get("range");
+            const range = parseByteRange(rangeHeader, ref.size);
+            if (rangeHeader && !range) {
+              return new Response(null, {
+                status: 416,
+                headers: { ...headers, "content-type": ref.mime, "content-range": `bytes */${ref.size}` },
+              });
+            }
+            const start = range?.[0] ?? 0;
+            const end = range?.[1] ?? ref.size - 1;
+            let stream: BodyInit | null = null;
+            if (end >= start) {
+              // Pin the exact inode before responding, not a path Bun might open
+              // after the next upload has already retired it.
+              let fd: number;
+              try { fd = openSync(ref.path, "r"); }
+              catch (error) {
+                if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+                throw error;
+              }
+              stream = Readable.toWeb(createReadStream(ref.path, { fd, start, end })) as unknown as BodyInit;
+            }
+            return new Response(stream, {
+              status: range ? 206 : 200,
               headers: {
-                etag: fileEtag,
-                "accept-ranges": "bytes",
-                ...privateHeaders,
-              },
-            });
-          }
-          const file = Bun.file(ref.path);
-          const range = parseByteRange(req.headers.get("range"), ref.size);
-          if (range) {
-            // 206 Partial Content: pdf.js fetches only the bytes for
-            // the page it's rendering instead of the whole document.
-            const [start, end] = range;
-            return new Response(file.slice(start, end + 1), {
-              status: 206,
-              headers: {
+                ...headers,
                 "content-type": ref.mime,
-                "accept-ranges": "bytes",
-                "content-range": `bytes ${start}-${end}/${ref.size}`,
-                etag: fileEtag,
-                ...privateHeaders,
+                "content-length": String(end - start + 1),
+                ...(range && { "content-range": `bytes ${start}-${end}/${ref.size}` }),
               },
             });
           }
-          if (req.headers.get("range")) {
-            // a Range was sent but unsatisfiable
-            return new Response(null, {
-              status: 416,
-              headers: {
-                "content-type": ref.mime,
-                "accept-ranges": "bytes",
-                "content-range": `bytes */${ref.size}`,
-                ...privateHeaders,
-              },
-            });
-          }
-          // full file: Bun.file streams from disk (no heap buffering)
-          return new Response(file, {
-            headers: {
-              "content-type": ref.mime,
-              "accept-ranges": "bytes",
-              etag: fileEtag,
-              ...privateHeaders,
-            },
-          });
+          return noSource();
+
         }
       }
 
@@ -1999,6 +2037,34 @@ export function startCloud(
         const kind = pageMatch[3];
         if (kind === "rm") {
           if (req.method === "GET") {
+            if (req.headers.get("x-weft-recovery") === "1" && auth.via === "device") {
+              const recovery = store.readRecoveryPage(user, doc, page,
+                req.headers.get("x-weft-native-sha256"), req.headers.get("if-none-match"));
+              if (!recovery) return json({ error: "page not found" }, 404);
+              const headers = {
+                etag: recovery.etag, "cache-control": "private, no-store",
+                vary: "X-Weft-Recovery, X-Weft-Native-Sha256, Accept-Encoding",
+              };
+              if (!recovery.body) return new Response(null, {
+                status: 304, headers: { ...CORS, ...headers },
+              });
+              const body = JSON.stringify(recovery.body);
+              if (Buffer.byteLength(body) > MAX_RECOVERY_JSON) {
+                return json({ error: "Recovery page exceeds size limit" }, 413, headers);
+              }
+              const [encoding] = acceptedEncodings(req, ["gzip", "identity"], ["gzip"]);
+              if (!encoding) return new Response(null, { status: 406, headers });
+              if (encoding === "gzip") {
+                const compressed = Readable.from([body])
+                  .pipe(createGzip({ level: zlib.Z_BEST_SPEED }));
+                return new Response(Readable.toWeb(compressed) as unknown as ConstructorParameters<typeof Response>[0], {
+                  headers: { ...CORS, ...headers, "content-type": "application/json", "content-encoding": "gzip" },
+                });
+              }
+              return new Response(body, {
+                headers: { ...CORS, ...headers, "content-type": "application/json" },
+              });
+            }
             // op-mode page (#45): materialize .rm from the op log for
             // the codec-dumb daemon; legacy pages serve the blob.
             if (store.isOpModePage(user, doc, page)) {
@@ -2126,6 +2192,12 @@ export function startCloud(
       if (err instanceof RootTextAuthorConflict) {
         // A legacy tablet treats 409 as permission to fetch a different page.
         return json({ error: "unresolved-text-author" }, 422);
+      }
+      if (err instanceof Error && "code" in err &&
+          (err.code === "ENOSPC" || err.code === "EDQUOT" || err.code === "SQLITE_FULL")) {
+        counters.capacity++;
+        console.error("weft-cloud: storage exhausted:", err.code);
+        return json({ error: "server storage is full; try again when space is available", reason: "capacity" }, 507);
       }
       reportError(err, { origin: "route" });
       console.error("weft-cloud: route error:", err);
