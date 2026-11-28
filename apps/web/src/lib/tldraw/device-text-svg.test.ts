@@ -45,4 +45,3 @@ describe('native imported indentation before editing', () => {
         }
     }
 })
-
