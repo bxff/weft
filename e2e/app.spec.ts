@@ -84,17 +84,27 @@ test('GEOMETRY PIN: centered-coordinate ink lies inside the page border', async 
     const shapes = page.locator('.tl-shape')
     await expect.poll(async () => shapes.count(), { timeout: 30_000 }).toBeGreaterThanOrEqual(3)
 
-    const border = page
-        .locator('[data-testid="editor-root"] div[style*="border-radius: 2px"]')
-        .first()
-    const borderBox = await border.boundingBox()
-    expect(borderBox).not.toBeNull()
-    const count = await shapes.count()
-    for (let i = 0; i < count; i++) {
-        const box = await shapes.nth(i).boundingBox()
-        if (!box) continue
-        expect(box.x).toBeGreaterThanOrEqual(borderBox!.x - 8)
-        expect(box.x + box.width).toBeLessThanOrEqual(borderBox!.x + borderBox!.width + 8)
+    const border = page.getByTestId('editor-page-border')
+    await expect(border).toBeVisible({ timeout: 30_000 })
+    const geometry = await border.evaluate((sheet) => {
+        const rect = sheet.getBoundingClientRect()
+        const ink = Array.from(sheet.closest('[data-testid="editor-root"]')!.querySelectorAll('.tl-shape'))
+        return {
+            left: rect.left, right: rect.right, width: rect.width, height: rect.height,
+            ink: ink.map((shape) => {
+                const box = shape.getBoundingClientRect()
+                return { left: box.left, right: box.right, width: box.width, height: box.height }
+            }),
+        }
+    })
+    expect(geometry.width).toBeGreaterThan(0)
+    expect(geometry.height).toBeGreaterThan(0)
+    expect(geometry.ink.length).toBeGreaterThanOrEqual(3)
+    for (const box of geometry.ink) {
+        expect(box.width).toBeGreaterThan(0)
+        expect(box.height).toBeGreaterThan(0)
+        expect(box.left).toBeGreaterThanOrEqual(geometry.left - 8)
+        expect(box.right).toBeLessThanOrEqual(geometry.right + 8)
     }
     await page.screenshot({ path: 'e2e/artifacts/centered.png' })
 })
