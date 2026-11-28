@@ -840,11 +840,13 @@ export function TldrawApp({ docId, pageId, onController }: TldrawAppProps) {
                     setStatus(
                         s.state === 'synced'
                             ? 'synced'
-                            : s.state === 'pending'
-                              ? 'saving…'
-                              : s.state === 'offline'
-                                ? 'offline'
-                                : 'sync problem',
+                            : s.state === 'saving-locally'
+                              ? 'saving locally…'
+                              : s.state === 'pending'
+                                ? 'saving…'
+                                : s.state === 'offline'
+                                  ? 'offline'
+                                  : 'sync problem',
                     )
                 },
             })
@@ -1164,6 +1166,12 @@ export function TldrawApp({ docId, pageId, onController }: TldrawAppProps) {
                                 while it is awake).
                             </>
                         )}
+                        {syncDetail.state === 'saving-locally' && (
+                            <>Saving this stroke to this browser. Do not reload yet.</>
+                        )}
+                        {syncDetail.state === 'local-save-failed' && (
+                            <>Could not save this stroke in this browser. Keep this tab open.</>
+                        )}
                         {syncDetail.state === 'pending' && (
                             <>
                                 Saving {syncDetail.ops || 'your latest'}{' '}
@@ -1180,7 +1188,9 @@ export function TldrawApp({ docId, pageId, onController }: TldrawAppProps) {
                         )}
                         {syncDetail.state !== 'synced' &&
                             syncDetail.state !== 'pending' &&
-                            syncDetail.state !== 'offline' && (
+                            syncDetail.state !== 'offline' &&
+                            syncDetail.state !== 'saving-locally' &&
+                            syncDetail.state !== 'local-save-failed' && (
                                 <>
                                     Syncing hit a problem: {syncDetail.detail ?? 'unknown'}.
                                     Your edits stay in this browser; nothing is lost.

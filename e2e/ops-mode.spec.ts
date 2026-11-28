@@ -836,3 +836,196 @@ test("DEVICE TEXT: toolbar is limited to rm features and bold persists to the de
     { text: "heavy", bold: true },
   ]);
 });
+
+async function drawState(page: Page) {
+  return page.evaluate(() => {
+    const w = window as unknown as {
+      __weftEditor: { getCurrentPageShapes(): { type: string; props: { isComplete?: boolean } }[] };
+      __weftController: { session: { pendingCount: number } }
+    };
+    if (!w.__weftEditor || !w.__weftController?.session) return {complete: -1, incomplete: -1, ops: -1};
+    const draws = w.__weftEditor.getCurrentPageShapes().filter(s => s.type === "draw");
+    return {
+      complete: draws.filter(s => s.props.isComplete).length,
+      incomplete: draws.filter(s => !s.props.isComplete).length,
+      ops: w.__weftController.session.pendingCount,
+    };
+  });
+}
+
+test("a finished offline stroke is staged before the relay debounce and survives immediate reload", async ({ page }) => {
+  const id = crypto.randomUUID();
+  await page.goto(`/app/${NOTEBOOK}/${id}`);
+  await waitForSynced(page);
+  await page.route("**/api/**", route => route.abort("connectionfailed"));
+  await drawStroke(page, 150, 150);
+  await expect(page.getByTestId("sync-status")).toHaveText("offline");
+  await drawStroke(page, 260, 150);
+  await expect.poll(async () => (await drawState(page)).ops).toBe(2);
+  await expect(page.getByTestId("sync-status")).not.toHaveText("saving locally…");
+  await page.reload();
+  await expect.poll(async () => (await drawState(page)).complete).toBe(2);
+  await page.reload();
+  await expect.poll(async () => (await drawState(page)).complete).toBe(2);
+  expect(await opsCount(page, id)).toBe(0);
+  await page.unroute("**/api/**");
+  await waitForSynced(page);
+  // Each stroke produces one native add and one semantic overlay upsert.
+  await expect.poll(() => opsCount(page,id)).toBe(4);
+  const { RmDocument } = await import('../packages/rm-format/src/index');
+  const bytes = await (await page.request.get(`/api/documents/${NOTEBOOK}/pages/${id}/rm`)).body();
+  const doc = RmDocument.parse(new Uint8Array(bytes));
+  expect([...doc.tree().walk()].filter(([, item]) => item.kind === 'line')).toHaveLength(2);
+  await page.reload();
+  await waitForSynced(page);
+  expect(await drawState(page)).toMatchObject({complete:2, ops:0});
+});
+
+for (const reject of [false, true]) {
+  test(`local storage gate controls completed stroke status (reject=${reject})`, async ({page}) => {
+    const id = crypto.randomUUID();
+    await page.goto(`/app/${NOTEBOOK}/${id}`);
+    await waitForSynced(page);
+    await page.route("**/api/**", route => route.abort("connectionfailed"));
+    await page.evaluate((reject) => {
+      type State = Window & { finishPenWrite: () => void; penWriteEntered: boolean; __weftController: { session: { storage: { set(key: string, bytes: Uint8Array): Promise<void> }; savePending(): Promise<void> } } };
+      const w = window as unknown as State;
+      const storage = w.__weftController.session.storage;
+      const set = storage.set.bind(storage);
+      const gate = new Promise<void>(resolve => { w.finishPenWrite = resolve });
+      storage.set = async (key, bytes) => {
+        if (key.includes('/pending/') && !w.penWriteEntered) {
+          w.penWriteEntered = true;
+          await gate;
+          if (reject) throw new DOMException('Synthetic write rejected', 'QuotaExceededError');
+        }
+        await set(key, bytes);
+      };
+    }, reject);
+    await drawStroke(page, 145, 140);
+    await expect.poll(() => page.evaluate(() => Reflect.get(window, "penWriteEntered"))).toBe(true);
+    await expect(page.getByTestId("sync-status")).toHaveText("saving locally…");
+    await page.evaluate(() => Reflect.get(window, "finishPenWrite")());
+    if (reject) {
+      await expect(page.getByTestId("sync-status")).toHaveText("sync problem");
+      await page.evaluate(() => Reflect.get(window, "__weftController").session.reconcile());
+      await expect(page.getByTestId("sync-status")).toHaveText("sync problem");
+      // Another stroke commits the whole pending queue, including the first.
+      // Staying in the editor must then show offline (not a permanent error).
+      await drawStroke(page, 280, 140);
+    }
+    await expect(page.getByTestId("sync-status")).toHaveText("offline");
+    await page.reload();
+    await expect.poll(async () => (await drawState(page)).complete).toBe(reject ? 2 : 1);
+  });
+}
+
+
+test("an interrupted in-progress pen mark is not journaled", async ({page}) => {
+  const id=crypto.randomUUID();
+  await page.goto(`/app/${NOTEBOOK}/${id}`);
+  await waitForSynced(page);
+  await page.route("**/api/**", route => route.abort("connectionfailed"));
+  await page.keyboard.press("d");
+  const box=(await page.locator(".tl-canvas").boundingBox())!;
+  await page.mouse.move(box.x+150,box.y+150);
+  await page.mouse.down();
+  await page.mouse.move(box.x+260,box.y+170,{steps:6});
+  await expect.poll(async () => (await drawState(page)).incomplete).toBe(1);
+  expect((await drawState(page)).ops).toBe(0);
+  await page.keyboard.press("Escape");
+  await page.mouse.up();
+  await page.reload();
+  await expect(page.getByTestId("sync-status")).toHaveText("offline");
+  expect(await drawState(page)).toEqual({ complete:0,incomplete:0,ops:0 });
+});
+
+test("split pen gestures finish as one undoable gesture", async ({page}) => {
+  const id=crypto.randomUUID();
+  await page.goto(`/app/${NOTEBOOK}/${id}`);
+  await waitForSynced(page);
+  await page.route("**/api/**", route => route.abort("connectionfailed"));
+  await page.evaluate(() => {
+    const ed=Reflect.get(window,'__weftEditor');
+    ed.getShapeUtil('draw').options.maxPointsPerShape = 8;
+  });
+  await page.keyboard.press("d");
+  const box=(await page.locator(".tl-canvas").boundingBox())!;
+  await page.mouse.move(box.x+145,box.y+176);
+  await page.mouse.down();
+  await page.mouse.move(box.x+465,box.y+198,{steps:25});
+  const middle=await drawState(page);
+  expect(middle.complete).toBeGreaterThan(0);
+  expect(middle.incomplete).toBe(1);
+  await page.mouse.up();
+  await expect.poll(async () => (await drawState(page)).incomplete).toBe(0);
+  await expect(page.getByTestId("sync-status")).toHaveText("offline");
+  const beforeUndo=await drawState(page);
+  expect(beforeUndo.complete).toBe(middle.complete+1);
+  expect(beforeUndo.ops).toBe(beforeUndo.complete);
+  await page.keyboard.press("ControlOrMeta+z");
+  await expect.poll(async () => (await drawState(page)).complete).toBe(0);
+  await expect.poll(async () => (await drawState(page)).ops).toBe(beforeUndo.ops*2);
+  await expect(page.getByTestId("sync-status")).toHaveText("offline");
+  await page.reload();
+  await expect(page.getByTestId("sync-status")).toHaveText("offline");
+  expect((await drawState(page)).complete).toBe(0);
+});
+
+
+test("an older write must not report a completed stroke saved while mixed work is still queued", async ({page}) => {
+  const id=crypto.randomUUID();
+  await page.goto(`/app/${NOTEBOOK}/${id}`);
+  await waitForSynced(page);
+  await page.route("**/api/**", route => route.abort("connectionfailed"));
+  await page.evaluate(() => {
+    const w = window as Window & {setPenGate?: () => void; penGateEntered?: boolean};
+    const storage = Reflect.get(window, "__weftController").session.storage;
+    const set = storage.set.bind(storage);
+    const gate = new Promise<void>(resolve => {w.setPenGate = resolve;});
+    storage.set = async (key: string, bytes: Uint8Array) => {
+      if (key.includes('/pending/') && !w.penGateEntered) {
+        w.penGateEntered = true;
+        await gate;
+      }
+      return set(key, bytes);
+    };
+  });
+  await drawStroke(page, 145, 140);
+  await expect.poll(() => page.evaluate(() => Reflect.get(window, "penGateEntered"))).toBe(true);
+  await drawStroke(page, 225, 245);
+  await page.evaluate(() => {
+    const e=Reflect.get(window,"__weftEditor");
+    e.createShape({ type: "geo", x: 70, y: 45, props: {geo:"rectangle", w:60, h:80} });
+    e.store._flushHistory();
+    const t=setTimeout;
+    const blocked: Array<() => void> = [];
+    window.setTimeout = ((fn:TimerHandler,delay?:number,...args:unknown[]) => {
+      if (delay === 180 && typeof fn === 'function') {
+        return t(() => blocked.push(() => fn(...args)), 0);
+      }
+      return t(fn,delay,...args);
+    }) as typeof window.setTimeout;
+    Reflect.set(window, "resumePenDebounce", () => {
+      window.setTimeout = t;
+      for (const fn of blocked.splice(0)) fn();
+    });
+  });
+  await expect(page.getByTestId("sync-status")).toHaveText("saving locally…");
+  await page.evaluate(async () => {
+    const c=Reflect.get(window,"__weftController");
+    const older=c.flushing;
+    Reflect.get(window,"setPenGate")();
+    await older;
+    // Let the deferred fast-path continuation recheck the mixed batch.
+    await new Promise<void>(resolve=>setTimeout(resolve,0));
+  });
+  expect((await drawState(page)).ops).toBe(1);
+  expect((await drawState(page)).complete).toBe(2);
+  await expect(page.getByTestId("sync-status")).toHaveText("saving locally…");
+  await page.evaluate(() => Reflect.get(window, "resumePenDebounce")());
+  await expect(page.getByTestId("sync-status")).toHaveText("offline");
+  await page.reload();
+  await expect.poll(async () => (await drawState(page)).complete).toBe(2);
+  await expect(page.locator('.tl-shape[data-shape-type="geo"]')).toHaveCount(1);
+});
